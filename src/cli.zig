@@ -73,7 +73,7 @@ pub const Arg = struct {
                 .@"enum" => |e| std.meta.stringToEnum(T, v) orelse
                     std.enums.fromInt(T, try self.to(e.tag_type)) orelse
                     return ConvertError.ConvertFailure,
-                else => @compileError("Cannot convert to type `" ++ @typeName(T) ++ "`. Can only convert to integer, float, boolean, or enum."),
+                else => @compileError("Cannot convert to type `" ++ @typeName(T) ++ "`. Can only convert to integer, float, or enum."),
             };
         }
         return ConvertError.Unassigned;
@@ -82,7 +82,9 @@ pub const Arg = struct {
 
 /// Flag argument
 pub const Flag = struct {
+    /// The actual boolean value of this flag
     value: bool,
+    /// If false, this value has not been toggled
     dirty: bool = false,
 
     /// Initialize with value=false
@@ -91,6 +93,7 @@ pub const Flag = struct {
     /// Initialize with value=true
     pub const on: Flag = .{ .value = true };
 
+    /// A flag given a single-character alias rather than the full arg name
     pub const Named = struct {
         flag: *Flag,
         name: u8,
@@ -126,8 +129,8 @@ pub const Flag = struct {
     }
 };
 
-/// Create a set of all possible flags (.e.g. `-ab` would be both the flags 'a' and 'b').
-/// That way, aliases can be used clumped together in a single argument, all while ensuring that a given flag is not toggled more than once.
+/// Create a set of all possible flags (.e.g. `-ab` would be equivalent to '-a -b').
+/// That way, flag-stacking is allowed, all while ensuring that a given flag is not toggled more than once.
 pub const FlagSet = struct {
     set: Set,
 
