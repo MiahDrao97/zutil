@@ -63,8 +63,8 @@ pub const Arg = struct {
     /// - floats
     /// - enums (tag name or integer value)
     pub fn to(self: Arg, comptime T: type) ConvertError!T {
-        if (self.value) |v| {
-            return switch (@typeInfo(T)) {
+        return if (self.value) |v|
+            switch (@typeInfo(T)) {
                 .int => |i| switch (i.signedness) {
                     .signed => std.fmt.parseInt(T, v, 0) catch return ConvertError.ConvertFailure,
                     .unsigned => std.fmt.parseUnsigned(T, v, 0) catch return ConvertError.ConvertFailure,
@@ -74,9 +74,9 @@ pub const Arg = struct {
                     std.enums.fromInt(T, try self.to(e.tag_type)) orelse
                     return ConvertError.ConvertFailure,
                 else => @compileError("Cannot convert to type `" ++ @typeName(T) ++ "`. Can only convert to integer, float, or enum."),
-            };
-        }
-        return ConvertError.Unassigned;
+            }
+        else
+            ConvertError.Unassigned;
     }
 };
 
@@ -137,6 +137,7 @@ pub const FlagSet = struct {
     const Self = @This();
     const Set = std.AutoArrayHashMapUnmanaged(u8, *Flag);
 
+    /// Errors returned while parsing for this `FlagSet`
     pub const Error = Flag.Error || error{
         /// Returned if an unknown flag is contained in the argument
         UnknownFlag,
@@ -144,7 +145,7 @@ pub const FlagSet = struct {
 
     /// Pass in a set of named flags.
     /// If any flag names are repeated, that will invoke a panic.
-    pub fn initSlice(gpa: Allocator, flags: []const Flag.Named) Allocator.Error!Self {
+    pub fn create(gpa: Allocator, flags: []const Flag.Named) Allocator.Error!Self {
         var set: Set = .empty;
         try set.ensureTotalCapacity(gpa, flags.len);
         for (flags) |f| {
@@ -159,25 +160,24 @@ pub const FlagSet = struct {
     }
 
     /// Initialize from an array, which allows us to determine the upper bound of memory required for this set.
-    pub fn initArr(n: comptime_int, flags: [n]Flag.Named, buf: *[requiredCapacityBytes(n)]u8) Self {
+    pub fn initArray(n: comptime_int, flags: [n]Flag.Named, buf: *[requiredCapacityBytes(n)]u8) Self {
         var fba: FixedBufferAllocator = .init(buf);
-        return initSlice(fba.allocator(), &flags) catch unreachable;
+        return create(fba.allocator(), &flags) catch unreachable;
     }
 
     /// Determined the number of bytes required for a buffer with capacity `n`
     pub fn requiredCapacityBytes(n: usize) usize {
         var capacity: usize = 0;
-        while (true) {
+        while (capacity < n) {
             capacity +|= capacity / 2 + std.atomic.cache_line;
-            if (capacity >= n) break;
         }
         return std.MultiArrayList(Set.Data).capacityInBytes(capacity);
     }
 
-    /// Parse for any group of flags.
-    /// Use this method if you allow a client to pass in all flags grouped together in a single argument (e.g. "-ab" would have flags "a" and "b" toggled)
-    /// This argument is expected to start with a single dash and have no repeated values (repeated values results in `error.AlreadyToggled`).
-    /// Call this parse function last because it assumes that all characters present (after the dash) are known flag values.
+    /// Parse for the configured set of flags.
+    /// `arg` is expected to start with a single dash and have no repeated values (repeated values results in `error.AlreadyToggled`).
+    /// NOTE : Call this parse function last because it assumes that all characters present in `arg` (after the dash) are known flag values.
+    /// If you have any single-character aliases outside of this configured set of flags, this will interpret that alias an unknown flag.
     pub fn parseAny(self: *Self, arg: []const u8) Error!bool {
         if (arg.len > 1 and arg[0] == '-' and arg[1] != '-') {
             for (arg[1..]) |f| {
