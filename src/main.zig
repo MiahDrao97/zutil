@@ -58,9 +58,9 @@ const MyEnum = enum { cake, watermelon, pickles };
 
 const std = @import("std");
 const zutil = @import("zutil");
-const Arg = zutil.Arg;
-const Flag = zutil.Flag;
-const FlagSet = zutil.FlagSet;
+const Arg = zutil.cli.Arg;
+const Flag = zutil.cli.Flag;
+const FlagSet = zutil.cli.FlagSet;
 const Allocator = std.mem.Allocator;
 const DebugAllocator = std.heap.DebugAllocator;
 const ArgIter = std.process.ArgIterator;
