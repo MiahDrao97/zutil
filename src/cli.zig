@@ -178,7 +178,7 @@ pub const FlagSet = struct {
     /// All matching flags will be toggled.
     /// NOTE : Call this parse function last because it assumes that all characters present in `arg` (after the dash) are known flag values.
     /// If you have any single-character aliases outside of this configured set of flags, this will interpret that alias an unknown flag.
-    pub fn toggleMultiple(self: *Self, arg: []const u8) Error!bool {
+    pub fn toggleAny(self: *Self, arg: []const u8) Error!bool {
         if (arg.len > 1 and arg[0] == '-' and arg[1] != '-') {
             for (arg[1..]) |f| {
                 if (self.set.get(f)) |flag| {
@@ -203,6 +203,6 @@ pub const FlagSet = struct {
 
 const std = @import("std");
 const ArgIterator = std.process.ArgIterator;
-const log = std.log.scoped(.zutil);
+const log = std.log.scoped(.@"zutil.cli");
 const FixedBufferAllocator = std.heap.FixedBufferAllocator;
 const Allocator = std.mem.Allocator;
