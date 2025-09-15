@@ -110,7 +110,7 @@ pub const Flag = struct {
     /// If `arg` matches any of the `arg_names` provided, toggles `self.value` and returns `true`.
     ///
     /// If none of the above, returns `false`.
-    pub fn parseFor(self: *Flag, arg_names: []const []const u8, arg: []const u8) Error!bool {
+    pub fn toggleOn(self: *Flag, arg_names: []const []const u8, arg: []const u8) Error!bool {
         return for (arg_names) |name| {
             if (std.mem.eql(u8, name, arg)) {
                 self.toggle() catch |err| {
@@ -174,11 +174,11 @@ pub const FlagSet = struct {
         return std.MultiArrayList(Set.Data).capacityInBytes(capacity);
     }
 
-    /// Parse for the configured set of flags.
     /// `arg` is expected to start with a single dash and have no repeated values (repeated values results in `error.AlreadyToggled`).
+    /// All matching flags will be toggled.
     /// NOTE : Call this parse function last because it assumes that all characters present in `arg` (after the dash) are known flag values.
     /// If you have any single-character aliases outside of this configured set of flags, this will interpret that alias an unknown flag.
-    pub fn parseAny(self: *Self, arg: []const u8) Error!bool {
+    pub fn toggleMultiple(self: *Self, arg: []const u8) Error!bool {
         if (arg.len > 1 and arg[0] == '-' and arg[1] != '-') {
             for (arg[1..]) |f| {
                 if (self.set.get(f)) |flag| {

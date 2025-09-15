@@ -27,9 +27,9 @@ pub fn main() !void {
     while (arg_iter.next()) |n| {
         if (try required.parseFor(&.{ "--required", "-r" }, n, &arg_iter)) continue;
         if (try optional.parseFor(&.{"--optional"}, n, &arg_iter)) continue;
-        if (try flag.parseFor(&.{"--flag"}, n)) continue;
-        if (try other.parseFor(&.{"--other"}, n)) continue;
-        if (try set.parseAny(n)) continue;
+        if (try flag.toggleOn(&.{"--flag"}, n)) continue;
+        if (try other.toggleOn(&.{"--other"}, n)) continue;
+        if (try set.toggleMultiple(n)) continue;
 
         print("ERR: Unrecognized argument '{s}'\n", .{n});
         return error.UnrecognizedArgument;
