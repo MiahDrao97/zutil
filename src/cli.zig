@@ -145,7 +145,7 @@ pub const FlagSet = struct {
 
     /// Pass in a set of named flags.
     /// If any flag names are repeated, that will invoke a panic.
-    pub fn create(gpa: Allocator, flags: []const Flag.Named) Allocator.Error!Self {
+    pub fn init(gpa: Allocator, flags: []const Flag.Named) Allocator.Error!Self {
         var set: Set = .empty;
         try set.ensureTotalCapacity(gpa, flags.len);
         for (flags) |f| {
@@ -160,9 +160,9 @@ pub const FlagSet = struct {
     }
 
     /// Initialize from an array, which allows us to determine the upper bound of memory required for this set.
-    pub fn initArray(n: comptime_int, flags: [n]Flag.Named, buf: *[requiredCapacityBytes(n)]u8) Self {
+    pub fn initBounded(n: comptime_int, flags: [n]Flag.Named, buf: *[requiredCapacityBytes(n)]u8) Self {
         var fba: FixedBufferAllocator = .init(buf);
-        return create(fba.allocator(), &flags) catch unreachable;
+        return init(fba.allocator(), &flags) catch unreachable;
     }
 
     /// Determined the number of bytes required for a buffer with capacity `n`
