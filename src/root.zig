@@ -15,6 +15,7 @@ pub fn Managed(comptime T: type) type {
         arena: ArenaAllocator,
 
         /// Create a new managed value.
+        /// Returns `self.*` (usually because you're returning this managed value or passing it as an argument).
         /// This requires a 2-step initialization. Example:
         /// ```zig
         /// var managed: Managed(T) = undefined;
@@ -40,15 +41,14 @@ pub fn Managed(comptime T: type) type {
     };
 }
 
-/// `T` must be a subset of `struct`'s type.
-/// Create an instance of `T` from `struct`'s members.
-/// This evaluates members only. Declarations are not evaluated.
-pub fn structSubset(comptime T: type, @"struct": anytype) T {
+/// `TSubset` must be a subset of `struct`'s type (strictly looking at the names and types of struct members).
+/// Create an instance of `TSubset` from `struct`'s members.
+pub fn structSubset(comptime TSubset: type, @"struct": anytype) TSubset {
     const SourceType = @TypeOf(@"struct");
     switch (@typeInfo(SourceType)) {
-        .@"struct" => switch (@typeInfo(T)) {
+        .@"struct" => switch (@typeInfo(TSubset)) {
             .@"struct" => |to| {
-                var result: T = undefined;
+                var result: TSubset = undefined;
                 inline for (to.fields) |field| {
                     if (@hasField(SourceType, field.name)) {
                         if (@FieldType(SourceType, field.name) == field.type) {
@@ -60,7 +60,7 @@ pub fn structSubset(comptime T: type, @"struct": anytype) T {
                 }
                 return result;
             },
-            else => @compileError("`" ++ @typeName(T) ++ "` is not a struct."),
+            else => @compileError("`" ++ @typeName(TSubset) ++ "` is not a struct."),
         },
         .pointer => |ptr| return structSubset(ptr.child, @"struct".*),
         else => @compileError("`" ++ @typeName(SourceType) ++ "` is not a struct."),
