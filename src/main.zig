@@ -21,7 +21,7 @@ pub fn main() !void {
         other.alias('o'),
     };
     var buf: [FlagSet.requiredCapacityBytes(all_flags.len)]u8 = undefined;
-    var set: FlagSet = .initBounded(all_flags.len, all_flags, &buf);
+    const set: FlagSet = .initBounded(all_flags.len, all_flags, &buf);
 
     _ = arg_iter.next(); // skip first arg (that's the .exe)
     while (arg_iter.next()) |n| {
