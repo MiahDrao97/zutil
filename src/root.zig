@@ -4,9 +4,8 @@
 /// Command line utilies
 pub const cli = @import("cli.zig");
 
-/// Use to return a managed object.
-/// This strategy is useful when memory won't be or can't be freed after creating a given value.
-/// However, when this managed object is freed, all memory allocated beforehand when creating it will also be freed.
+/// A managed value is useful when memory won't be or can't be freed after doing the work to create said value.
+/// However, when this managed value is freed, all memory allocated beforehand when it was created will also be freed.
 pub fn Managed(comptime T: type) type {
     return struct {
         /// Value itself
@@ -70,3 +69,5 @@ pub fn structSubset(comptime TSubset: type, @"struct": anytype) TSubset {
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
+const log = std.log;
+const SourceLocation = std.builtin.SourceLocation;
