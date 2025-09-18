@@ -66,6 +66,10 @@ pub fn structSubset(comptime TSubset: type, @"struct": anytype) TSubset {
     }
 }
 
+comptime {
+    std.testing.refAllDecls(@This());
+}
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;

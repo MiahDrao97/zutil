@@ -201,7 +201,50 @@ pub const FlagSet = struct {
     }
 };
 
+test FlagSet {
+    var f1: Flag = .off;
+    var f2: Flag = .off;
+    var f3: Flag = .off;
+
+    const flags = [_]Flag.Named{
+        f1.alias('1'),
+        f2.alias('2'),
+        f3.alias('3'),
+    };
+
+    var set: FlagSet = try .init(testing.allocator, &flags);
+    defer set.deinit(testing.allocator);
+
+    try testing.expect(!try set.toggleAny("a"));
+    try testing.expectError(FlagSet.Error.UnknownFlag, set.toggleAny("-a"));
+    try testing.expect(try set.toggleAny("-1"));
+    try testing.expect(f1.value);
+    try testing.expectError(FlagSet.Error.AlreadyToggled, set.toggleAny("-1"));
+}
+comptime {
+    for (1..27) |n| {
+        _ = struct {
+            test "FlagSet does not panic on initBounded()" {
+                var vec: @Vector(n, u8) = std.simd.iota(u8, n);
+                vec += @splat('a');
+
+                var flags: [n]Flag = @splat(.off);
+                var named: [n]Flag.Named = undefined;
+                for (&flags, &named, 0..) |*f, *aliased, i| aliased.* = .{
+                    .flag = f,
+                    .name = vec[i],
+                };
+
+                var buf: [FlagSet.requiredCapacityBytes(n)]u8 = undefined;
+                // if our buffer size is wrong, this line will panic
+                _ = FlagSet.initBounded(n, named, &buf);
+            }
+        };
+    }
+}
+
 const std = @import("std");
+const testing = std.testing;
 const ArgIterator = std.process.ArgIterator;
 const log = std.log.scoped(.@"zutil.cli");
 const FixedBufferAllocator = std.heap.FixedBufferAllocator;
