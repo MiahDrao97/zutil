@@ -201,25 +201,29 @@ pub const FlagSet = struct {
     }
 };
 
+test Arg {
+    // TODO:
+    return error.SkipZigTest;
+}
 test FlagSet {
-    var f1: Flag = .off;
-    var f2: Flag = .off;
-    var f3: Flag = .off;
+    var a: Flag = .off;
+    var b: Flag = .off;
+    var c: Flag = .off;
 
     const flags = [_]Flag.Named{
-        f1.alias('1'),
-        f2.alias('2'),
-        f3.alias('3'),
+        a.alias('a'),
+        b.alias('b'),
+        c.alias('c'),
     };
 
     var set: FlagSet = try .init(testing.allocator, &flags);
     defer set.deinit(testing.allocator);
 
     try testing.expect(!try set.toggleAny("a"));
-    try testing.expectError(FlagSet.Error.UnknownFlag, set.toggleAny("-a"));
-    try testing.expect(try set.toggleAny("-1"));
-    try testing.expect(f1.value);
-    try testing.expectError(FlagSet.Error.AlreadyToggled, set.toggleAny("-1"));
+    try testing.expectError(FlagSet.Error.UnknownFlag, set.toggleAny("-d"));
+    try testing.expect(try set.toggleAny("-a"));
+    try testing.expect(a.value);
+    try testing.expectError(FlagSet.Error.AlreadyToggled, set.toggleAny("-a"));
 }
 comptime {
     for (1..27) |n| {
@@ -237,7 +241,8 @@ comptime {
 
                 var buf: [FlagSet.requiredCapacityBytes(n)]u8 = undefined;
                 // if our buffer size is wrong, this line will panic
-                _ = FlagSet.initBounded(n, named, &buf);
+                const set: FlagSet = .initBounded(n, named, &buf);
+                try testing.expect(!try set.toggleAny(""));
             }
         };
     }
