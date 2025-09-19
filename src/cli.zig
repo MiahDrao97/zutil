@@ -202,8 +202,171 @@ pub const FlagSet = struct {
 };
 
 test Arg {
-    // TODO:
-    return error.SkipZigTest;
+    {
+        const cmd: []const u8 = "MyProgram.exe --some-val";
+        const cmd_line_w: []const u16 = try std.unicode.utf8ToUtf16LeAlloc(testing.allocator, cmd);
+        defer testing.allocator.free(cmd_line_w);
+
+        var iter_windows: ArgIteratorWindows = try .init(testing.allocator, cmd_line_w);
+        defer iter_windows.deinit();
+
+        var iter: ArgIterator = .{ .inner = iter_windows };
+        var some_value: Arg = .unassigned;
+
+        _ = iter.next(); // skip first arg since that's the .exe
+        while (iter.next()) |arg|
+            try testing.expectError(
+                Arg.ParseError.NoValueProvided,
+                some_value.parseFor(&.{"--some-val"}, arg, &iter),
+            );
+    }
+    {
+        const cmd: []const u8 = "MyProgram.exe --some-val asdf --some-val blarf";
+        const cmd_line_w: []const u16 = try std.unicode.utf8ToUtf16LeAlloc(testing.allocator, cmd);
+        defer testing.allocator.free(cmd_line_w);
+
+        var iter_windows: ArgIteratorWindows = try .init(testing.allocator, cmd_line_w);
+        defer iter_windows.deinit();
+
+        var iter: ArgIterator = .{ .inner = iter_windows };
+        var some_value: Arg = .unassigned;
+
+        var already_assigned: ?error{AlreadyAssigned} = null;
+        loop: while (iter.next()) |arg|
+            _ = some_value.parseFor(&.{"--some-val"}, arg, &iter) catch |err| {
+                switch (err) {
+                    error.AlreadyAssigned => |e| already_assigned = e,
+                    else => return err,
+                }
+                break :loop;
+            };
+        try testing.expect(already_assigned != null);
+    }
+    {
+        const cmd: []const u8 = "MyProgram.exe --some-val asdf";
+        const cmd_line_w: []const u16 = try std.unicode.utf8ToUtf16LeAlloc(testing.allocator, cmd);
+        defer testing.allocator.free(cmd_line_w);
+
+        var iter_windows: ArgIteratorWindows = try .init(testing.allocator, cmd_line_w);
+        defer iter_windows.deinit();
+
+        var iter: ArgIterator = .{ .inner = iter_windows };
+        var some_value: Arg = .unassigned;
+
+        _ = iter.next();
+        while (iter.next()) |arg|
+            if (try some_value.parseFor(&.{"--some-val"}, arg, &iter)) continue;
+
+        try testing.expectEqualStrings("asdf", some_value.value.?);
+    }
+    {
+        const cmd: []const u8 = "MyProgram.exe";
+        const cmd_line_w: []const u16 = try std.unicode.utf8ToUtf16LeAlloc(testing.allocator, cmd);
+        defer testing.allocator.free(cmd_line_w);
+
+        var iter_windows: ArgIteratorWindows = try .init(testing.allocator, cmd_line_w);
+        defer iter_windows.deinit();
+
+        var iter: ArgIterator = .{ .inner = iter_windows };
+        var some_value: Arg = .unassigned;
+
+        while (iter.next()) |arg|
+            if (try some_value.parseFor(&.{"--some-val"}, arg, &iter)) continue;
+
+        try testing.expectEqual(null, some_value.value);
+        try testing.expectError(error.Unassigned, some_value.to(u32));
+    }
+    {
+        const cmd: []const u8 = "MyProgram.exe --some-val asdf";
+        const cmd_line_w: []const u16 = try std.unicode.utf8ToUtf16LeAlloc(testing.allocator, cmd);
+        defer testing.allocator.free(cmd_line_w);
+
+        var iter_windows: ArgIteratorWindows = try .init(testing.allocator, cmd_line_w);
+        defer iter_windows.deinit();
+
+        var iter: ArgIterator = .{ .inner = iter_windows };
+        var some_value: Arg = .unassigned;
+
+        _ = iter.next();
+        while (iter.next()) |arg|
+            if (try some_value.parseFor(&.{"--some-val"}, arg, &iter)) continue;
+
+        try testing.expectError(error.ConvertFailure, some_value.to(u32));
+    }
+    {
+        const MyEnum = enum { asdf, blarf };
+        const cmd: []const u8 = "MyProgram.exe --some-val asdf";
+        const cmd_line_w: []const u16 = try std.unicode.utf8ToUtf16LeAlloc(testing.allocator, cmd);
+        defer testing.allocator.free(cmd_line_w);
+
+        var iter_windows: ArgIteratorWindows = try .init(testing.allocator, cmd_line_w);
+        defer iter_windows.deinit();
+
+        var iter: ArgIterator = .{ .inner = iter_windows };
+        var some_value: Arg = .unassigned;
+
+        _ = iter.next();
+        while (iter.next()) |arg|
+            if (try some_value.parseFor(&.{"--some-val"}, arg, &iter)) continue;
+
+        const as_enum: MyEnum = try some_value.to(MyEnum);
+        try testing.expectEqual(.asdf, as_enum);
+    }
+    {
+        const MyEnum = enum { asdf, blarf };
+        const cmd: []const u8 = "MyProgram.exe --some-val 0";
+        const cmd_line_w: []const u16 = try std.unicode.utf8ToUtf16LeAlloc(testing.allocator, cmd);
+        defer testing.allocator.free(cmd_line_w);
+
+        var iter_windows: ArgIteratorWindows = try .init(testing.allocator, cmd_line_w);
+        defer iter_windows.deinit();
+
+        var iter: ArgIterator = .{ .inner = iter_windows };
+        var some_value: Arg = .unassigned;
+
+        _ = iter.next();
+        while (iter.next()) |arg|
+            if (try some_value.parseFor(&.{"--some-val"}, arg, &iter)) continue;
+
+        const as_enum: MyEnum = try some_value.to(MyEnum);
+        try testing.expectEqual(.asdf, as_enum);
+    }
+    {
+        const cmd: []const u8 = "MyProgram.exe --some-val 19";
+        const cmd_line_w: []const u16 = try std.unicode.utf8ToUtf16LeAlloc(testing.allocator, cmd);
+        defer testing.allocator.free(cmd_line_w);
+
+        var iter_windows: ArgIteratorWindows = try .init(testing.allocator, cmd_line_w);
+        defer iter_windows.deinit();
+
+        var iter: ArgIterator = .{ .inner = iter_windows };
+        var some_value: Arg = .unassigned;
+
+        _ = iter.next();
+        while (iter.next()) |arg|
+            if (try some_value.parseFor(&.{"--some-val"}, arg, &iter)) continue;
+
+        const as_num: i32 = try some_value.to(i32);
+        try testing.expectEqual(19, as_num);
+    }
+    {
+        const cmd: []const u8 = "MyProgram.exe --some-val 19.2345";
+        const cmd_line_w: []const u16 = try std.unicode.utf8ToUtf16LeAlloc(testing.allocator, cmd);
+        defer testing.allocator.free(cmd_line_w);
+
+        var iter_windows: ArgIteratorWindows = try .init(testing.allocator, cmd_line_w);
+        defer iter_windows.deinit();
+
+        var iter: ArgIterator = .{ .inner = iter_windows };
+        var some_value: Arg = .unassigned;
+
+        _ = iter.next();
+        while (iter.next()) |arg|
+            if (try some_value.parseFor(&.{"--some-val"}, arg, &iter)) continue;
+
+        const as_num: f32 = try some_value.to(f32);
+        try testing.expectEqual(19.2345, as_num);
+    }
 }
 test FlagSet {
     var a: Flag = .off;
@@ -251,6 +414,7 @@ comptime {
 const std = @import("std");
 const testing = std.testing;
 const ArgIterator = std.process.ArgIterator;
+const ArgIteratorWindows = std.process.ArgIteratorWindows;
 const log = std.log.scoped(.@"zutil.cli");
 const FixedBufferAllocator = std.heap.FixedBufferAllocator;
 const Allocator = std.mem.Allocator;
