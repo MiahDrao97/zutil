@@ -392,18 +392,16 @@ comptime {
     for (1..27) |n| {
         _ = struct {
             test "FlagSet does not panic on initBounded()" {
-                var vec: @Vector(n, u8) = std.simd.iota(u8, n);
-                vec += @splat('a');
-
+                const letters: [n]u8 = std.simd.iota(u8, n) + @as(@Vector(n, u8), @splat('a'));
                 var flags: [n]Flag = @splat(.off);
                 var named: [n]Flag.Named = undefined;
-                for (&flags, &named, 0..) |*f, *aliased, i| aliased.* = .{
+                for (&named, &flags, &letters) |*aliased, *f, letter| aliased.* = .{
                     .flag = f,
-                    .name = vec[i],
+                    .name = letter,
                 };
 
                 var buf: [FlagSet.requiredCapacityBytes(n)]u8 = undefined;
-                // if our buffer size is wrong, this line will panic
+                // if our buffer size is wrong, the following line will panic:
                 const set: FlagSet = .initBounded(n, named, &buf);
                 try testing.expect(!try set.toggleAny(""));
             }
