@@ -3,6 +3,8 @@
 
 /// Command line utilies
 pub const cli = @import("cli.zig");
+/// String utilities
+pub const string = @import("string.zig");
 
 /// A managed value is useful when memory won't be or can't be freed after doing the work to create said value.
 /// However, when this managed value is freed, all memory allocated beforehand when it was created will also be freed.
