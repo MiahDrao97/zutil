@@ -68,17 +68,28 @@ pub fn structSubset(comptime TSubset: type, @"struct": anytype) TSubset {
     }
 }
 
+/// Universally unique identifier
+/// Currently supports v3, v4, and v5
 pub const Uuid = struct {
-    bytes: [16]u8,
+    /// Any 16 bytes are assumed to be a valid UUID.
+    /// However, generating UUID's is what makes them special, as there are various methods to create them.
+    /// v3 and v5 hash strings, while v4 is a completely random (apart from 2 special digits).
+    bytes: [16]u8 align(16),
 
+    /// Zero-valued UUID
     pub const empty: Uuid = .{ .bytes = @splat(0) };
 
+    /// Maximum value a UUID can be
     pub const max: Uuid = .{ .bytes = @splat(0xff) };
 
+    /// Format options when printing
     pub const FormatOptions = struct {
+        /// Grouped like 8-4-4-4-12, with a given separator (defaulting to dashes)
         seperator: Separator = .dashes,
+        /// Casing on the values
         casing: enum { lower, upper } = .lower,
 
+        /// Supported separators or no separators
         pub const Separator = enum {
             dashes,
             underscores,
@@ -96,6 +107,17 @@ pub const Uuid = struct {
         };
     };
 
+    /// Possible errors when parsing a UUID (see `from()`)
+    pub const ParseError = std.fmt.ParseIntError || error{
+        /// This indicates the string's length is not correct:
+        /// Expecting either 16 raw bytes, 32 characters with no separators, or 36 characters including separators
+        InvalidFormat,
+        /// The bytes at indices 8, 13, 18, and/or 23 did not match (these are expected to be separators)
+        MismatchedSeparators,
+        /// The separator character is invalid (only supporting dashes, underscores, and periods)
+        InvalidSeparator,
+    };
+
     /// Concats `namespace` and `name` and creates a hash using the MD5 algorithm.
     /// NOTE : This is not considered cryptographically safe.
     pub fn v3(gpa: Allocator, namespace: []const u8, name: []const u8) Allocator.Error!Uuid {
@@ -104,7 +126,7 @@ pub const Uuid = struct {
         @memcpy(to_hash[0..namespace.len], namespace);
         @memcpy(to_hash[namespace.len..], name);
 
-        var md5 = crypto.hash.Md5.init(.{});
+        var md5: crypto.hash.Md5 = .init(.{});
         md5.update(to_hash);
 
         var uuid: Uuid = undefined;
@@ -144,7 +166,7 @@ pub const Uuid = struct {
         @memcpy(to_hash[0..namespace.len], namespace);
         @memcpy(to_hash[namespace.len..], name);
 
-        var sha1 = crypto.hash.Sha1.init(.{});
+        var sha1: crypto.hash.Sha1 = .init(.{});
         sha1.update(to_hash);
 
         var out: [20]u8 = undefined;
@@ -156,33 +178,35 @@ pub const Uuid = struct {
         return uuid;
     }
 
-    pub fn from(str: []const u8, separator: FormatOptions.Separator) (std.fmt.ParseIntError || error{InvalidFormat})!Uuid {
-        switch (separator) {
-            .none => {
-                if (str.len == 16) {
-                    // raw bytes
-                    var uuid: Uuid = undefined;
-                    @memcpy(&uuid.bytes, str[0..16]);
-                    return uuid;
-                } else if (str.len == 32) {
-                    // bytes rendered as a string without separators
-                    var uuid: Uuid = undefined;
-                    var i: usize = 0;
-                    for (0..16) |j| {
-                        uuid.bytes[j] = try std.fmt.parseUnsigned(u8, str[i..][0..2], 16);
-                        i += 2;
-                    }
-                    return uuid;
-                }
-                return error.InvalidFormat;
+    /// Parse a UUID from a string.
+    /// The string is expected to be one of the following formats:
+    /// - 16 raw bytes
+    /// - 32 hex digits with no separators
+    /// - 36 characters of 32 hex digits plus 4 separators at indices 8, 13, 18, and 23
+    pub fn from(str: []const u8) ParseError!Uuid {
+        return switch (str.len) {
+            16 => raw_bytes: {
+                var uuid: Uuid = undefined;
+                @memcpy(&uuid.bytes, str[0..16]);
+                break :raw_bytes uuid;
             },
-            inline else => |x| {
-                if (str.len != 36) {
-                    return error.InvalidFormat;
+            32 => hex_digits_no_separators: {
+                var uuid: Uuid = undefined;
+                var i: usize = 0;
+                for (0..16) |j| {
+                    uuid.bytes[j] = try std.fmt.parseUnsigned(u8, str[i..][0..2], 16);
+                    i += 2;
                 }
-                // separators need to be in the expected locations
-                if (str[8] != x.char().? and str[13] != x.char().? and str[18] != x.char().? and str[23] != x.char().?) {
-                    return error.InvalidFormat;
+                break :hex_digits_no_separators uuid;
+            },
+            36 => hex_digits_with_separators: {
+                const separator: u8 = str[8];
+                if (str[13] != separator and str[18] != separator and str[23] != separator) {
+                    return error.MismatchedSeparators;
+                }
+                switch (separator) {
+                    '-', '_', '.' => {},
+                    else => return error.InvalidSeparator,
                 }
 
                 var uuid: Uuid = undefined;
@@ -211,26 +235,33 @@ pub const Uuid = struct {
                     uuid.bytes[j] = try std.fmt.parseUnsigned(u8, str[i..][0..2], 16);
                     i += 2;
                 }
-
-                return uuid;
+                break :hex_digits_with_separators uuid;
             },
-        }
+            else => error.InvalidFormat,
+        };
     }
 
+    /// So that a UUID can be printed with the `{f}` specifier.
+    /// Writes the default lower-case format with dashes for separators.
+    /// If you want to write this UUID in a different format, use `writeTo()`.
     pub fn format(self: Uuid, writer: *Io.Writer) Io.Writer.Error!void {
-        try self.toStringCore(writer, .{});
+        try self.writeTo(writer, .{});
     }
 
+    /// Writes to a buffer.
+    /// This function is infallible due to enforcing the buffer's size in the function signature.
+    /// Will write no more than 36 bytes.
     pub fn toString(
         self: Uuid,
         buf: *[36]u8,
         fmt_opts: FormatOptions,
     ) []const u8 {
         var writer: Io.Writer = .fixed(buf);
-        self.toStringCore(&writer, fmt_opts) catch unreachable;
+        self.writeTo(&writer, fmt_opts) catch unreachable;
         return writer.buffered();
     }
 
+    /// Format the UUID, allocating the resulting string
     pub fn toStringAlloc(
         self: Uuid,
         gpa: Allocator,
@@ -239,11 +270,12 @@ pub const Uuid = struct {
         var stream: Io.Writer.Allocating = .init(gpa);
         defer stream.deinit();
 
-        self.toStringCore(&stream.writer, fmt_opts) catch return Allocator.Error.OutOfMemory;
+        self.writeTo(&stream.writer, fmt_opts) catch return Allocator.Error.OutOfMemory;
         return try stream.toOwnedSlice();
     }
 
-    fn toStringCore(
+    /// Format the UUID to a writer
+    pub fn writeTo(
         self: Uuid,
         writer: *Io.Writer,
         fmt_opts: FormatOptions,
@@ -254,40 +286,42 @@ pub const Uuid = struct {
                 .upper => try writer.print("{X}", .{self.bytes}),
             },
             // 8-4-4-4-12 format, or whichever separator
-            inline else => |x| switch (fmt_opts.casing) {
-                .lower => try writer.print("{x}{c}{x}{c}{x}{c}{x}{c}{x}", .{
-                    self.bytes[0..4],
-                    x.char().?,
-                    self.bytes[4..][0..2],
-                    x.char().?,
-                    self.bytes[6..][0..2],
-                    x.char().?,
-                    self.bytes[8..][0..2],
-                    x.char().?,
-                    self.bytes[10..],
-                }),
-                .upper => try writer.print("{X}{c}{X}{c}{X}{c}{X}{c}{X}", .{
-                    self.bytes[0..4],
-                    x.char().?,
-                    self.bytes[4..][0..2],
-                    x.char().?,
-                    self.bytes[6..][0..2],
-                    x.char().?,
-                    self.bytes[8..][0..2],
-                    x.char().?,
-                    self.bytes[10..],
-                }),
+            inline else => |x| {
+                const char: u8 = x.char().?;
+                switch (fmt_opts.casing) {
+                    .lower => try writer.print("{x}{c}{x}{c}{x}{c}{x}{c}{x}", .{
+                        self.bytes[0..4],
+                        char,
+                        self.bytes[4..][0..2],
+                        char,
+                        self.bytes[6..][0..2],
+                        char,
+                        self.bytes[8..][0..2],
+                        char,
+                        self.bytes[10..],
+                    }),
+                    .upper => try writer.print("{X}{c}{X}{c}{X}{c}{X}{c}{X}", .{
+                        self.bytes[0..4],
+                        char,
+                        self.bytes[4..][0..2],
+                        char,
+                        self.bytes[6..][0..2],
+                        char,
+                        self.bytes[8..][0..2],
+                        char,
+                        self.bytes[10..],
+                    }),
+                }
             },
         }
     }
 
+    /// Test if two UUID's are equal
     pub fn eql(a: Uuid, b: Uuid) bool {
-        const vec_a_1: @Vector(8, u8) = a.bytes[0..8][0..8].*;
-        const vec_a_2: @Vector(8, u8) = a.bytes[8..][0..8].*;
-        const vec_b_1: @Vector(8, u8) = b.bytes[0..8][0..8].*;
-        const vec_b_2: @Vector(8, u8) = b.bytes[8..][0..8].*;
+        const vec_a: @Vector(16, u8) = a.bytes;
+        const vec_b: @Vector(16, u8) = b.bytes;
 
-        return @reduce(.And, vec_a_1 == vec_b_1) and @reduce(.And, vec_a_2 == vec_b_2);
+        return @reduce(.And, vec_a == vec_b);
     }
 
     test v4 {
@@ -307,13 +341,13 @@ pub const Uuid = struct {
         // dashes
         {
             const uuid_str: []const u8 = uuid.toString(&buf, .{});
-            const parsed: Uuid = try .from(uuid_str, .dashes);
+            const parsed: Uuid = try .from(uuid_str);
             try testing.expect(uuid.eql(parsed));
         }
         // no dashes
         {
             const uuid_str: []const u8 = uuid.toString(&buf, .{ .seperator = .none });
-            const parsed: Uuid = try .from(uuid_str, .none);
+            const parsed: Uuid = try .from(uuid_str);
             try testing.expect(uuid.eql(parsed));
         }
     }
@@ -321,6 +355,15 @@ pub const Uuid = struct {
         const uuid: Uuid = .v4();
         const uuid_str: []const u8 = try uuid.toStringAlloc(testing.allocator, .{});
         defer testing.allocator.free(uuid_str);
+
+        const parsed: Uuid = try .from(uuid_str);
+        try testing.expect(uuid.eql(parsed));
+    }
+    test "alignment" {
+        var bytes: [16]u8 align(16) = @splat(0);
+        const uuid: *const Uuid = @ptrCast(&bytes);
+        try testing.expect(uuid.eql(.empty));
+        try testing.expect(@alignOf(Uuid) == 16);
     }
 };
 
