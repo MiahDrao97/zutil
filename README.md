@@ -65,6 +65,24 @@ fn parse(gpa: Allocator, to_parse: []const u8) !Managed(Value) {
 }
 ```
 
+## UUID
+Currently supporting v3, v4, and v5 for UUID generation.
+Assumes any 16 bytes can be a valid UUID, but provides parsing and some printing/formatting options.
+
+Example usage:
+```zig
+const std = @import("std");
+const gpa: std.Allocator = std.testing.allocator;
+
+const uuid: Uuid = .v4();
+std.debug.print("UUID: {f}\n", .{uuid}); // formatted like xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (lower-case) by default
+const uuid_str: []const u8 = try uuid.toStringAlloc(gpa, .{}); // can pass in format options
+defer gpa.free(uuid_str);
+
+const parsed: Uuid = try .from(uuid_str);
+try std.testing.expect(uuid.eql(parsed));
+```
+
 ## `cli` Namespace
 This namespace contains structures useful for parsing CLI args.
 Use `Arg` for arguments that will be assigned a value.

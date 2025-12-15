@@ -197,7 +197,7 @@ pub const Uuid = struct {
             16 => raw(str[0..16].*),
             32 => hex_digits_no_separators: {
                 var uuid: Uuid = undefined;
-                var i: usize = 0;
+                comptime var i: usize = 0;
                 inline for (0..16) |j| {
                     uuid.bytes[j] = try std.fmt.parseUnsigned(u8, str[i..][0..2], 16);
                     i += 2;
@@ -219,7 +219,7 @@ pub const Uuid = struct {
                 }
 
                 var uuid: Uuid = undefined;
-                var i: usize = 0;
+                comptime var i: usize = 0;
                 inline for (0..16) |j| {
                     uuid.bytes[j] = try std.fmt.parseUnsigned(u8, str[i..][0..2], 16);
                     i += 2;
@@ -243,7 +243,7 @@ pub const Uuid = struct {
 
     /// Writes to a buffer.
     /// This function is infallible due to enforcing the buffer's size in the function signature (will not write more than 36 bytes).
-    pub fn toString(
+    pub fn toStringBuf(
         self: Uuid,
         buf: *[36]u8,
         fmt_opts: FormatOptions,
@@ -332,13 +332,13 @@ pub const Uuid = struct {
         var buf: [36]u8 = undefined;
         // dashes
         {
-            const uuid_str: []const u8 = uuid.toString(&buf, .{});
+            const uuid_str: []const u8 = uuid.toStringBuf(&buf, .{});
             const parsed: Uuid = try .from(uuid_str);
             try testing.expect(uuid.eql(parsed));
         }
         // no dashes
         {
-            const uuid_str: []const u8 = uuid.toString(&buf, .{ .seperator = .none });
+            const uuid_str: []const u8 = uuid.toStringBuf(&buf, .{ .seperator = .none });
             const parsed: Uuid = try .from(uuid_str);
             try testing.expect(uuid.eql(parsed));
         }
