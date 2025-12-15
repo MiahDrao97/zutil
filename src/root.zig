@@ -118,7 +118,15 @@ pub const Uuid = struct {
         InvalidSeparator,
     };
 
+    /// Create a value from any 16 bytes
+    pub fn raw(bytes: [16]u8) Uuid {
+        var uuid: Uuid = undefined;
+        @memcpy(&uuid.bytes, &bytes);
+        return uuid;
+    }
+
     /// Concats `namespace` and `name` and creates a hash using the MD5 algorithm.
+    /// `gpa` is only for the above concatenation, which is freed on scope exit.
     /// NOTE : This is not considered cryptographically safe.
     pub fn v3(gpa: Allocator, namespace: []const u8, name: []const u8) Allocator.Error!Uuid {
         const to_hash: []u8 = try gpa.alloc(u8, namespace.len + name.len);
@@ -158,6 +166,7 @@ pub const Uuid = struct {
     }
 
     /// Concats `namespace` and `name` and creates a hash using the SHA1 algorithm.
+    /// `gpa` is only for the above concatenation, which is freed on scope exit.
     /// NOTE : This is not considered cryptographically safe.
     pub fn v5(gpa: Allocator, namespace: []const u8, name: []const u8) Allocator.Error!Uuid {
         // SHA1
@@ -180,60 +189,44 @@ pub const Uuid = struct {
 
     /// Parse a UUID from a string.
     /// The string is expected to be one of the following formats:
-    /// - 16 raw bytes
+    /// - 16 raw bytes (infallible if this is the case)
     /// - 32 hex digits with no separators
     /// - 36 characters of 32 hex digits plus 4 separators at indices 8, 13, 18, and 23
     pub fn from(str: []const u8) ParseError!Uuid {
         return switch (str.len) {
-            16 => raw_bytes: {
-                var uuid: Uuid = undefined;
-                @memcpy(&uuid.bytes, str[0..16]);
-                break :raw_bytes uuid;
-            },
+            16 => raw(str[0..16].*),
             32 => hex_digits_no_separators: {
                 var uuid: Uuid = undefined;
                 var i: usize = 0;
-                for (0..16) |j| {
+                inline for (0..16) |j| {
                     uuid.bytes[j] = try std.fmt.parseUnsigned(u8, str[i..][0..2], 16);
                     i += 2;
                 }
                 break :hex_digits_no_separators uuid;
             },
             36 => hex_digits_with_separators: {
-                const separator: u8 = str[8];
-                if (str[13] != separator and str[18] != separator and str[23] != separator) {
+                const separator_indices: [4]usize = .{ 8, 13, 18, 23 };
+                var separators: [4]u8 = undefined;
+                inline for (&separators, separator_indices) |*s, i| s.* = str[i];
+
+                const first: u8 = separators[0];
+                if (@reduce(.And, @as(@Vector(4, u8), separators)) != first) {
                     return error.MismatchedSeparators;
                 }
-                switch (separator) {
+                switch (first) {
                     '-', '_', '.' => {},
                     else => return error.InvalidSeparator,
                 }
 
                 var uuid: Uuid = undefined;
                 var i: usize = 0;
-                for (0..4) |j| {
+                inline for (0..16) |j| {
                     uuid.bytes[j] = try std.fmt.parseUnsigned(u8, str[i..][0..2], 16);
                     i += 2;
-                }
-                i += 1;
-                for (4..6) |j| {
-                    uuid.bytes[j] = try std.fmt.parseUnsigned(u8, str[i..][0..2], 16);
-                    i += 2;
-                }
-                i += 1;
-                for (6..8) |j| {
-                    uuid.bytes[j] = try std.fmt.parseUnsigned(u8, str[i..][0..2], 16);
-                    i += 2;
-                }
-                i += 1;
-                for (8..10) |j| {
-                    uuid.bytes[j] = try std.fmt.parseUnsigned(u8, str[i..][0..2], 16);
-                    i += 2;
-                }
-                i += 1;
-                for (10..16) |j| {
-                    uuid.bytes[j] = try std.fmt.parseUnsigned(u8, str[i..][0..2], 16);
-                    i += 2;
+                    const current: @Vector(4, usize) = @splat(i);
+                    if (@reduce(.Or, current == separator_indices)) {
+                        i += 1;
+                    }
                 }
                 break :hex_digits_with_separators uuid;
             },
@@ -249,8 +242,7 @@ pub const Uuid = struct {
     }
 
     /// Writes to a buffer.
-    /// This function is infallible due to enforcing the buffer's size in the function signature.
-    /// Will write no more than 36 bytes.
+    /// This function is infallible due to enforcing the buffer's size in the function signature (will not write more than 36 bytes).
     pub fn toString(
         self: Uuid,
         buf: *[36]u8,
@@ -349,6 +341,14 @@ pub const Uuid = struct {
             const uuid_str: []const u8 = uuid.toString(&buf, .{ .seperator = .none });
             const parsed: Uuid = try .from(uuid_str);
             try testing.expect(uuid.eql(parsed));
+        }
+        // raw
+        {
+            const raw_bytes: [16]u8 = @splat('a');
+            const parsed: Uuid = try .from(&raw_bytes);
+            for (&parsed.bytes) |b| {
+                try testing.expect(b == 'a');
+            }
         }
     }
     test toStringAlloc {

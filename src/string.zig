@@ -157,15 +157,14 @@ fn separatedCase(
 ) Io.Writer.Error!void {
     std.debug.assert(casing != .either);
 
-    var last: u8 = 0;
+    var last: ?u8 = null;
     for (str, 0..) |char, i| switch (char) {
         '0'...'9' => {
             const next_is_digit: bool = i + 1 < str.len and ascii.isDigit(str[i + 1]);
-            if (writer.end > 0) {
-                if ((last != separator and !ascii.isDigit(last)) or !next_is_digit) {
+            if (last) |l|
+                if (!next_is_digit or (l != separator and !ascii.isDigit(l))) {
                     try writer.writeByte(separator);
-                }
-            }
+                };
             try writer.writeByte(char);
             last = char;
         },
@@ -173,11 +172,11 @@ fn separatedCase(
             const next_is_upper: bool = i + 1 < str.len and
                 (ascii.isUpper(str[i + 1]) or !ascii.isAlphabetic(str[i + 1]));
             const prev_is_upper: bool = i > 0 and ascii.isUpper(str[i - 1]);
-            if (ascii.isUpper(char) and writer.end > 0) {
-                if (last != separator and ((!next_is_upper and i + 1 < str.len) or !prev_is_upper)) {
-                    try writer.writeByte(separator);
-                }
-            }
+            if (ascii.isUpper(char))
+                if (last != null and last != separator)
+                    if (!prev_is_upper or ((!next_is_upper and i + 1 < str.len))) {
+                        try writer.writeByte(separator);
+                    };
             const c: u8 = switch (casing) {
                 .upper => ascii.toUpper(char),
                 .lower => ascii.toLower(char),
@@ -187,11 +186,9 @@ fn separatedCase(
             last = c;
         },
         else => {
-            if (writer.end > 0) {
-                if (last != separator) {
-                    try writer.writeByte(separator);
-                    last = separator;
-                }
+            if (last != null and last != separator) {
+                try writer.writeByte(separator);
+                last = separator;
             }
         }
     };
