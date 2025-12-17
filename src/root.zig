@@ -119,9 +119,9 @@ pub const Uuid = struct {
     };
 
     /// Create a value from any 16 bytes
-    pub fn raw(bytes: [16]u8) Uuid {
+    pub fn raw(bytes: *const [16]u8) Uuid {
         var uuid: Uuid = undefined;
-        @memcpy(&uuid.bytes, &bytes);
+        @memcpy(&uuid.bytes, bytes);
         return uuid;
     }
 
@@ -194,7 +194,7 @@ pub const Uuid = struct {
     /// - 36 characters of 32 hex digits plus 4 separators at indices 8, 13, 18, and 23
     pub fn from(str: []const u8) ParseError!Uuid {
         return switch (str.len) {
-            16 => raw(str[0..16].*),
+            16 => raw(str[0..16]),
             32 => hex_digits_no_separators: {
                 var uuid: Uuid = undefined;
                 comptime var i: usize = 0;
@@ -347,6 +347,10 @@ pub const Uuid = struct {
             const raw_bytes: [16]u8 = @splat('a');
             const parsed: Uuid = try .from(&raw_bytes);
             for (&parsed.bytes) |b| {
+                try testing.expect(b == 'a');
+            }
+            const raw_uuid: Uuid = .raw(&raw_bytes);
+            for (&raw_uuid.bytes) |b| {
                 try testing.expect(b == 'a');
             }
         }
