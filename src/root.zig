@@ -69,7 +69,7 @@ pub fn structSubset(comptime TSubset: type, @"struct": anytype) TSubset {
 }
 
 /// Universally unique identifier
-/// Currently supports v3, v4, and v5
+/// Currently supports v3, v4, v5, and v7
 pub const Uuid = struct {
     /// Any 16 bytes are assumed to be a valid UUID.
     /// However, generating UUID's is what makes them special, as there are various methods to create them.
@@ -81,6 +81,13 @@ pub const Uuid = struct {
 
     /// Maximum value a UUID can be
     pub const max: Uuid = .{ .bytes = @splat(0xff) };
+
+    /// Default comparer if used in any sorting algorithm in `std.mem`
+    pub const comparer: struct {
+        pub fn lessThan(_: @This(), a: Uuid, b: Uuid) bool {
+            return a.lessThan(b);
+        }
+    } = .{};
 
     /// Format options when printing
     pub const FormatOptions = struct {
@@ -144,7 +151,7 @@ pub const Uuid = struct {
     }
 
     /// Create a UUIDv4 using a specific implementation of `std.Random`
-    pub fn v4Random(random: std.Random) Uuid {
+    pub fn v4Random(random: Random) Uuid {
         var uuid: Uuid = undefined;
         random.bytes(&uuid.bytes);
 
@@ -169,7 +176,6 @@ pub const Uuid = struct {
     /// `gpa` is only for the above concatenation, which is freed on scope exit.
     /// NOTE : This is not considered cryptographically safe.
     pub fn v5(gpa: Allocator, namespace: []const u8, name: []const u8) Allocator.Error!Uuid {
-        // SHA1
         const to_hash: []u8 = try gpa.alloc(u8, namespace.len + name.len);
         defer gpa.free(to_hash);
         @memcpy(to_hash[0..namespace.len], namespace);
@@ -185,6 +191,38 @@ pub const Uuid = struct {
         @memcpy(&uuid.bytes, out[0..16]);
 
         return uuid;
+    }
+
+    /// The first 6 bytes represent a millisecond timestamp, which provides a sense of time-based ordering to the identifier.
+    /// The 7th byte starts with a 0x7 since this is version 7 and the rest is random
+    pub fn v7Random(random: Random) Uuid {
+        var uuid: Uuid = undefined;
+
+        const ms: i48 = @truncate(std.time.milliTimestamp());
+        // These need to be represented as big endian
+        const ms_bytes: *const [6]u8 = switch (@import("builtin").target.cpu.arch.endian()) {
+            .little => little_endian: {
+                var ms_big: [6]u8 = undefined;
+                const ms_little: *const [6]u8 = @ptrCast(&ms);
+                inline for (&ms_big, 1..) |*b, i| b.* = ms_little[6 - i];
+                break :little_endian &ms_big;
+            },
+            .big => @ptrCast(&ms),
+        };
+        @memcpy(uuid.bytes[0..6], ms_bytes);
+
+        random.bytes(uuid.bytes[6..]);
+
+        // since this is v7 the 7th byte must start with 7
+        uuid.bytes[6] &= 0x0f;
+        uuid.bytes[6] |= 0x70;
+
+        return uuid;
+    }
+
+    /// Uses `std.crypto.random` as default implementation
+    pub fn v7() Uuid {
+        return v7Random(crypto.random);
     }
 
     /// Parse a UUID from a string.
@@ -316,16 +354,50 @@ pub const Uuid = struct {
         return @reduce(.And, vec_a == vec_b);
     }
 
+    /// Use this to sort UUIDs.
+    /// Generally, sorting doesn't make much sense outside of generating UUIDs with v7, since those begin with a ms timestamp of their creation time.
+    pub fn lessThan(a: Uuid, b: Uuid) bool {
+        return inline for (&a.bytes, &b.bytes) |x, y| {
+            if (x < y) break true;
+            if (x > y) break false;
+        } else false;
+    }
+
+    test lessThan {
+        const a: Uuid = try .from("019b3d7e-cfd2-7eef-ee0d-aa4f305fcf22");
+        const b: Uuid = try .from("019b3d7e-cfe2-7b6f-ff94-876ee3312800");
+        try testing.expect(a.lessThan(b));
+    }
     test v4 {
-        for (0..1000) |_| {
+        var prev: ?Uuid = null;
+        for (0..100) |_| {
             const uuid: Uuid = .v4();
+            defer prev = uuid;
+
             try testing.expect(uuid.bytes[6] >= 0x40 and uuid.bytes[6] < 0x50);
             try testing.expect(uuid.bytes[8] >= 0x80 and uuid.bytes[8] < 0xc0);
+            if (prev) |p| {
+                try testing.expect(!uuid.eql(p));
+            }
         }
-        const a: Uuid = .v4();
-        const b: Uuid = .v4();
+    }
+    test v7 {
+        var prev: ?Uuid = null;
+        for (0..100) |_| {
+            const uuid: Uuid = .v7();
+            defer prev = uuid;
 
-        try testing.expect(!a.eql(b));
+            std.debug.print("{f}\n", .{uuid});
+
+            try testing.expect(uuid.bytes[6] >= 0x70 and uuid.bytes[6] < 0x80);
+            if (prev) |p| {
+                try testing.expect(!uuid.eql(p));
+                try testing.expect(p.lessThan(uuid));
+            }
+
+            // need to guarantee they're spaced out by at least 1ms, or else the `lessThan()` check fails
+            std.Thread.sleep(1_000_000);
+        }
     }
     test from {
         const uuid: Uuid = .v4();
@@ -383,3 +455,4 @@ const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const SourceLocation = std.builtin.SourceLocation;
+const Random = std.Random;
