@@ -1,10 +1,12 @@
 //! Various utilities that I find myself reusing across Zig codebases.
 //! - MiahDrao97
 
-/// Command line utilies
+/// Command line utilies namespace
 pub const cli = @import("cli.zig");
-/// String utilities
-pub const string = @import("string.zig");
+/// String utilities namespace
+pub const string = struct {
+    pub const Casing = @import("string/Casing.zig");
+};
 
 /// A managed value is useful when memory won't be or can't be freed after doing the work to create said value.
 /// However, when this managed value is freed, all memory allocated when it was created will also be freed.
@@ -444,7 +446,8 @@ pub const Uuid = struct {
 };
 
 comptime {
-    testing.refAllDecls(@This());
+    _ = string.Casing;
+    _ = cli;
 }
 
 const std = @import("std");

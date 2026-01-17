@@ -66,7 +66,7 @@ fn parse(gpa: Allocator, to_parse: []const u8) !Managed(Value) {
 ```
 
 ## UUID
-Currently supporting v3, v4, and v5 for UUID generation.
+Currently supporting v3, v4, v5, and v7 for UUID generation.
 Assumes any 16 bytes can be a valid UUID, but provides parsing and some printing/formatting options.
 
 Example usage:
@@ -158,3 +158,16 @@ try testing.expect(!c.value);
 
 ## `string` Namespace
 Currently only have casing utilies (convert a string to camel case, title case, kebab, snake, and screaming snake).
+```zig
+const std = @import("std");
+const zutil = @import("zutil");
+const Casing = zutil.string.Casing;
+
+test {
+    var stream: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stream.deinit();
+
+    try stream.print("{f}", .{Casing.titleCase("something-to-case")});
+    try std.testing.expectEqualStrings("SomethingToCase", stream.written());
+}
+```
