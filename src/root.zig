@@ -19,7 +19,7 @@ pub fn Managed(comptime T: type) type {
         /// Arena used to create the managed value
         arena: ArenaAllocator,
 
-        const mine = minefield.landmine(enum { init }, create);
+        const mine = minefield.plant(enum { init }, create);
 
         /// Create a new managed value.
         /// Returns `self.*` (usually because you're returning this managed value or passing it as an argument).
