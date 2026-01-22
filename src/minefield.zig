@@ -1,7 +1,7 @@
 //! Really, just a reskinning of Mitchell Hashimoto's [TripWire](https://mitchellh.com/writing/tripwire)
 //! OG source code mimicked from here: https://github.com/ghostty-org/ghostty/blob/main/src/tripwire.zig
 //!
-//! This is was a convention created by Mitchel Hashimoto for the Ghostty project to ensure testing of `errdefer` paths.
+//! This is was a convention created by Mitchell Hashimoto for the Ghostty project to ensure testing of `errdefer` paths.
 //! Essentially, right before any failable function call, you can simply place a landmine before.
 //! If the landmine is set to detonate when stepped on, the specified error will be returned, thereby testing the `errdefer` logic path.
 //! It does not generate any machine code in non-test builds.
