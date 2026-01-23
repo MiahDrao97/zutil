@@ -160,13 +160,13 @@ pub const FlagSet = struct {
     }
 
     /// Initialize from an array, which allows us to determine the upper bound of memory required for this set.
-    pub fn initBounded(n: comptime_int, flags: [n]Flag.Named, buf: *[requiredCapacityBytes(n)]u8) Self {
+    pub fn initBounded(n: comptime_int, flags: [n]Flag.Named, buf: *[bytesForCapacity(n)]u8) Self {
         var fba: FixedBufferAllocator = .init(buf);
         return init(fba.allocator(), &flags) catch unreachable;
     }
 
     /// Determined the number of bytes required for a buffer with capacity `n`
-    pub fn requiredCapacityBytes(n: usize) usize {
+    pub fn bytesForCapacity(n: usize) usize {
         var capacity: usize = 0;
         while (capacity < n) {
             capacity +|= capacity / 2 + std.atomic.cache_line;
@@ -395,12 +395,10 @@ comptime {
                 const letters: [n]u8 = std.simd.iota(u8, n) + @as(@Vector(n, u8), @splat('a'));
                 var flags: [n]Flag = @splat(.off);
                 var named: [n]Flag.Named = undefined;
-                for (&named, &flags, &letters) |*aliased, *f, letter| aliased.* = .{
-                    .flag = f,
-                    .name = letter,
-                };
+                for (&named, &flags, &letters) |*aliased, *f, letter|
+                    aliased.* = f.alias(letter);
 
-                var buf: [FlagSet.requiredCapacityBytes(n)]u8 = undefined;
+                var buf: [FlagSet.bytesForCapacity(n)]u8 = undefined;
                 // if our buffer size is wrong, the following line will panic:
                 const set: FlagSet = .initBounded(n, named, &buf);
                 try testing.expect(!try set.toggleAny(""));

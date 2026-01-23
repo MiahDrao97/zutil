@@ -20,7 +20,7 @@ pub fn main() !void {
         flag.alias('f'),
         other.alias('o'),
     };
-    var buf: [FlagSet.requiredCapacityBytes(all_flags.len)]u8 = undefined;
+    var buf: [FlagSet.bytesForCapacity(all_flags.len)]u8 = undefined;
     const set: FlagSet = .initBounded(all_flags.len, all_flags, &buf);
 
     _ = arg_iter.next(); // skip first arg (that's the .exe)
