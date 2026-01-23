@@ -19,7 +19,7 @@ pub fn Managed(comptime T: type) type {
         /// Arena used to create the managed value
         arena: ArenaAllocator,
 
-        const mine = minefield.plant(enum { init }, create);
+        const mine = minefield.set(enum { init }, anyerror);
 
         /// Create a new managed value.
         /// Returns `self.*` (usually because you're returning this managed value or passing it as an argument).
@@ -425,8 +425,6 @@ pub const Uuid = struct {
             const uuid: Uuid = .v7();
             defer prev = uuid;
 
-            std.debug.print("{f}\n", .{uuid});
-
             try testing.expect(uuid.bytes[6] >= 0x70 and uuid.bytes[6] < 0x80);
             if (prev) |p| {
                 try testing.expect(!uuid.eql(p));
@@ -484,6 +482,9 @@ pub const Uuid = struct {
 comptime {
     _ = string.Casing;
     _ = cli;
+    _ = minefield;
+    _ = Uuid;
+    _ = Managed(void);
 }
 
 const std = @import("std");
