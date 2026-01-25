@@ -9,6 +9,8 @@ pub const string = struct {
 };
 /// Minefield namespace for testing error paths, exactly like M. Hashimoto's Tripwire
 pub const minefield = @import("minefield.zig");
+/// General-purpose memory cache
+pub const MemCache = @import("MemCache.zig");
 
 /// A managed value is useful when memory won't be or can't be freed after doing the work to create said value.
 /// However, when this managed value is freed, all memory allocated when it was created will also be freed.
@@ -188,26 +190,21 @@ pub const Uuid = struct {
         return uuid;
     }
 
-    /// Create a UUIDv4 using a specific implementation of `std.Random`
-    pub fn v4Random(random: Random) Uuid {
+    /// Create a UUIDv4
+    pub fn v4(io: Io) Uuid {
         var uuid: Uuid = undefined;
-        random.bytes(&uuid.bytes);
+        io.random(&uuid.bytes);
 
         // since this is v4, the 7th byte must start with 4
         uuid.bytes[6] &= 0x0f;
         uuid.bytes[6] |= 0x40;
 
         // the 9th byte must start with 8, 9, a, or b
-        const mod: u8 = 0x80 + (@as(u8, random.int(u2)) * 0x10);
+        const mod: u8 = 0x80 + (@as(u8, @as(u2, @truncate(uuid.bytes[8]))) * 0x10);
         uuid.bytes[8] &= 0x0f;
         uuid.bytes[8] |= mod;
 
         return uuid;
-    }
-
-    /// Uses `std.crypto.random` as default implementation
-    pub fn v4() Uuid {
-        return v4Random(crypto.random);
     }
 
     /// Concats `namespace` and `name` and creates a hash using the SHA1 algorithm.
@@ -233,10 +230,11 @@ pub const Uuid = struct {
 
     /// The first 6 bytes represent a millisecond timestamp, which provides a sense of time-based ordering to the identifier.
     /// The 7th byte starts with a 0x7 since this is version 7 and the rest is random
-    pub fn v7Random(random: Random) Uuid {
+    pub fn v7(io: Io) Io.Clock.Error!Uuid {
         var uuid: Uuid = undefined;
 
-        const ms: i48 = @truncate(std.time.milliTimestamp());
+        const timestamp: Io.Timestamp = try Io.Clock.real.now(io);
+        const ms: i48 = @truncate(timestamp.toMilliseconds());
         // These need to be represented as big endian
         const ms_bytes: *const [6]u8 = switch (@import("builtin").target.cpu.arch.endian()) {
             .little => little_endian: {
@@ -249,18 +247,13 @@ pub const Uuid = struct {
         };
         @memcpy(uuid.bytes[0..6], ms_bytes);
 
-        random.bytes(uuid.bytes[6..]);
+        io.random(uuid.bytes[6..]);
 
         // since this is v7 the 7th byte must start with 7
         uuid.bytes[6] &= 0x0f;
         uuid.bytes[6] |= 0x70;
 
         return uuid;
-    }
-
-    /// Uses `std.crypto.random` as default implementation
-    pub fn v7() Uuid {
-        return v7Random(crypto.random);
     }
 
     /// Parse a UUID from a string.
@@ -409,7 +402,7 @@ pub const Uuid = struct {
     test v4 {
         var prev: ?Uuid = null;
         for (0..100) |_| {
-            const uuid: Uuid = .v4();
+            const uuid: Uuid = .v4(testing.io);
             defer prev = uuid;
 
             try testing.expect(uuid.bytes[6] >= 0x40 and uuid.bytes[6] < 0x50);
@@ -422,7 +415,7 @@ pub const Uuid = struct {
     test v7 {
         var prev: ?Uuid = null;
         for (0..100) |_| {
-            const uuid: Uuid = .v7();
+            const uuid: Uuid = try .v7(testing.io);
             defer prev = uuid;
 
             try testing.expect(uuid.bytes[6] >= 0x70 and uuid.bytes[6] < 0x80);
@@ -432,11 +425,11 @@ pub const Uuid = struct {
             }
 
             // need to guarantee they're spaced out by at least 1ms, or else the `lessThan()` check fails
-            std.Thread.sleep(1_000_000);
+            try testing.io.sleep(.fromMilliseconds(1), Io.Clock.real);
         }
     }
     test from {
-        const uuid: Uuid = .v4();
+        const uuid: Uuid = .v4(testing.io);
         var buf: [36]u8 = undefined;
         // dashes
         {
@@ -464,7 +457,7 @@ pub const Uuid = struct {
         }
     }
     test toStringAlloc {
-        const uuid: Uuid = .v4();
+        const uuid: Uuid = .v4(testing.io);
         const uuid_str: []const u8 = try uuid.toStringAlloc(testing.allocator, .{});
         defer testing.allocator.free(uuid_str);
 
@@ -485,13 +478,14 @@ comptime {
     _ = minefield;
     _ = Uuid;
     _ = Managed(void);
+    _ = MemCache;
 }
 
 const std = @import("std");
 const log = std.log;
-const Io = std.Io;
 const crypto = std.crypto;
 const testing = std.testing;
+const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const SourceLocation = std.builtin.SourceLocation;

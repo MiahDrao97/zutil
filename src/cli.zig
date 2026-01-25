@@ -37,7 +37,7 @@ pub const Arg = struct {
         self: *Arg,
         arg_names: []const []const u8,
         arg: []const u8,
-        iter: *ArgIterator,
+        iter: *process.Args.Iterator,
     ) ParseError!bool {
         return for (arg_names) |name| {
             if (std.mem.eql(u8, name, arg)) {
@@ -207,10 +207,10 @@ test Arg {
         const cmd_line_w: []const u16 = try std.unicode.utf8ToUtf16LeAlloc(testing.allocator, cmd);
         defer testing.allocator.free(cmd_line_w);
 
-        var iter_windows: ArgIteratorWindows = try .init(testing.allocator, cmd_line_w);
-        defer iter_windows.deinit();
+        const args: process.Args = .{ .vector = cmd_line_w };
+        var iter: process.Args.Iterator = try args.iterateAllocator(testing.allocator);
+        defer iter.deinit();
 
-        var iter: ArgIterator = .{ .inner = iter_windows };
         var some_value: Arg = .unassigned;
 
         _ = iter.next(); // skip first arg since that's the .exe
@@ -225,10 +225,10 @@ test Arg {
         const cmd_line_w: []const u16 = try std.unicode.utf8ToUtf16LeAlloc(testing.allocator, cmd);
         defer testing.allocator.free(cmd_line_w);
 
-        var iter_windows: ArgIteratorWindows = try .init(testing.allocator, cmd_line_w);
-        defer iter_windows.deinit();
+        const args: process.Args = .{ .vector = cmd_line_w };
+        var iter: process.Args.Iterator = try args.iterateAllocator(testing.allocator);
+        defer iter.deinit();
 
-        var iter: ArgIterator = .{ .inner = iter_windows };
         var some_value: Arg = .unassigned;
 
         var already_assigned: ?error{AlreadyAssigned} = null;
@@ -247,10 +247,10 @@ test Arg {
         const cmd_line_w: []const u16 = try std.unicode.utf8ToUtf16LeAlloc(testing.allocator, cmd);
         defer testing.allocator.free(cmd_line_w);
 
-        var iter_windows: ArgIteratorWindows = try .init(testing.allocator, cmd_line_w);
-        defer iter_windows.deinit();
+        const args: process.Args = .{ .vector = cmd_line_w };
+        var iter: process.Args.Iterator = try args.iterateAllocator(testing.allocator);
+        defer iter.deinit();
 
-        var iter: ArgIterator = .{ .inner = iter_windows };
         var some_value: Arg = .unassigned;
 
         _ = iter.next();
@@ -264,10 +264,10 @@ test Arg {
         const cmd_line_w: []const u16 = try std.unicode.utf8ToUtf16LeAlloc(testing.allocator, cmd);
         defer testing.allocator.free(cmd_line_w);
 
-        var iter_windows: ArgIteratorWindows = try .init(testing.allocator, cmd_line_w);
-        defer iter_windows.deinit();
+        const args: process.Args = .{ .vector = cmd_line_w };
+        var iter: process.Args.Iterator = try args.iterateAllocator(testing.allocator);
+        defer iter.deinit();
 
-        var iter: ArgIterator = .{ .inner = iter_windows };
         var some_value: Arg = .unassigned;
 
         while (iter.next()) |arg|
@@ -281,10 +281,10 @@ test Arg {
         const cmd_line_w: []const u16 = try std.unicode.utf8ToUtf16LeAlloc(testing.allocator, cmd);
         defer testing.allocator.free(cmd_line_w);
 
-        var iter_windows: ArgIteratorWindows = try .init(testing.allocator, cmd_line_w);
-        defer iter_windows.deinit();
+        const args: process.Args = .{ .vector = cmd_line_w };
+        var iter: process.Args.Iterator = try args.iterateAllocator(testing.allocator);
+        defer iter.deinit();
 
-        var iter: ArgIterator = .{ .inner = iter_windows };
         var some_value: Arg = .unassigned;
 
         _ = iter.next();
@@ -299,10 +299,10 @@ test Arg {
         const cmd_line_w: []const u16 = try std.unicode.utf8ToUtf16LeAlloc(testing.allocator, cmd);
         defer testing.allocator.free(cmd_line_w);
 
-        var iter_windows: ArgIteratorWindows = try .init(testing.allocator, cmd_line_w);
-        defer iter_windows.deinit();
+        const args: process.Args = .{ .vector = cmd_line_w };
+        var iter: process.Args.Iterator = try args.iterateAllocator(testing.allocator);
+        defer iter.deinit();
 
-        var iter: ArgIterator = .{ .inner = iter_windows };
         var some_value: Arg = .unassigned;
 
         _ = iter.next();
@@ -318,10 +318,10 @@ test Arg {
         const cmd_line_w: []const u16 = try std.unicode.utf8ToUtf16LeAlloc(testing.allocator, cmd);
         defer testing.allocator.free(cmd_line_w);
 
-        var iter_windows: ArgIteratorWindows = try .init(testing.allocator, cmd_line_w);
-        defer iter_windows.deinit();
+        const args: process.Args = .{ .vector = cmd_line_w };
+        var iter: process.Args.Iterator = try args.iterateAllocator(testing.allocator);
+        defer iter.deinit();
 
-        var iter: ArgIterator = .{ .inner = iter_windows };
         var some_value: Arg = .unassigned;
 
         _ = iter.next();
@@ -336,10 +336,10 @@ test Arg {
         const cmd_line_w: []const u16 = try std.unicode.utf8ToUtf16LeAlloc(testing.allocator, cmd);
         defer testing.allocator.free(cmd_line_w);
 
-        var iter_windows: ArgIteratorWindows = try .init(testing.allocator, cmd_line_w);
-        defer iter_windows.deinit();
+        const args: process.Args = .{ .vector = cmd_line_w };
+        var iter: process.Args.Iterator = try args.iterateAllocator(testing.allocator);
+        defer iter.deinit();
 
-        var iter: ArgIterator = .{ .inner = iter_windows };
         var some_value: Arg = .unassigned;
 
         _ = iter.next();
@@ -354,10 +354,10 @@ test Arg {
         const cmd_line_w: []const u16 = try std.unicode.utf8ToUtf16LeAlloc(testing.allocator, cmd);
         defer testing.allocator.free(cmd_line_w);
 
-        var iter_windows: ArgIteratorWindows = try .init(testing.allocator, cmd_line_w);
-        defer iter_windows.deinit();
+        const args: process.Args = .{ .vector = cmd_line_w };
+        var iter: process.Args.Iterator = try args.iterateAllocator(testing.allocator);
+        defer iter.deinit();
 
-        var iter: ArgIterator = .{ .inner = iter_windows };
         var some_value: Arg = .unassigned;
 
         _ = iter.next();
@@ -409,8 +409,7 @@ comptime {
 
 const std = @import("std");
 const testing = std.testing;
-const ArgIterator = std.process.ArgIterator;
-const ArgIteratorWindows = std.process.ArgIteratorWindows;
+const process = std.process;
 const log = std.log.scoped(.@"zutil.cli");
 const FixedBufferAllocator = std.heap.FixedBufferAllocator;
 const Allocator = std.mem.Allocator;

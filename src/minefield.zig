@@ -1,7 +1,7 @@
 //! Really, just a reskinning of Mitchell Hashimoto's [TripWire](https://mitchellh.com/writing/tripwire)
 //! OG source code mimicked from here: https://github.com/ghostty-org/ghostty/blob/main/src/tripwire.zig
 //!
-//! This is was a convention created by Mitchell Hashimoto for the Ghostty project to ensure testing of `errdefer` paths.
+//! This is a convention created by Mitchell Hashimoto for the Ghostty project to ensure testing of `errdefer` paths.
 //! Essentially, right before any failable function call, you can simply place a mine before.
 //! If the mine is set to detonate when stepped on (or when stepped on a certain number of times),
 //! the specified error will be returned, thereby testing the `errdefer` logic path.
@@ -12,7 +12,7 @@
 /// `E` - an error set, error union, or failable function (the minefield we're planting mines in).
 pub fn set(comptime F: type, comptime E: anytype) type {
     return struct {
-        /// Expose `Fuse` back
+        /// Expose `F` back
         pub const Fuse = F;
         /// Expose `E` back
         pub const Error = err: {
@@ -34,8 +34,6 @@ pub fn set(comptime F: type, comptime E: anytype) type {
         // static map of mines
         var mine_map: MineMap = .{};
 
-        /// Inline when not live so that no machine code will be produced
-        const cc: std.builtin.CallingConvention = if (live) .auto else .@"inline";
         /// Map of all active fuses
         const MineMap = std.EnumMap(Fuse, Mine);
         /// The mine itself
@@ -61,7 +59,7 @@ pub fn set(comptime F: type, comptime E: anytype) type {
         /// Step on a mine with a given fuse.
         /// It will only detonate if configured to.
         /// In non-test builds (releases and even debug), this function has no effect and doesn't even emit machine code.
-        pub fn stepOn(fuse: Fuse) callconv(cc) Error!void {
+        pub inline fn stepOn(fuse: Fuse) Error!void {
             if (!comptime live) return;
 
             const m: *Mine = mine_map.getPtr(fuse) orelse return;
