@@ -10,7 +10,7 @@ pub const string = struct {
 /// Minefield namespace for testing error paths, exactly like M. Hashimoto's Tripwire
 pub const minefield = @import("minefield.zig");
 /// General-purpose memory cache
-pub const MemCache = @import("MemCache.zig");
+pub const MemCache = @import("mem_cache.zig").MemCache;
 
 /// A managed value is useful when memory won't be or can't be freed after doing the work to create said value.
 /// However, when this managed value is freed, all memory allocated when it was created will also be freed.
@@ -478,7 +478,7 @@ comptime {
     _ = minefield;
     _ = Uuid;
     _ = Managed(void);
-    _ = MemCache;
+    _ = MemCache(.@"1");
 }
 
 const std = @import("std");
