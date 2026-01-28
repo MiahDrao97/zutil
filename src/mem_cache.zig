@@ -14,7 +14,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
     return struct {
         /// The cache of raw values
         value_cache: ValueCache,
-        /// The cache of values containing the size of each value
+        /// The cache containing the length of each value
         len_cache: LenCache,
         /// Io group that handles entry expirations
         expiration_group: Io.Group,

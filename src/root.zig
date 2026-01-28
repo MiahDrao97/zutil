@@ -5,6 +5,7 @@
 pub const cli = @import("cli.zig");
 /// String utilities namespace
 pub const string = struct {
+    /// Casing utilities
     pub const Casing = @import("string/Casing.zig");
 };
 /// Minefield namespace for testing error paths, exactly like M. Hashimoto's Tripwire
