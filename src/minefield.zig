@@ -61,9 +61,15 @@ pub fn set(comptime F: type, comptime E: anytype) type {
         /// In non-test builds (releases and even debug), this function has no effect and doesn't even emit machine code.
         pub inline fn stepOn(fuse: Fuse) Error!void {
             if (!comptime live) return;
+            try stepOnSubset(fuse, Error);
+        }
+
+        /// Step on a mine with a given fuse, but it can only return a subset of `Error`
+        pub inline fn stepOnSubset(fuse: Fuse, comptime ErrorSubset: type) ErrorSubset!void {
+            if (!comptime live) return;
 
             const m: *Mine = mine_map.getPtr(fuse) orelse return;
-            try m.step();
+            return @errorCast(m.step());
         }
 
         /// Activates a mine with the corresponding fuse.
