@@ -30,13 +30,17 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         /// Each active reader represents one unit on the entry's reference_count (max active references for an entry is 127).
         pub const SafeReader = struct {
             /// Reference count for the number of references to this particular cache entry
-            ref_count: *RefCount,
+            ref_count: *Atomic(RefCount),
             /// Raw cache entry
             raw_value: []align(max_alignment.toByteUnits()) const u8,
 
             /// After this call, the entry is no longer safe to read
             pub fn release(self: SafeReader) void {
-                const prev_count: RefCount = @atomicRmw(RefCount, self.ref_count, .Xchg, self.ref_count.minusOne(), .release);
+                const prev_count: RefCount = self.ref_count.rmw(
+                    .Xchg,
+                    self.ref_count.load(.monotonic).minusOne(),
+                    .release,
+                );
                 // The previous ref count must be some value between 1 and 127.
                 // Otherwise, something's broken...
                 debug.assert(prev_count.compare(.gt, .zero));
@@ -201,7 +205,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                         value_gop.value_ptr.* = v.ptr;
                         metadata.len = @intCast(v.len);
                         // let other threads know that this can be safely read
-                        metadata.ref_count = .zero;
+                        metadata.ref_count.store(.zero, .release);
                     }
                 } else {
                     value_gop.value_ptr.* = v.ptr;
@@ -251,7 +255,8 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         /// Lock an entry, producing a `SafeReader` that repesents an active read on the entry.
         /// Until the `SafeReader` is released, this entry is safe to read.
         /// Returns null if no entry exists with this key.
-        pub fn lockEntry(self: *Self, io: Io, key: []const u8) Io.Cancelable!?SafeReader {
+        /// Returns `error.TooManyOpenReaders` if the ref count would exceed 127.
+        pub fn lockEntry(self: *Self, io: Io, key: []const u8) (error{TooManyOpenReaders} || Io.Cancelable)!?SafeReader {
             const k: StringHash = .fromStr(key);
 
             var metadata: ?*Metadata = null;
@@ -263,8 +268,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             }
 
             log.debug("Metadata for key {x} was {s}.", .{ k, if (metadata == null) "found" else "not found" });
-            if (metadata) |m| switch (m.safeRead()) {
-                // TODO : handle max ref count
+            if (metadata) |m| switch (try m.safeRead()) {
                 .safe => return .{
                     .raw_value = self.value_cache.get(k).?[0..m.len],
                     .ref_count = &m.ref_count,
@@ -300,12 +304,12 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                     // spin until ref count reaches 0...
                 }
 
-                // crital section... we're removing from the caches
+                // critical section... we're removing from the caches
                 {
                     try self.mutex.lock(io);
                     defer self.mutex.unlock(io);
 
-                    const entry: [*]const u8 = self.value_cache.fetchRemove(k).?.value;
+                    const entry: [*]align(max_alignment.toByteUnits()) const u8 = self.value_cache.fetchRemove(k).?.value;
                     log.debug("Freeing entry {*}, len {d} with Allocator impl {*}", .{ entry, m.len, gpa.ptr });
                     gpa.free(entry[0..m.len]);
                     debug.assert(self.metadata_cache.remove(k));
@@ -383,16 +387,16 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             /// Length of the cache entry
             len: u32,
             /// Number of references reading this cache entry
-            ref_count: RefCount,
+            ref_count: Atomic(RefCount),
 
             fn init(len: u32) Metadata {
-                return .{ .len = len, .ref_count = .zero };
+                return .{ .len = len, .ref_count = .init(.zero) };
             }
 
             fn safeSwap(self: *Metadata, io: Io) Io.Cancelable!bool {
                 try io.checkCancel();
                 var safe: bool = true;
-                if (@cmpxchgWeak(RefCount, &self.ref_count, .zero, .swapping, .seq_cst, .acquire)) |count| {
+                if (self.ref_count.cmpxchgWeak(.zero, .swapping, .acquire, .monotonic)) |count| {
                     log.debug("{*} is {d}. Not yet safe to swap value.", .{ &self.ref_count, count });
                     safe = false;
                 }
@@ -402,37 +406,36 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             fn safeDestroy(self: *Metadata, io: Io) Io.Cancelable!bool {
                 try io.checkCancel();
                 var safe: bool = true;
-                if (@cmpxchgWeak(RefCount, &self.ref_count, .zero, .destroying, .seq_cst, .acquire)) |count| {
+                if (self.ref_count.cmpxchgWeak(.zero, .destroying, .acquire, .monotonic)) |count| {
                     log.debug("{*} is {d}. Not yet safe to destroy value.", .{ &self.ref_count, count });
                     safe = false;
                 }
                 return safe;
             }
 
-            fn safeRead(self: *Metadata) enum { safe, swapping, destroying } {
-                const refs: RefCount = @atomicLoad(RefCount, &self.ref_count, .monotonic);
+            fn safeRead(self: *Metadata) error{TooManyOpenReaders}!enum { safe, swapping, destroying } {
+                var refs: RefCount = self.ref_count.load(.monotonic);
                 switch (refs) {
                     .destroying => return .destroying,
-                    .swapping => return .swapping,
-                    else => |x| if (x.compare(.lt, .zero)) return .swapping,
+                    .max => return error.TooManyOpenReaders,
+                    else => |x| if (x.compare(.lt, .zero)) return .swapping, // assuming all other negative values are a swap
                 }
 
-                return if (@cmpxchgStrong(RefCount, &self.ref_count, refs, refs.plusOne(), .acq_rel, .acquire)) |count| maybe_unsafe: {
-                    log.debug("{*} is {d}. Not yet safe to read.", .{ &self.ref_count, count });
-                    break :maybe_unsafe switch (count) {
-                        .destroying => .destroying,
-                        else => |x| if (x.compare(.gte, .zero))
-                            .safe // assuming non-negative is safe to read
-                        else
-                            .swapping, // all other values are assumed to be a swap
-                    };
-                } else .safe;
+                while (self.ref_count.cmpxchgWeak(refs, refs.plusOne(), .acquire, .monotonic)) |count| : (refs = count) {
+                    log.debug("{*} is {d}. May not be safe to read.", .{ &self.ref_count, count });
+                    switch (count) {
+                        .destroying => return .destroying,
+                        .max => return error.TooManyOpenReaders,
+                        else => |x| if (x.compare(.lt, .zero)) return .swapping,
+                    }
+                }
+                return .safe;
             }
 
             fn waitForRead(self: *Metadata, io: Io) Io.Cancelable!bool {
                 try io.checkCancel();
                 var safe: bool = true;
-                if (@cmpxchgWeak(RefCount, &self.ref_count, .zero, .one, .seq_cst, .acquire)) |count| {
+                if (self.ref_count.cmpxchgWeak(.zero, .one, .acquire, .monotonic)) |count| {
                     log.debug("{*} is {d}. Swap operation is taking place... Not yet safe to read.", .{ &self.ref_count, count });
                     safe = count.compare(.gte, .zero);
                 }
@@ -509,6 +512,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             }
         };
 
+        /// Determines behavior when a key already exists
         const PutBehavior = enum {
             /// No clobbering allowed
             no_clobber,
@@ -529,14 +533,14 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             try mem_cache.newEntry(testing.io, testing.allocator, "struct_val", s, .none);
 
             if (try mem_cache.lockEntry(testing.io, "struct_val")) |reader| {
-                try testing.expectEqual(.one, reader.ref_count.*); // normally this should be accessed atomically, but we're in a test
+                try testing.expectEqual(.one, reader.ref_count.raw); // normally this should be accessed atomically, but we're in a test
 
                 const entry: *const StructValue = reader.readEntry(StructValue);
                 try testing.expectEqual(s.a, entry.a);
                 try testing.expectEqual(s.b, entry.b);
 
                 reader.release(); // normally, you'd want to call this in a defer at the top of your scope
-                try testing.expectEqual(.zero, reader.ref_count.*); // normally this should be accessed atomically, but we're in a test
+                try testing.expectEqual(.zero, reader.ref_count.raw); // normally this should be accessed atomically, but we're in a test
             } else return error.NoEntry;
 
             const num: u32 = 90;
@@ -551,7 +555,6 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         }
 
         test handleExpiration {
-            testing.log_level = .debug;
             var mem_cache: MemCache = .init;
             defer mem_cache.deinit(testing.io, testing.allocator);
 
@@ -571,9 +574,9 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             try mem_cache.newEntry(testing.io, testing.allocator, "struct_val", s, expiration);
 
             if (try mem_cache.lockEntry(testing.io, "struct_val")) |reader| {
-                try testing.expectEqual(.one, reader.ref_count.*); // normally this should be accessed atomically, but we're in a test
+                try testing.expectEqual(.one, reader.ref_count.raw); // normally this should be accessed atomically, but we're in a test
                 reader.release();
-                try testing.expectEqual(.zero, reader.ref_count.*); // normally this should be accessed atomically, but we're in a test
+                try testing.expectEqual(.zero, reader.ref_count.raw); // normally this should be accessed atomically, but we're in a test
             } else return error.NoEntry;
             try testing.io.sleep(.fromMilliseconds(20), .awake); // give this a good buffer of time to let this expire (flaky test if sleep time is too close to expiration time)
 
@@ -689,11 +692,8 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         }
 
         test remove {
-            testing.log_level = .debug;
             var mem_cache: MemCache = .init;
             defer mem_cache.deinit(testing.io, testing.allocator);
-
-            errdefer debug.print("Test of remove() failed:\n{f}", .{mem_cache});
 
             const arr: [3]u32 = .{ 1, 2, 3 };
             try mem_cache.newSliceEntry(u32, testing.io, testing.allocator, "my_slice", &arr, .none);
@@ -707,11 +707,8 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         }
 
         test clear {
-            testing.log_level = .debug;
             var mem_cache: MemCache = .init;
             defer mem_cache.deinit(testing.io, testing.allocator);
-
-            errdefer debug.print("Test of clear() failed:\n{f}", .{mem_cache});
 
             const StructValue = struct {
                 a: f32,
@@ -757,6 +754,12 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             try mem_cache.newSliceEntry(u32, testing.io, testing.allocator, "my_slice", &arr, expiration);
             try mem_cache.newEntry(testing.io, testing.allocator, "struct_value", s, expiration);
         }
+
+        // TODO : Write the following tests:
+        // - SafeReader with slice value
+        // - Multiple removes in parallel
+        // - Swap entry
+        // - Swap slice entry
     };
 }
 
@@ -770,3 +773,4 @@ const log = std.log.scoped(.MemCache);
 const Allocator = mem.Allocator;
 const Io = std.Io;
 const Alignment = mem.Alignment;
+const Atomic = std.atomic.Value;
