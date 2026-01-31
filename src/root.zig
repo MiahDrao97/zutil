@@ -10,6 +10,8 @@ pub const string = struct {
 };
 /// Minefield namespace for testing error paths, exactly like M. Hashimoto's Tripwire
 pub const minefield = @import("minefield.zig");
+/// Meta-programming utilities
+pub const meta = @import("meta.zig");
 /// General-purpose memory cache
 pub const MemCache = mem_cache.MemCache;
 /// Create a memory cache of any max alignment
@@ -83,32 +85,6 @@ pub fn Managed(comptime T: type) type {
             }
         }
     };
-}
-
-/// `TSubset` must be a subset of `struct`'s type (strictly looking at the names and types of struct members).
-/// Create an instance of `TSubset` from `struct`'s members.
-pub fn structSubset(comptime TSubset: type, @"struct": anytype) TSubset {
-    const SourceType = @TypeOf(@"struct");
-    switch (@typeInfo(SourceType)) {
-        .@"struct" => switch (@typeInfo(TSubset)) {
-            .@"struct" => |to| {
-                var result: TSubset = undefined;
-                inline for (to.fields) |field| {
-                    if (@hasField(SourceType, field.name)) {
-                        if (@FieldType(SourceType, field.name) == field.type) {
-                            @field(result, field.name) = @field(@"struct", field.name);
-                        } else {
-                            @compileError("Expected type `" ++ @typeName(field.type) ++ "` on field `" ++ field.name ++ "`, but found `" ++ @typeName(@FieldType(SourceType, field.name)) ++ "`.");
-                        }
-                    } else @compileError("Field `" ++ field.Name ++ "` not found on type `" ++ @typeName(SourceType) ++ "`.");
-                }
-                return result;
-            },
-            else => @compileError("`" ++ @typeName(TSubset) ++ "` is not a struct."),
-        },
-        .pointer => |ptr| return structSubset(ptr.child, @"struct".*),
-        else => @compileError("`" ++ @typeName(SourceType) ++ "` is not a struct."),
-    }
 }
 
 /// Universally unique identifier
