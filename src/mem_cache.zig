@@ -30,7 +30,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         pub const SafeReader = struct {
             /// Reference count for the number of references to this particular cache entry
             ref_count: *Atomic(RefCount),
-            /// Raw cache entry
+            /// Raw cache entry as bytes
             raw_value: []align(max_alignment.toByteUnits()) const u8,
 
             /// After this call, the entry is no longer safe to read
@@ -788,6 +788,8 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         }
 
         test "muliple removes" {
+            debug.assert(!builtin.single_threaded);
+
             var mem_cache: MemCache = .init;
             defer mem_cache.deinit(testing.io, testing.allocator);
 
@@ -815,6 +817,8 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         }
 
         test "read and remove conflict" {
+            debug.assert(!builtin.single_threaded);
+
             var mem_cache: MemCache = .init;
             defer mem_cache.deinit(testing.io, testing.allocator);
 
