@@ -1,9 +1,8 @@
 //! The purpose of a memory cache is to cache values that would otherwise take longer to fetch again.
 //! Namely, this would be data from database queries or network calls that'd you rather not make very often or more than once.
 //! However, because this memory cache can store data of any type, the memory allocated is fragmented and varied in size.
-//! As a result, do not treat this cache as a data-oriented design technique.
+//! As a result, do not treat this cache as a data-oriented design technique, since the cached entries are almost guaranteed to use RAM.
 //! Rather, this is meant to save on network/IO/SYSCALLs that would be more expensive than RAM usage.
-//! WARN : Only compiles on Zig master
 
 /// Aligned to cache line alignment boundary to prevent CPU cache invalidation.
 /// It's expected for memory in this cache to be accessed via RAM rather than CPU caches.
@@ -36,11 +35,8 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
 
             /// After this call, the entry is no longer safe to read
             pub fn release(self: SafeReader) void {
-                const prev_count: RefCount = self.ref_count.rmw(
-                    .Xchg,
-                    self.ref_count.load(.monotonic).minusOne(),
-                    .release,
-                );
+                const count_as_int: *Atomic(i8) = @ptrCast(self.ref_count);
+                const prev_count: RefCount = @enumFromInt(count_as_int.fetchSub(1, .release));
                 // The previous ref count must be some value between 1 and 127.
                 // Otherwise, something's broken...
                 debug.assert(prev_count.compare(.gt, .zero));
@@ -90,8 +86,8 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
 
         /// Creates or swaps an entry.
         /// Ensure that `gpa` is thread-safe.
-        /// Use `swapSliceEntry()` to swap a slice.
-        pub fn swapEntry(
+        /// Use `overwriteSliceEntry()` to swap a slice.
+        pub fn overwriteEntry(
             self: *Self,
             io: Io,
             gpa: Allocator,
@@ -122,7 +118,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
 
         /// Creates or swaps a slice entry.
         /// Ensure that `gpa` is thread-safe.
-        pub fn swapSliceEntry(
+        pub fn overwriteSliceEntry(
             self: *Self,
             comptime T: type,
             io: Io,
@@ -256,7 +252,9 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         /// Until the `SafeReader` is released, this entry is safe to read.
         /// Returns null if no entry exists with this key.
         /// Returns `error.TooManyOpenReaders` if the ref count would exceed 127.
-        pub fn lockEntry(self: *Self, io: Io, key: []const u8) (error{TooManyOpenReaders} || Io.Cancelable)!?SafeReader {
+        ///
+        /// WARN : If `release()` is never called on 1 or more readers, that will cause a deadlock when the memory cache is deinitialized.
+        pub fn lockReader(self: *Self, io: Io, key: []const u8) (error{TooManyOpenReaders} || Io.Cancelable)!?SafeReader {
             const k: StringHash = .fromStr(key);
 
             var metadata: ?*Metadata = null;
@@ -268,20 +266,19 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             }
 
             log.debug("Metadata for key {x} was {s}.", .{ k, if (metadata == null) "found" else "not found" });
-            if (metadata) |m| switch (try m.safeRead()) {
+            if (metadata) |m| switch (try m.safeRead(io)) {
                 .safe => return .{
                     .raw_value = self.value_cache.get(k).?[0..m.len],
                     .ref_count = &m.ref_count,
                 },
-                .swapping => {
-                    while (!try m.waitForRead(io)) {
-                        // wait for swap operation to complete
-                    }
-                    return .{
+                .swapping => while (switch (try m.safeRead(io)) {
+                    .swapping => true, // wait for swap operation to complete
+                    .safe => return .{
                         .raw_value = self.value_cache.get(k).?[0..m.len],
                         .ref_count = &m.ref_count,
-                    };
-                },
+                    },
+                    .destroying => return null,
+                }) {},
                 .destroying => {}, // welp, this entry is currently being destroyed
             };
             return null;
@@ -291,29 +288,18 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         pub fn remove(self: *Self, io: Io, gpa: Allocator, key: []const u8) Io.Cancelable!bool {
             const k: StringHash = .fromStr(key);
 
-            var metadata: ?*Metadata = null;
-            {
-                try self.mutex.lock(io);
-                defer self.mutex.unlock(io);
+            try self.mutex.lock(io);
+            defer self.mutex.unlock(io);
 
-                metadata = self.metadata_cache.getPtr(k);
-            }
-
-            if (metadata) |m| {
+            if (self.metadata_cache.getPtr(k)) |m| {
                 while (!try m.safeDestroy(io)) {
                     // spin until ref count reaches 0...
                 }
 
-                // critical section... we're removing from the caches
-                {
-                    try self.mutex.lock(io);
-                    defer self.mutex.unlock(io);
-
-                    const entry: [*]align(max_alignment.toByteUnits()) const u8 = self.value_cache.fetchRemove(k).?.value;
-                    log.debug("Freeing entry {*}, len {d} with Allocator impl {*}", .{ entry, m.len, gpa.ptr });
-                    gpa.free(entry[0..m.len]);
-                    debug.assert(self.metadata_cache.remove(k));
-                }
+                const entry: [*]align(max_alignment.toByteUnits()) const u8 = self.value_cache.fetchRemove(k).?.value;
+                log.debug("Freeing entry {*}, len {d} with Allocator impl {*}", .{ entry, m.len, gpa.ptr });
+                gpa.free(entry[0..m.len]);
+                debug.assert(self.metadata_cache.remove(k));
                 return true;
             }
             return false;
@@ -396,7 +382,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             fn safeSwap(self: *Metadata, io: Io) Io.Cancelable!bool {
                 try io.checkCancel();
                 var safe: bool = true;
-                if (self.ref_count.cmpxchgWeak(.zero, .swapping, .acquire, .monotonic)) |count| {
+                if (self.ref_count.cmpxchgWeak(.zero, .swapping, .acq_rel, .monotonic)) |count| {
                     log.debug("{*} is {d}. Not yet safe to swap value.", .{ &self.ref_count, count });
                     safe = false;
                 }
@@ -406,14 +392,14 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             fn safeDestroy(self: *Metadata, io: Io) Io.Cancelable!bool {
                 try io.checkCancel();
                 var safe: bool = true;
-                if (self.ref_count.cmpxchgWeak(.zero, .destroying, .acquire, .monotonic)) |count| {
+                if (self.ref_count.cmpxchgWeak(.zero, .destroying, .acq_rel, .monotonic)) |count| {
                     log.debug("{*} is {d}. Not yet safe to destroy value.", .{ &self.ref_count, count });
                     safe = false;
                 }
                 return safe;
             }
 
-            fn safeRead(self: *Metadata) error{TooManyOpenReaders}!enum { safe, swapping, destroying } {
+            fn safeRead(self: *Metadata, io: Io) (error{TooManyOpenReaders} || Io.Cancelable)!enum { safe, swapping, destroying } {
                 var refs: RefCount = self.ref_count.load(.monotonic);
                 switch (refs) {
                     .destroying => return .destroying,
@@ -428,18 +414,9 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                         .max => return error.TooManyOpenReaders,
                         else => |x| if (x.compare(.lt, .zero)) return .swapping,
                     }
+                    try io.checkCancel();
                 }
                 return .safe;
-            }
-
-            fn waitForRead(self: *Metadata, io: Io) Io.Cancelable!bool {
-                try io.checkCancel();
-                var safe: bool = true;
-                if (self.ref_count.cmpxchgWeak(.zero, .one, .acquire, .monotonic)) |count| {
-                    log.debug("{*} is {d}. Swap operation is taking place... Not yet safe to read.", .{ &self.ref_count, count });
-                    safe = count.compare(.gte, .zero);
-                }
-                return safe;
             }
 
             pub fn format(self: Metadata, writer: *Io.Writer) Io.Writer.Error!void {
@@ -520,7 +497,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             replace,
         };
 
-        test lockEntry {
+        test lockReader {
             var mem_cache: MemCache = .init;
             defer mem_cache.deinit(testing.io, testing.allocator);
 
@@ -532,7 +509,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             const s: StructValue = .{ .a = 3.14, .b = 5 };
             try mem_cache.newEntry(testing.io, testing.allocator, "struct_val", s, .none);
 
-            if (try mem_cache.lockEntry(testing.io, "struct_val")) |reader| {
+            if (try mem_cache.lockReader(testing.io, "struct_val")) |reader| {
                 try testing.expectEqual(.one, reader.ref_count.raw); // normally this should be accessed atomically, but we're in a test
 
                 const entry: *const StructValue = reader.readEntry(StructValue);
@@ -551,6 +528,27 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             try testing.expectError(
                 error.CacheClobber,
                 mem_cache.newSliceEntry(u8, testing.io, testing.allocator, "struct_val", "oh my", .none),
+            );
+
+            const arr: [3]u32 = .{ 1, 2, 3 };
+            try mem_cache.newSliceEntry(u32, testing.io, testing.allocator, "slice", &arr, .none);
+            if (try mem_cache.lockReader(testing.io, "slice")) |reader| {
+                try testing.expectEqual(.one, reader.ref_count.raw); // normally this should be accessed atomically, but we're in a test
+
+                const entry: []const u32 = reader.readSliceEntry(u32);
+                try testing.expectEqualSlices(u32, &arr, entry);
+
+                reader.release(); // normally, you'd want to call this in a defer at the top of your scope
+                try testing.expectEqual(.zero, reader.ref_count.raw); // normally this should be accessed atomically, but we're in a test
+            } else return error.NoEntry;
+
+            try testing.expectError(
+                error.CacheClobber,
+                mem_cache.newEntry(testing.io, testing.allocator, "slice", num, .none),
+            );
+            try testing.expectError(
+                error.CacheClobber,
+                mem_cache.newSliceEntry(u8, testing.io, testing.allocator, "slice", "oh my", .none),
             );
         }
 
@@ -573,14 +571,14 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
 
             try mem_cache.newEntry(testing.io, testing.allocator, "struct_val", s, expiration);
 
-            if (try mem_cache.lockEntry(testing.io, "struct_val")) |reader| {
+            if (try mem_cache.lockReader(testing.io, "struct_val")) |reader| {
                 try testing.expectEqual(.one, reader.ref_count.raw); // normally this should be accessed atomically, but we're in a test
                 reader.release();
                 try testing.expectEqual(.zero, reader.ref_count.raw); // normally this should be accessed atomically, but we're in a test
             } else return error.NoEntry;
             try testing.io.sleep(.fromMilliseconds(20), .awake); // give this a good buffer of time to let this expire (flaky test if sleep time is too close to expiration time)
 
-            if (try mem_cache.lockEntry(testing.io, "struct_val")) |_| return error.ExpectedNoEntry;
+            if (try mem_cache.lockReader(testing.io, "struct_val")) |_| return error.ExpectedNoEntry;
         }
 
         test newEntry {
@@ -697,13 +695,13 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
 
             const arr: [3]u32 = .{ 1, 2, 3 };
             try mem_cache.newSliceEntry(u32, testing.io, testing.allocator, "my_slice", &arr, .none);
-            if (try mem_cache.lockEntry(testing.io, "my_slice")) |reader|
+            if (try mem_cache.lockReader(testing.io, "my_slice")) |reader|
                 reader.release()
             else
                 return error.NoEntry;
 
             try testing.expect(try mem_cache.remove(testing.io, testing.allocator, "my_slice"));
-            if (try mem_cache.lockEntry(testing.io, "my_slice")) |_| return error.ExpectedNoEntry;
+            if (try mem_cache.lockReader(testing.io, "my_slice")) |_| return error.ExpectedNoEntry;
         }
 
         test clear {
@@ -720,19 +718,19 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             try mem_cache.newSliceEntry(u32, testing.io, testing.allocator, "my_slice", &arr, .none);
             try mem_cache.newEntry(testing.io, testing.allocator, "struct_val", s, .none);
 
-            if (try mem_cache.lockEntry(testing.io, "my_slice")) |reader|
+            if (try mem_cache.lockReader(testing.io, "my_slice")) |reader|
                 reader.release()
             else
                 return error.NoEntry;
-            if (try mem_cache.lockEntry(testing.io, "struct_val")) |reader|
+            if (try mem_cache.lockReader(testing.io, "struct_val")) |reader|
                 reader.release()
             else
                 return error.NoEntry;
 
             try mem_cache.clear(testing.io, testing.allocator);
 
-            if (try mem_cache.lockEntry(testing.io, "my_slice")) |_| return error.ExpectedNoEntry;
-            if (try mem_cache.lockEntry(testing.io, "struct_val")) |_| return error.ExpectedNoEntry;
+            if (try mem_cache.lockReader(testing.io, "my_slice")) |_| return error.ExpectedNoEntry;
+            if (try mem_cache.lockReader(testing.io, "struct_val")) |_| return error.ExpectedNoEntry;
 
             const expiration: Io.Timeout = .{
                 .duration = .{
@@ -747,19 +745,122 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             // clear before expiration, which should cancel the expiration tasks
             try mem_cache.clear(testing.io, testing.allocator);
 
-            if (try mem_cache.lockEntry(testing.io, "my_slice")) |_| return error.ExpectedNoEntry;
-            if (try mem_cache.lockEntry(testing.io, "struct_val")) |_| return error.ExpectedNoEntry;
+            if (try mem_cache.lockReader(testing.io, "my_slice")) |_| return error.ExpectedNoEntry;
+            if (try mem_cache.lockReader(testing.io, "struct_val")) |_| return error.ExpectedNoEntry;
 
             // re-add AGAIN... to make sure we can cancel again and free everything as expected
             try mem_cache.newSliceEntry(u32, testing.io, testing.allocator, "my_slice", &arr, expiration);
             try mem_cache.newEntry(testing.io, testing.allocator, "struct_value", s, expiration);
         }
 
-        // TODO : Write the following tests:
-        // - SafeReader with slice value
-        // - Multiple removes in parallel
-        // - Swap entry
-        // - Swap slice entry
+        test overwriteEntry {
+            var mem_cache: MemCache = .init;
+            defer mem_cache.deinit(testing.io, testing.allocator);
+
+            const num: i32 = 64;
+            const num2: i32 = -72;
+
+            try mem_cache.overwriteEntry(testing.io, testing.allocator, "my_entry", num, .none);
+            try mem_cache.overwriteEntry(testing.io, testing.allocator, "my_entry", num2, .none);
+
+            if (try mem_cache.lockReader(testing.io, "my_entry")) |reader| {
+                defer reader.release();
+
+                try testing.expectEqual(num2, reader.readEntry(i32).*);
+            }
+        }
+
+        test overwriteSliceEntry {
+            var mem_cache: MemCache = .init;
+            defer mem_cache.deinit(testing.io, testing.allocator);
+
+            const slice1: []const u8 = "asdf";
+            const slice2: []const u8 = "blarf";
+
+            try mem_cache.overwriteSliceEntry(u8, testing.io, testing.allocator, "my_slice", slice1, .none);
+            try mem_cache.overwriteSliceEntry(u8, testing.io, testing.allocator, "my_slice", slice2, .none);
+
+            if (try mem_cache.lockReader(testing.io, "my_slice")) |reader| {
+                defer reader.release();
+
+                try testing.expectEqualStrings(slice2, reader.readSliceEntry(u8));
+            }
+        }
+
+        test "muliple removes" {
+            var mem_cache: MemCache = .init;
+            defer mem_cache.deinit(testing.io, testing.allocator);
+
+            const slice1: []const u8 = "asdf";
+
+            try mem_cache.overwriteSliceEntry(u8, testing.io, testing.allocator, "my_slice", slice1, .none);
+
+            const removeEntry = struct {
+                fn removeEntry(start: *Atomic(bool), cache: *MemCache, io: Io, gpa: Allocator, key: []const u8) Io.Cancelable!void {
+                    while (!start.load(.monotonic)) {}
+                    _ = try cache.remove(io, gpa, key);
+                }
+            }.removeEntry;
+
+            var start: Atomic(bool) = .init(false);
+            var group: Io.Group = .init;
+            group.async(testing.io, removeEntry, .{ &start, &mem_cache, testing.io, testing.allocator, "my_slice" });
+            group.async(testing.io, removeEntry, .{ &start, &mem_cache, testing.io, testing.allocator, "my_slice" });
+            group.async(testing.io, removeEntry, .{ &start, &mem_cache, testing.io, testing.allocator, "my_slice" });
+
+            start.store(true, .release);
+            try group.await(testing.io);
+
+            if (try mem_cache.lockReader(testing.io, "my_slice")) |_| return error.ExpectedNoEntry;
+        }
+
+        test "read and remove conflict" {
+            var mem_cache: MemCache = .init;
+            defer mem_cache.deinit(testing.io, testing.allocator);
+
+            const slice1: []const u8 = "asdf";
+
+            try mem_cache.overwriteSliceEntry(u8, testing.io, testing.allocator, "my_slice", slice1, .none);
+
+            const removeEntry = struct {
+                fn removeEntry(start: *Atomic(bool), cache: *MemCache, io: Io, gpa: Allocator, key: []const u8) Io.Cancelable!void {
+                    while (!start.load(.monotonic)) {}
+                    _ = try cache.remove(io, gpa, key);
+                }
+            }.removeEntry;
+
+            const readEntry = struct {
+                fn readEntry(start: *Atomic(bool), cache: *MemCache, io: Io, key: []const u8) Io.Cancelable!void {
+                    while (!start.load(.monotonic)) {}
+                    if (cache.lockReader(io, key) catch |err| switch (err) {
+                        Io.Cancelable.Canceled => |canceled| return canceled,
+                        error.TooManyOpenReaders => unreachable,
+                    }) |reader| {
+                        defer reader.release();
+                        testing.expectEqualStrings(slice1, reader.readSliceEntry(u8)) catch unreachable;
+                    }
+                }
+            }.readEntry;
+
+            var start: Atomic(bool) = .init(false);
+            var group: Io.Group = .init;
+            group.async(testing.io, readEntry, .{ &start, &mem_cache, testing.io, "my_slice" });
+            group.async(testing.io, removeEntry, .{ &start, &mem_cache, testing.io, testing.allocator, "my_slice" });
+
+            start.store(true, .release);
+            try group.await(testing.io);
+
+            if (try mem_cache.lockReader(testing.io, "my_slice")) |_| return error.ExpectedNoEntry;
+
+            start.store(false, .release);
+            group.async(testing.io, removeEntry, .{ &start, &mem_cache, testing.io, testing.allocator, "my_slice" });
+            group.async(testing.io, readEntry, .{ &start, &mem_cache, testing.io, "my_slice" });
+
+            start.store(true, .release);
+            try group.await(testing.io);
+
+            if (try mem_cache.lockReader(testing.io, "my_slice")) |_| return error.ExpectedNoEntry;
+        }
     };
 }
 
