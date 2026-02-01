@@ -203,11 +203,7 @@ pub const FlagSet = struct {
 
 test Arg {
     {
-        const cmd: []const u8 = "MyProgram.exe --some-val";
-        const cmd_line_w: []const u16 = try std.unicode.utf8ToUtf16LeAlloc(testing.allocator, cmd);
-        defer testing.allocator.free(cmd_line_w);
-
-        const args: process.Args = .{ .vector = cmd_line_w };
+        const args: process.Args = .{ .vector = utf16("MyProgram.exe --some-val") };
         var iter: process.Args.Iterator = try args.iterateAllocator(testing.allocator);
         defer iter.deinit();
 
@@ -221,11 +217,7 @@ test Arg {
             );
     }
     {
-        const cmd: []const u8 = "MyProgram.exe --some-val asdf --some-val blarf";
-        const cmd_line_w: []const u16 = try std.unicode.utf8ToUtf16LeAlloc(testing.allocator, cmd);
-        defer testing.allocator.free(cmd_line_w);
-
-        const args: process.Args = .{ .vector = cmd_line_w };
+        const args: process.Args = .{ .vector = utf16("MyProgram.exe --some-val asdf --some-val blarf") };
         var iter: process.Args.Iterator = try args.iterateAllocator(testing.allocator);
         defer iter.deinit();
 
@@ -243,11 +235,7 @@ test Arg {
         try testing.expect(already_assigned != null);
     }
     {
-        const cmd: []const u8 = "MyProgram.exe --some-val asdf";
-        const cmd_line_w: []const u16 = try std.unicode.utf8ToUtf16LeAlloc(testing.allocator, cmd);
-        defer testing.allocator.free(cmd_line_w);
-
-        const args: process.Args = .{ .vector = cmd_line_w };
+        const args: process.Args = .{ .vector = utf16("MyProgram.exe --some-val asdf") };
         var iter: process.Args.Iterator = try args.iterateAllocator(testing.allocator);
         defer iter.deinit();
 
@@ -260,11 +248,7 @@ test Arg {
         try testing.expectEqualStrings("asdf", some_value.value.?);
     }
     {
-        const cmd: []const u8 = "MyProgram.exe";
-        const cmd_line_w: []const u16 = try std.unicode.utf8ToUtf16LeAlloc(testing.allocator, cmd);
-        defer testing.allocator.free(cmd_line_w);
-
-        const args: process.Args = .{ .vector = cmd_line_w };
+        const args: process.Args = .{ .vector = utf16("MyProgram.exe") };
         var iter: process.Args.Iterator = try args.iterateAllocator(testing.allocator);
         defer iter.deinit();
 
@@ -277,11 +261,7 @@ test Arg {
         try testing.expectError(error.Unassigned, some_value.to(u32));
     }
     {
-        const cmd: []const u8 = "MyProgram.exe --some-val asdf";
-        const cmd_line_w: []const u16 = try std.unicode.utf8ToUtf16LeAlloc(testing.allocator, cmd);
-        defer testing.allocator.free(cmd_line_w);
-
-        const args: process.Args = .{ .vector = cmd_line_w };
+        const args: process.Args = .{ .vector = utf16("MyProgram.exe --some-val asdf") };
         var iter: process.Args.Iterator = try args.iterateAllocator(testing.allocator);
         defer iter.deinit();
 
@@ -295,11 +275,8 @@ test Arg {
     }
     {
         const MyEnum = enum { asdf, blarf };
-        const cmd: []const u8 = "MyProgram.exe --some-val asdf";
-        const cmd_line_w: []const u16 = try std.unicode.utf8ToUtf16LeAlloc(testing.allocator, cmd);
-        defer testing.allocator.free(cmd_line_w);
 
-        const args: process.Args = .{ .vector = cmd_line_w };
+        const args: process.Args = .{ .vector = utf16("MyProgram.exe --some-val asdf") };
         var iter: process.Args.Iterator = try args.iterateAllocator(testing.allocator);
         defer iter.deinit();
 
@@ -314,11 +291,8 @@ test Arg {
     }
     {
         const MyEnum = enum { asdf, blarf };
-        const cmd: []const u8 = "MyProgram.exe --some-val 0";
-        const cmd_line_w: []const u16 = try std.unicode.utf8ToUtf16LeAlloc(testing.allocator, cmd);
-        defer testing.allocator.free(cmd_line_w);
 
-        const args: process.Args = .{ .vector = cmd_line_w };
+        const args: process.Args = .{ .vector = utf16("MyProgram.exe --some-val 0") };
         var iter: process.Args.Iterator = try args.iterateAllocator(testing.allocator);
         defer iter.deinit();
 
@@ -332,11 +306,7 @@ test Arg {
         try testing.expectEqual(.asdf, as_enum);
     }
     {
-        const cmd: []const u8 = "MyProgram.exe --some-val 19";
-        const cmd_line_w: []const u16 = try std.unicode.utf8ToUtf16LeAlloc(testing.allocator, cmd);
-        defer testing.allocator.free(cmd_line_w);
-
-        const args: process.Args = .{ .vector = cmd_line_w };
+        const args: process.Args = .{ .vector = utf16("MyProgram.exe --some-val 19") };
         var iter: process.Args.Iterator = try args.iterateAllocator(testing.allocator);
         defer iter.deinit();
 
@@ -350,11 +320,7 @@ test Arg {
         try testing.expectEqual(19, as_num);
     }
     {
-        const cmd: []const u8 = "MyProgram.exe --some-val 19.2345";
-        const cmd_line_w: []const u16 = try std.unicode.utf8ToUtf16LeAlloc(testing.allocator, cmd);
-        defer testing.allocator.free(cmd_line_w);
-
-        const args: process.Args = .{ .vector = cmd_line_w };
+        const args: process.Args = .{ .vector = utf16("MyProgram.exe --some-val 19.2345") };
         var iter: process.Args.Iterator = try args.iterateAllocator(testing.allocator);
         defer iter.deinit();
 
@@ -413,3 +379,4 @@ const process = std.process;
 const log = std.log.scoped(.@"zutil.cli");
 const FixedBufferAllocator = std.heap.FixedBufferAllocator;
 const Allocator = std.mem.Allocator;
+const utf16 = std.unicode.utf8ToUtf16LeStringLiteral;

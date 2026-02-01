@@ -1,4 +1,4 @@
-//! The purpose of a memory cache is to cache values that would otherwise take longer to fetch again.
+//! The purpose of a memory cache is to memoize values that would otherwise take longer to fetch again.
 //! Namely, this would be data from database queries or network calls that'd you rather not make very often or more than once.
 //! However, because this memory cache can store data of any type, the memory allocated is fragmented and varied in size.
 //! As a result, do not treat this cache as a data-oriented design technique, since the cached entries are almost guaranteed to use RAM.
