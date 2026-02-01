@@ -1,4 +1,4 @@
-//! My own module for meta-programming
+//! Module to assist with meta-programming
 
 /// `TSubset` must be a subset of `struct`'s type (strictly looking at the names and types of struct members).
 /// Create an instance of `TSubset` from `struct`'s members.

@@ -26,7 +26,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         pub const Error = Allocator.Error || Io.Cancelable || Io.ConcurrentError;
 
         /// Allows one to pull an entry from the cache and have it safely read until `release()` is called on this reader.
-        /// Each active reader represents one unit on the entry's reference_count (max active references for an entry is 127).
+        /// Each active reader represents one unit on the entry's reference_count (max active references for an entry is 32767).
         pub const SafeReader = struct {
             /// Reference count for the number of references to this particular cache entry
             ref_count: *Atomic(RefCount),
@@ -35,9 +35,9 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
 
             /// After this call, the entry is no longer safe to read
             pub fn release(self: SafeReader) void {
-                const count_as_int: *Atomic(i8) = @ptrCast(self.ref_count);
+                const count_as_int: *Atomic(i16) = @ptrCast(self.ref_count);
                 const prev_count: RefCount = @enumFromInt(count_as_int.fetchSub(1, .release));
-                // The previous ref count must be some value between 1 and 127.
+                // The previous ref count must be some value between 1 and 32767.
                 // Otherwise, something's broken...
                 debug.assert(prev_count.compare(.gt, .zero));
                 debug.assert(prev_count.compare(.lte, .max));
@@ -252,7 +252,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         }
 
         fn putEntry(
-            self: *MemCache,
+            self: *Self,
             io: Io,
             gpa: Allocator,
             key: []const u8,
@@ -336,9 +336,9 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         /// Lock an entry, producing a `SafeReader` that repesents an active read on the entry.
         /// Until the `SafeReader` is released, this entry is safe to read.
         /// Returns null if no entry exists with this key.
-        /// Returns `error.TooManyOpenReaders` if the ref count would exceed 127.
+        /// Returns `error.TooManyOpenReaders` if the ref count would exceed 32767.
         ///
-        /// WARN : If the caller fails to call `release()` on the reader, that may produce a deadlock or segmentation fault later in the program.
+        /// WARN : If the caller fails to call `release()` on the reader, it may produce a deadlock or segmentation fault later in the program.
         pub fn lockReader(self: *Self, io: Io, key: []const u8) (error{TooManyOpenReaders} || Io.Cancelable)!?SafeReader {
             const k: StringHash = .fromStr(key);
 
@@ -374,7 +374,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         /// Until the resulting `SafeReader` is released, this entry is safe to read.
         /// Returns null if no entry exists with this key.
         ///
-        /// WARN : If the caller fails to call `release()` on the reader, that may produce a deadlock or segmentation fault later in the program.
+        /// WARN : If the caller fails to call `release()` on the reader, it may produce a deadlock or segmentation fault later in the program.
         pub fn waitForReaderLock(self: *Self, io: Io, key: []const u8) Io.Cancelable!?SafeReader {
             while (true) {
                 if (self.lockReader(io, key) catch |err| switch (err) {
@@ -573,17 +573,17 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         };
 
         /// Used to count references on an entry
-        const RefCount = enum(i8) {
+        const RefCount = enum(i16) {
             swapping = -2,
             destroying = -1,
             zero = 0,
             one = 1,
-            max = 127,
+            max = std.math.maxInt(i16),
             _,
 
             fn compare(lh: RefCount, op: std.math.CompareOperator, rh: RefCount) bool {
-                const lh_int: i8 = @intFromEnum(lh);
-                const rh_int: i8 = @intFromEnum(rh);
+                const lh_int: i16 = @intFromEnum(lh);
+                const rh_int: i16 = @intFromEnum(rh);
 
                 return switch (op) {
                     .lt => lh_int < rh_int,
@@ -625,14 +625,14 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             try mem_cache.newEntry(testing.io, testing.allocator, "struct_val", s, .none);
 
             if (try mem_cache.lockReader(testing.io, "struct_val")) |reader| {
-                try testing.expectEqual(.one, reader.ref_count.raw); // normally this should be accessed atomically, but we're in a test
+                try testing.expectEqual(.one, reader.ref_count.load(.monotonic));
 
                 const entry: *const StructValue = reader.readEntry(StructValue);
                 try testing.expectEqual(s.a, entry.a);
                 try testing.expectEqual(s.b, entry.b);
 
                 reader.release(); // normally, you'd want to call this in a defer at the top of your scope
-                try testing.expectEqual(.zero, reader.ref_count.raw); // normally this should be accessed atomically, but we're in a test
+                try testing.expectEqual(.zero, reader.ref_count.load(.monotonic));
             } else return error.NoEntry;
 
             const num: u32 = 90;
@@ -648,13 +648,13 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             const arr: [3]u32 = .{ 1, 2, 3 };
             try mem_cache.newSliceEntry(u32, testing.io, testing.allocator, "slice", &arr, .none);
             if (try mem_cache.lockReader(testing.io, "slice")) |reader| {
-                try testing.expectEqual(.one, reader.ref_count.raw); // normally this should be accessed atomically, but we're in a test
+                try testing.expectEqual(.one, reader.ref_count.load(.monotonic));
 
                 const entry: []const u32 = reader.readSliceEntry(u32);
                 try testing.expectEqualSlices(u32, &arr, entry);
 
                 reader.release(); // normally, you'd want to call this in a defer at the top of your scope
-                try testing.expectEqual(.zero, reader.ref_count.raw); // normally this should be accessed atomically, but we're in a test
+                try testing.expectEqual(.zero, reader.ref_count.load(.monotonic));
             } else return error.NoEntry;
 
             try testing.expectError(
@@ -687,9 +687,9 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             try mem_cache.newEntry(testing.io, testing.allocator, "struct_val", s, expiration);
 
             if (try mem_cache.lockReader(testing.io, "struct_val")) |reader| {
-                try testing.expectEqual(.one, reader.ref_count.raw); // normally this should be accessed atomically, but we're in a test
+                try testing.expectEqual(.one, reader.ref_count.load(.monotonic));
                 reader.release();
-                try testing.expectEqual(.zero, reader.ref_count.raw); // normally this should be accessed atomically, but we're in a test
+                try testing.expectEqual(.zero, reader.ref_count.load(.monotonic));
             } else return error.NoEntry;
             try testing.io.sleep(.fromMilliseconds(20), .awake); // give this a good buffer of time to let this expire (flaky test if sleep time is too close to expiration time)
 
@@ -988,35 +988,13 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             const slice: []const u8 = "asdf";
             try mem_cache.overwriteSliceEntry(u8, testing.io, testing.allocator, "my_slice", slice, .none);
 
-            var readers: [@intFromEnum(RefCount.max)]SafeReader = undefined;
+            // deliberately interfere with the data cuz I don't wanna make 32K references just for a unit test
+            mem_cache.metadata_cache.getPtr(StringHash.fromStr("my_slice")).?.ref_count.store(.max, .release);
 
-            // in the following blocks of code, ref count should not be accessed like this, but we're in a test ^_^
-
-            var ref_count: RefCount = .zero;
-            for (&readers) |*reader| reader.* = lock_reader: {
-                if (try mem_cache.lockReader(testing.io, "my_slice")) |r| {
-                    ref_count = ref_count.plusOne();
-                    try testing.expectEqual(
-                        ref_count,
-                        mem_cache.metadata_cache.getPtr(StringHash.fromStr("my_slice")).?.ref_count.raw,
-                    );
-                    break :lock_reader r;
-                } else return error.NoEntry;
-            };
-
-            try testing.expectEqual(.max, ref_count);
             try testing.expectError(error.TooManyOpenReaders, mem_cache.lockReader(testing.io, "my_slice"));
 
-            // release them all so `clear()` doesn't deadlock
-            for (readers) |reader| {
-                reader.release();
-                ref_count = ref_count.minusOne();
-                try testing.expectEqual(
-                    ref_count,
-                    mem_cache.metadata_cache.getPtr(StringHash.fromStr("my_slice")).?.ref_count.raw,
-                );
-            }
-
+            // set this back so `clear()` doesn't deadlock
+            mem_cache.metadata_cache.getPtr(StringHash.fromStr("my_slice")).?.ref_count.store(.zero, .release);
             try mem_cache.clear(testing.io, testing.allocator);
         }
 
@@ -1095,50 +1073,29 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             const slice: []const u8 = "asdf";
             try mem_cache.overwriteSliceEntry(u8, testing.io, testing.allocator, "my_slice", slice, .none);
 
-            var readers: [@intFromEnum(RefCount.max)]SafeReader = undefined;
-
-            // in the following blocks of code, ref count should not be accessed like this, but we're in a test ^_^
-
-            var ref_count: RefCount = .zero;
-            for (&readers) |*reader| reader.* = lock_reader: {
-                if (try mem_cache.lockReader(testing.io, "my_slice")) |r| {
-                    ref_count = ref_count.plusOne();
-                    try testing.expectEqual(
-                        ref_count,
-                        mem_cache.metadata_cache.getPtr(StringHash.fromStr("my_slice")).?.ref_count.raw,
-                    );
-                    break :lock_reader r;
-                } else return error.NoEntry;
-            };
-
-            try testing.expectEqual(.max, ref_count);
+            // deliberately interfere with the data cuz I don't wanna make 32K references just for a unit test
+            mem_cache.metadata_cache.getPtr(StringHash.fromStr("my_slice")).?.ref_count.store(.max, .release);
 
             var read_future: Io.Future(Io.Cancelable!?SafeReader) = try testing.io.concurrent(waitForReaderLock, .{ &mem_cache, testing.io, "my_slice" });
             defer _ = read_future.cancel(testing.io) catch {};
 
-            // release the first reader so that we can await our future
-            readers[0].release();
+            // pretend that a reader was just released
+            mem_cache.metadata_cache.getPtr(StringHash.fromStr("my_slice")).?.ref_count.store(RefCount.max.minusOne(), .release);
             if (try read_future.await(testing.io)) |final_reader| {
-                defer {
-                    final_reader.release();
-                    ref_count = ref_count.minusOne();
-                }
+                defer final_reader.release();
                 try testing.expectEqual(
-                    ref_count,
-                    mem_cache.metadata_cache.getPtr(StringHash.fromStr("my_slice")).?.ref_count.raw,
+                    RefCount.max,
+                    mem_cache.metadata_cache.getPtr(StringHash.fromStr("my_slice")).?.ref_count.load(.monotonic),
                 );
             } else return error.NoEntry;
 
-            // release the rest so `clear()` doesn't deadlock
-            for (readers[1..]) |reader| {
-                reader.release();
-                ref_count = ref_count.minusOne();
-                try testing.expectEqual(
-                    ref_count,
-                    mem_cache.metadata_cache.getPtr(StringHash.fromStr("my_slice")).?.ref_count.raw,
-                );
-            }
+            try testing.expectEqual(
+                RefCount.max.minusOne(),
+                mem_cache.metadata_cache.getPtr(StringHash.fromStr("my_slice")).?.ref_count.load(.monotonic),
+            );
 
+            // set this back so `clear()` doesn't deadlock
+            mem_cache.metadata_cache.getPtr(StringHash.fromStr("my_slice")).?.ref_count.store(.zero, .release);
             try mem_cache.clear(testing.io, testing.allocator);
         }
     };
