@@ -187,14 +187,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             createEntryFn: anytype,
             args: ArgsTuple(@TypeOf(createEntryFn)),
         ) (ErrorType(@TypeOf(createEntryFn)) || Error || error{TooManyOpenReaders})!SafeReader {
-            const SliceType = switch (@typeInfo(@typeInfo(@TypeOf(createEntryFn)).@"fn".return_type.?)) {
-                .error_union => |e| switch (@typeInfo(e.payload)) {
-                    .pointer => |p| switch (p.size) {
-                        .slice => p.child,
-                        else => @compileError("Expected `createEntryFn` to have a return type coercible to `TError![]const T`"),
-                    },
-                    else => @compileError("Expected `createEntryFn` to have a return type coercible to `TError![]const T`"),
-                },
+            const SliceType = switch (@typeInfo(ReturnType(@TypeOf(createEntryFn)))) {
                 .pointer => |p| switch (p.size) {
                     .slice => p.child,
                     else => @compileError("Expected `createEntryFn` to have a return type coercible to `TError![]const T`"),
