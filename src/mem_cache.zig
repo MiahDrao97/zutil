@@ -172,6 +172,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
 
         /// Creates a new slice entry, returning `error.CacheClobber` if an entry with this `key` already exists.
         /// Ensure that `gpa` is thread-safe.
+        /// The contents of the entry are copied to the cache.
         pub fn newSliceEntry(
             self: *Self,
             comptime T: type,
@@ -188,6 +189,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
 
         /// Creates or overwrites a slice entry.
         /// Ensure that `gpa` is thread-safe.
+        /// The contents of the entry are copied to the cache.
         pub fn overwriteSliceEntry(
             self: *Self,
             comptime T: type,
@@ -205,6 +207,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         /// Reads the cache for an entry matching the `key`.
         /// If none exists, then `entry` will be written in, and a `SafeReader` for that entry will be returned.
         /// Assumes that the duration of `expiration` is longer than the time it takes to lock a reader.
+        /// The contents of the entry are copied to the cache.
         pub fn getOrPutSliceEntry(
             self: *Self,
             io: Io,
@@ -1078,7 +1081,8 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
 
                     fn cleanup(context: ?*anyopaque, entry: EntryReader) void {
                         const this: *const @This() = @ptrCast(@alignCast(context.?));
-                        this.gpa.destroy(entry.read(*const u32));
+                        // read returns a *const T, and in this case T = *const u32, so `entry.read()` returns `*const *const u32`
+                        this.gpa.destroy(entry.read(*const u32).*);
                         this.gpa.destroy(this);
                     }
                 };
@@ -1120,14 +1124,17 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
 
                 const EntryManager = struct {
                     gpa: Allocator,
+                    created_slice: []const u8 = undefined,
 
-                    fn createEntry(this: @This()) Allocator.Error![]const u8 {
-                        return this.gpa.dupe(u8, "whoa");
+                    fn createEntry(this: *@This()) Allocator.Error![]const u8 {
+                        this.created_slice = try this.gpa.dupe(u8, "whoa");
+                        return this.created_slice;
                     }
 
                     fn cleanup(context: ?*anyopaque, entry: EntryReader) void {
+                        _ = entry; // when a slice is entered in the cache, it's copied, so we have to track the slice on this structure
                         const this: *const @This() = @ptrCast(@alignCast(context.?));
-                        this.gpa.free(entry.readSlice(u8));
+                        this.gpa.free(this.created_slice);
                         this.gpa.destroy(this);
                     }
                 };
@@ -1141,7 +1148,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                     .timeout = .none,
                     .cleanup_context = entry_manager,
                     .runCleanup = EntryManager.cleanup,
-                }, EntryManager.createEntry, .{entry_manager.*});
+                }, EntryManager.createEntry, .{entry_manager});
                 defer reader.release();
 
                 try testing.expectEqualStrings("whoa", reader.entry.readSlice(u8));
