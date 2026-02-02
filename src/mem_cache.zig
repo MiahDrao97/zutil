@@ -25,13 +25,31 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         /// Possible errors returned when adding a new entry
         pub const Error = Allocator.Error || Io.Cancelable || Io.ConcurrentError;
 
+        /// Simple reader
+        pub const EntryReader = struct {
+            /// Raw cache entry as bytes
+            raw_value: []align(max_alignment.toByteUnits()) const u8,
+
+            /// Read this entry as `*const T
+            pub fn read(self: EntryReader, comptime T: type) *align(max_alignment.toByteUnits()) const T {
+                debug.assert(@sizeOf(T) == self.raw_value.len);
+                return mem.bytesAsValue(T, self.raw_value);
+            }
+
+            /// Read this entry as `[]const T`
+            pub fn readSlice(self: EntryReader, comptime T: type) []align(max_alignment.toByteUnits()) const T {
+                debug.assert(@rem(self.raw_value.len, @sizeOf(T)) == 0);
+                return mem.bytesAsSlice(T, self.raw_value);
+            }
+        };
+
         /// Allows one to pull an entry from the cache and have it safely read until `release()` is called on this reader.
         /// Each active reader represents one unit on the entry's reference_count (max active references for an entry is 32767).
         pub const SafeReader = struct {
             /// Reference count for the number of references to this particular cache entry
             ref_count: *Atomic(RefCount),
-            /// Raw cache entry as bytes
-            raw_value: []align(max_alignment.toByteUnits()) const u8,
+            /// The entry
+            entry: EntryReader,
 
             /// After this call, the entry is no longer safe to read
             pub fn release(self: SafeReader) void {
@@ -42,17 +60,26 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                 debug.assert(prev_count.compare(.gt, .zero));
                 debug.assert(prev_count.compare(.lte, .max));
             }
+        };
 
-            /// Read this entry as `*const T
-            pub fn readEntry(self: SafeReader, comptime T: type) *align(max_alignment.toByteUnits()) const T {
-                debug.assert(@sizeOf(T) == self.raw_value.len);
-                return mem.bytesAsValue(T, self.raw_value);
-            }
+        /// An entry's expiration
+        pub const Expiration = struct {
+            /// Entry's lifetime
+            timeout: Io.Timeout,
+            /// Optional cleanup context to be passed `runCleanup` that will be run when the entry is removed
+            cleanup_context: ?*anyopaque = null,
+            /// Cleanup function to be run when the entry is removed
+            runCleanup: *const fn (context: ?*anyopaque, entry: EntryReader) void = noopCleanup,
 
-            /// Read this entry as `[]const T`
-            pub fn readSliceEntry(self: SafeReader, comptime T: type) []align(max_alignment.toByteUnits()) const T {
-                debug.assert(@rem(self.raw_value.len, @sizeOf(T)) == 0);
-                return mem.bytesAsSlice(T, self.raw_value);
+            /// No-op cleanup function
+            pub fn noopCleanup(_: ?*anyopaque, _: EntryReader) void {}
+
+            /// No expiration -
+            /// Assumes that nothing needs to be run when the entry is removed
+            pub const none: Expiration = .{ .timeout = .none };
+
+            inline fn cleanup(self: Expiration, entry: EntryReader) void {
+                self.runCleanup(self.cleanup_context, entry);
             }
         };
 
@@ -77,7 +104,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             gpa: Allocator,
             key: []const u8,
             entry: anytype,
-            expiration: Io.Timeout,
+            expiration: Expiration,
         ) (error{CacheClobber} || Error)!void {
             const v: []align(max_alignment.toByteUnits()) u8 = try createEntryValue(gpa, entry);
             errdefer gpa.free(v);
@@ -98,7 +125,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             gpa: Allocator,
             key: []const u8,
             entry: anytype,
-            expiration: Io.Timeout,
+            expiration: Expiration,
         ) Error!void {
             const v: []align(max_alignment.toByteUnits()) u8 = try createEntryValue(gpa, entry);
             errdefer gpa.free(v);
@@ -118,7 +145,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             io: Io,
             gpa: Allocator,
             key: []const u8,
-            expiration: Io.Timeout,
+            expiration: Expiration,
             createEntryFn: anytype,
             args: ArgsTuple(@TypeOf(createEntryFn)),
         ) (ErrorType(@TypeOf(createEntryFn)) || Error || error{TooManyOpenReaders})!SafeReader {
@@ -152,7 +179,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             gpa: Allocator,
             key: []const u8,
             entry: []const T,
-            expiration: Io.Timeout,
+            expiration: Expiration,
         ) (error{CacheClobber} || Error)!void {
             const v: []align(max_alignment.toByteUnits()) u8 = try allocSliceEntryValue(T, gpa, entry);
             errdefer gpa.free(v);
@@ -168,7 +195,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             gpa: Allocator,
             key: []const u8,
             entry: []const T,
-            expiration: Io.Timeout,
+            expiration: Expiration,
         ) Error!void {
             const v: []align(max_alignment.toByteUnits()) u8 = try allocSliceEntryValue(T, gpa, entry);
             errdefer gpa.free(v);
@@ -183,7 +210,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             io: Io,
             gpa: Allocator,
             key: []const u8,
-            expiration: Io.Timeout,
+            expiration: Expiration,
             createEntryFn: anytype,
             args: ArgsTuple(@TypeOf(createEntryFn)),
         ) (ErrorType(@TypeOf(createEntryFn)) || Error || error{TooManyOpenReaders})!SafeReader {
@@ -257,7 +284,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             gpa: Allocator,
             key: []const u8,
             v: []align(max_alignment.toByteUnits()) u8,
-            expiration: Io.Timeout,
+            expiration: Expiration,
             comptime put_behavior: PutBehavior,
         ) switch (put_behavior) {
             .replace => Error,
@@ -277,23 +304,27 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                     .no_clobber => return error.CacheClobber,
                     .replace => {
                         const metadata: *Metadata = self.metadata_cache.getPtr(k).?;
+
                         while (!try metadata.safeSwap(io)) {
                             // spin until we can safely swap
                         }
+                        const raw: []align(max_alignment.toByteUnits()) const u8 = value_gop.value_ptr.*[0..metadata.len];
+                        metadata.expiration.cleanup(.{ .raw_value = raw });
                         // free the previous value
-                        gpa.free(value_gop.value_ptr.*[0..metadata.len]);
+                        gpa.free(raw);
                         // replace...
                         value_gop.value_ptr.* = v.ptr;
                         metadata.len = @intCast(v.len);
                         // let other threads know that this can be safely read
                         metadata.ref_count.store(.zero, .release);
+                        metadata.expiration = expiration;
                     }
                 } else {
                     value_gop.value_ptr.* = v.ptr;
                     errdefer debug.assert(self.value_cache.remove(k));
 
                     try mine.stepOn(.insert_size_entry);
-                    try self.metadata_cache.putNoClobber(gpa, k, .init(@intCast(v.len)));
+                    try self.metadata_cache.putNoClobber(gpa, k, .init(@intCast(v.len), expiration));
                 }
             }
             errdefer {
@@ -302,9 +333,9 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             }
 
             try mine.stepOn(.start_expiration);
-            switch (expiration) {
+            switch (expiration.timeout) {
                 .none => {},
-                else => try self.expiration_group.concurrent(io, handleExpiration, .{ self, io, gpa, key, expiration }),
+                else => try self.expiration_group.concurrent(io, handleExpiration, .{ self, io, gpa, key, expiration.timeout }),
             }
         }
 
@@ -314,11 +345,11 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             io: Io,
             gpa: Allocator,
             key: []const u8,
-            expiration: Io.Timeout,
+            expiration_timeout: Io.Timeout,
         ) Io.Cancelable!void {
-            debug.assert(expiration != .none);
+            debug.assert(expiration_timeout != .none);
 
-            expiration.sleep(io) catch |err| switch (err) {
+            expiration_timeout.sleep(io) catch |err| switch (err) {
                 // okay, we've received a cancellation request, which means we're probably clearing the cache or de-initializing
                 Io.SleepError.Canceled => |canceled| return canceled,
                 Io.SleepError.UnsupportedClock => @panic("Clock does not support timeout operation."),
@@ -353,13 +384,13 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             log.debug("Metadata for key {x} was {s}.", .{ k, if (metadata == null) "found" else "not found" });
             if (metadata) |m| switch (try m.safeRead(io)) {
                 .safe => return .{
-                    .raw_value = self.value_cache.get(k).?[0..m.len],
+                    .entry = .{ .raw_value = self.value_cache.get(k).?[0..m.len] },
                     .ref_count = &m.ref_count,
                 },
                 .swapping => while (switch (try m.safeRead(io)) {
                     .swapping => true, // wait for swap operation to complete
                     .safe => return .{
-                        .raw_value = self.value_cache.get(k).?[0..m.len],
+                        .entry = .{ .raw_value = self.value_cache.get(k).?[0..m.len] },
                         .ref_count = &m.ref_count,
                     },
                     .destroying => return null,
@@ -398,9 +429,11 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                     // spin until ref count reaches 0...
                 }
 
-                const entry: [*]align(max_alignment.toByteUnits()) const u8 = self.value_cache.fetchRemove(k).?.value;
-                log.debug("Freeing entry {*}, len {d} with Allocator impl {*}", .{ entry, m.len, gpa.ptr });
-                gpa.free(entry[0..m.len]);
+                const raw: []align(max_alignment.toByteUnits()) const u8 = self.value_cache.fetchRemove(k).?.value[0..m.len];
+                m.expiration.cleanup(.{ .raw_value = raw });
+
+                log.debug("Freeing entry {*}, len {d} with Allocator impl {*}", .{ raw.ptr, raw.len, gpa.ptr });
+                gpa.free(raw);
                 debug.assert(self.metadata_cache.remove(k));
                 return true;
             }
@@ -424,7 +457,9 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                 while (!try metadata.safeDestroy(io)) {
                     // spin until ref count reaches 0...
                 }
-                gpa.free(entry.value_ptr.*[0..metadata.len]);
+                const raw: []align(max_alignment.toByteUnits()) const u8 = entry.value_ptr.*[0..metadata.len];
+                metadata.expiration.cleanup(.{ .raw_value = raw });
+                gpa.free(raw);
             }
 
             self.value_cache.clearRetainingCapacity();
@@ -466,8 +501,10 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             debug.assert(self.value_cache.count() == self.metadata_cache.count());
             var iter: ValueCache.Iterator = self.value_cache.iterator();
             while (iter.next()) |entry| {
-                const len: u32 = self.metadata_cache.get(entry.key_ptr.*).?.len;
-                gpa.free(entry.value_ptr.*[0..len]);
+                const metadata: *const Metadata = self.metadata_cache.getPtr(entry.key_ptr.*).?;
+                const raw: []align(max_alignment.toByteUnits()) const u8 = entry.value_ptr.*[0..metadata.len];
+                metadata.expiration.cleanup(.{ .raw_value = raw });
+                gpa.free(raw);
             }
             self.value_cache.deinit(gpa);
             self.metadata_cache.deinit(gpa);
@@ -485,13 +522,19 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
 
         /// Metadata on a cache entry, containg the length of the entry and its reference count
         const Metadata = struct {
+            /// Entry expiration
+            expiration: Expiration,
             /// Length of the cache entry
             len: u32,
             /// Number of references reading this cache entry
             ref_count: Atomic(RefCount),
 
-            fn init(len: u32) Metadata {
-                return .{ .len = len, .ref_count = .init(.zero) };
+            fn init(len: u32, expiration: Expiration) Metadata {
+                return .{
+                    .expiration = expiration,
+                    .len = len,
+                    .ref_count = .init(.zero),
+                };
             }
 
             fn safeSwap(self: *Metadata, io: Io) Io.Cancelable!bool {
@@ -627,7 +670,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             if (try mem_cache.lockReader(testing.io, "struct_val")) |reader| {
                 try testing.expectEqual(.one, reader.ref_count.load(.monotonic));
 
-                const entry: *const StructValue = reader.readEntry(StructValue);
+                const entry: *const StructValue = reader.entry.read(StructValue);
                 try testing.expectEqual(s.a, entry.a);
                 try testing.expectEqual(s.b, entry.b);
 
@@ -650,7 +693,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             if (try mem_cache.lockReader(testing.io, "slice")) |reader| {
                 try testing.expectEqual(.one, reader.ref_count.load(.monotonic));
 
-                const entry: []const u32 = reader.readSliceEntry(u32);
+                const entry: []const u32 = reader.entry.readSlice(u32);
                 try testing.expectEqualSlices(u32, &arr, entry);
 
                 reader.release(); // normally, you'd want to call this in a defer at the top of your scope
@@ -684,7 +727,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                 },
             };
 
-            try mem_cache.newEntry(testing.io, testing.allocator, "struct_val", s, expiration);
+            try mem_cache.newEntry(testing.io, testing.allocator, "struct_val", s, .{ .timeout = expiration });
 
             if (try mem_cache.lockReader(testing.io, "struct_val")) |reader| {
                 try testing.expectEqual(.one, reader.ref_count.load(.monotonic));
@@ -847,10 +890,12 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             if (try mem_cache.lockReader(testing.io, "my_slice")) |_| return error.ExpectedNoEntry;
             if (try mem_cache.lockReader(testing.io, "struct_val")) |_| return error.ExpectedNoEntry;
 
-            const expiration: Io.Timeout = .{
-                .duration = .{
-                    .raw = .fromMilliseconds(5),
-                    .clock = .awake,
+            const expiration: Expiration = .{
+                .timeout = .{
+                    .duration = .{
+                        .raw = .fromMilliseconds(5),
+                        .clock = .awake,
+                    },
                 },
             };
             // re-add with expiration
@@ -881,7 +926,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             if (try mem_cache.lockReader(testing.io, "my_entry")) |reader| {
                 defer reader.release();
 
-                try testing.expectEqual(num2, reader.readEntry(i32).*);
+                try testing.expectEqual(num2, reader.entry.read(i32).*);
             }
         }
 
@@ -898,7 +943,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             if (try mem_cache.lockReader(testing.io, "my_slice")) |reader| {
                 defer reader.release();
 
-                try testing.expectEqualStrings(slice2, reader.readSliceEntry(u8));
+                try testing.expectEqualStrings(slice2, reader.entry.readSlice(u8));
             }
         }
 
@@ -954,7 +999,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                         error.TooManyOpenReaders => unreachable,
                     }) |reader| {
                         defer reader.release();
-                        testing.expectEqualStrings(slice, reader.readSliceEntry(u8)) catch unreachable;
+                        testing.expectEqualStrings(slice, reader.entry.readSlice(u8)) catch unreachable;
                     }
                 }
             }.readEntry;
@@ -1015,24 +1060,43 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                 };
                 defer reader.release();
 
-                try testing.expectEqual(64, reader.readEntry(i32).*);
+                try testing.expectEqual(64, reader.entry.read(i32).*);
             }
             {
-                var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-                defer arena.deinit();
-                const reader: SafeReader = try mem_cache.getOrPutEntry(testing.io, testing.allocator, "my_other_val", .none, struct {
-                    fn createEntry(a: Allocator) Allocator.Error!*const u32 {
+                // this test exemplifies a pattern for creating an entry and the cleanup that may be required when the entry is removed
+
+                const EntryManager = struct {
+                    gpa: Allocator,
+
+                    fn createEntry(this: @This()) Allocator.Error!*const u32 {
                         // imagine this is some DB query or something...
                         // idk why we have to create a pointer, but just imagine with me
-                        const val: *u32 = try a.create(u32);
+                        const val: *u32 = try this.gpa.create(u32);
                         val.* = 25;
                         return val;
                     }
-                }.createEntry, .{arena.allocator()});
+
+                    fn cleanup(context: ?*anyopaque, entry: EntryReader) void {
+                        const this: *const @This() = @ptrCast(@alignCast(context.?));
+                        this.gpa.destroy(entry.read(*const u32));
+                        this.gpa.destroy(this);
+                    }
+                };
+
+                const entry_manager: *EntryManager = try testing.allocator.create(EntryManager);
+                errdefer testing.allocator.destroy(entry_manager);
+
+                entry_manager.* = .{ .gpa = testing.allocator };
+
+                const reader: SafeReader = try mem_cache.getOrPutEntry(testing.io, testing.allocator, "my_other_val", .{
+                    .timeout = .none,
+                    .cleanup_context = entry_manager,
+                    .runCleanup = EntryManager.cleanup,
+                }, EntryManager.createEntry, .{entry_manager.*});
                 defer reader.release();
 
                 // funky edge case here
-                try testing.expectEqual(25, reader.readEntry(*const u32).*.*);
+                try testing.expectEqual(25, reader.entry.read(*const u32).*.*);
             }
         }
 
@@ -1049,20 +1113,38 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                 }.createEntry, .{});
                 defer reader.release();
 
-                try testing.expectEqualStrings("blarf", reader.readSliceEntry(u8));
+                try testing.expectEqualStrings("blarf", reader.entry.readSlice(u8));
             }
             {
-                var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-                defer arena.deinit();
+                // this test exemplifies a pattern for creating a slice entry and the cleanup that may be required when the entry is removed
 
-                const reader: SafeReader = try mem_cache.getOrPutSliceEntry(testing.io, testing.allocator, "my_other_val", .none, struct {
-                    fn createEntry(a: Allocator) Allocator.Error![]const u8 {
-                        return try a.dupe(u8, "whoa");
+                const EntryManager = struct {
+                    gpa: Allocator,
+
+                    fn createEntry(this: @This()) Allocator.Error![]const u8 {
+                        return this.gpa.dupe(u8, "whoa");
                     }
-                }.createEntry, .{arena.allocator()});
+
+                    fn cleanup(context: ?*anyopaque, entry: EntryReader) void {
+                        const this: *const @This() = @ptrCast(@alignCast(context.?));
+                        this.gpa.free(entry.readSlice(u8));
+                        this.gpa.destroy(this);
+                    }
+                };
+
+                const entry_manager: *EntryManager = try testing.allocator.create(EntryManager);
+                errdefer testing.allocator.destroy(entry_manager);
+
+                entry_manager.* = .{ .gpa = testing.allocator };
+
+                const reader: SafeReader = try mem_cache.getOrPutSliceEntry(testing.io, testing.allocator, "my_other_val", .{
+                    .timeout = .none,
+                    .cleanup_context = entry_manager,
+                    .runCleanup = EntryManager.cleanup,
+                }, EntryManager.createEntry, .{entry_manager.*});
                 defer reader.release();
 
-                try testing.expectEqualStrings("whoa", reader.readSliceEntry(u8));
+                try testing.expectEqualStrings("whoa", reader.entry.readSlice(u8));
             }
         }
 
