@@ -1088,15 +1088,16 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                 };
 
                 const entry_manager: *EntryManager = try testing.allocator.create(EntryManager);
-                errdefer testing.allocator.destroy(entry_manager);
-
                 entry_manager.* = .{ .gpa = testing.allocator };
 
-                const reader: SafeReader = try mem_cache.getOrPutEntry(testing.io, testing.allocator, "my_other_val", .{
-                    .timeout = .none,
-                    .cleanup_context = entry_manager,
-                    .runCleanup = EntryManager.cleanup,
-                }, EntryManager.createEntry, .{entry_manager.*});
+                const reader: SafeReader = reader: {
+                    errdefer testing.allocator.destroy(entry_manager);
+                    break :reader try mem_cache.getOrPutEntry(testing.io, testing.allocator, "my_other_val", .{
+                        .timeout = .none,
+                        .cleanup_context = entry_manager,
+                        .runCleanup = EntryManager.cleanup,
+                    }, EntryManager.createEntry, .{entry_manager.*});
+                };
                 defer reader.release();
 
                 // funky edge case here
@@ -1140,15 +1141,16 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                 };
 
                 const entry_manager: *EntryManager = try testing.allocator.create(EntryManager);
-                errdefer testing.allocator.destroy(entry_manager);
-
                 entry_manager.* = .{ .gpa = testing.allocator };
 
-                const reader: SafeReader = try mem_cache.getOrPutSliceEntry(testing.io, testing.allocator, "my_other_val", .{
-                    .timeout = .none,
-                    .cleanup_context = entry_manager,
-                    .runCleanup = EntryManager.cleanup,
-                }, EntryManager.createEntry, .{entry_manager});
+                const reader: SafeReader = reader: {
+                    errdefer testing.allocator.destroy(entry_manager);
+                    break :reader try mem_cache.getOrPutSliceEntry(testing.io, testing.allocator, "my_other_val", .{
+                        .timeout = .none,
+                        .cleanup_context = entry_manager,
+                        .runCleanup = EntryManager.cleanup,
+                    }, EntryManager.createEntry, .{entry_manager});
+                };
                 defer reader.release();
 
                 try testing.expectEqualStrings("whoa", reader.entry.readSlice(u8));
