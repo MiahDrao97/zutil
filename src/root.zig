@@ -100,11 +100,6 @@ comptime {
 
 const std = @import("std");
 const mem_cache = @import("mem_cache.zig");
-const log = std.log;
-const crypto = std.crypto;
 const testing = std.testing;
-const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
-const SourceLocation = std.builtin.SourceLocation;
-const Random = std.Random;
