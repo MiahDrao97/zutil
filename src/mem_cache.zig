@@ -193,15 +193,14 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                 return .{ .result = .exists, .reader = reader };
             }
 
-            const EntryType = ReturnType(@TypeOf(createEntryFn));
             const call = struct {
-                fn call(ctx: @TypeOf(create_entry_ctx), cleanup_context_out: *Expiration.CleanupContextOut) ErrorType(TReturn)!EntryType {
+                fn call(ctx: @TypeOf(create_entry_ctx), cleanup_context_out: *Expiration.CleanupContextOut) ErrorType(TReturn)!ReturnType(TReturn) {
                     return @call(.auto, createEntryFn, .{ ctx, cleanup_context_out });
                 }
             }.call;
 
             var expiration_cpy: Expiration = expiration;
-            const val: EntryType = try call(create_entry_ctx, &expiration_cpy.cleanup_context);
+            const val: ReturnType(TReturn) = try call(create_entry_ctx, &expiration_cpy.cleanup_context);
 
             const entry_reader: EntryReader = .{ .raw_value = &mem.toBytes(val) };
             errdefer expiration_cpy.cleanup(entry_reader);
@@ -275,7 +274,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             create_entry_ctx: anytype,
             createEntryFn: fn (@TypeOf(create_entry_ctx), *Expiration.CleanupContextOut) TReturn,
         ) (ErrorType(TReturn) || Error || error{TooManyOpenReaders})!GetOrPutResult {
-            const SliceType = switch (@typeInfo(ReturnType(@TypeOf(createEntryFn)))) {
+            const SliceType = switch (@typeInfo(ReturnType(TReturn))) {
                 .pointer => |p| switch (p.size) {
                     .slice => p.child,
                     else => @compileError("Expected `createEntryFn` to have a return type coercible to `TError![]const T`"),

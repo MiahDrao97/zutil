@@ -41,13 +41,17 @@ pub fn ErrorType(comptime T: type) type {
     };
 }
 
-/// Extracts the non-error component of a function's return type,
-/// or, if it doesn't return an error union, simply the return type.
-pub fn ReturnType(comptime Func: type) type {
-    const TReturn = @typeInfo(Func).@"fn".return_type.?;
-    return switch (@typeInfo(TReturn)) {
+/// Extracts the non-error component of a function's return type or error union.
+/// If `T` is neither of the above, simply returns `T` (except error sets produce a compile error).
+pub fn ReturnType(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .@"fn" => |f| switch (@typeInfo(f.return_type.?)) {
+            .error_union => |e| e.payload,
+            .error_set => @compileError("Return type must be an error union or a non-error-set value."),
+            else => f.return_type.?,
+        },
         .error_union => |e| e.payload,
         .error_set => @compileError("Return type must be an error union or a non-error-set value."),
-        else => TReturn,
+        else => T,
     };
 }
