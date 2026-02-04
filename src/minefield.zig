@@ -15,15 +15,8 @@ pub fn set(comptime F: type, comptime E: anytype) type {
         /// Expose `F` back
         pub const Fuse = F;
         /// Expose `E` back
-        pub const Error = err: {
-            const T = if (@TypeOf(E) == type) E else @TypeOf(E);
-            break :err switch (@typeInfo(T)) {
-                .error_set => T,
-                .error_union => |e| e.error_set,
-                .@"fn" => |f| @typeInfo(f.return_type.?).error_union.error_set,
-                else => @compileError("Expected error union, error set, or function but received " ++ @typeName(T)),
-            };
-        };
+        pub const Error = ErrorType(if (@TypeOf(E) == type) E else @TypeOf(E));
+
         comptime {
             debug.assert(@typeInfo(Fuse) == .@"enum");
             debug.assert(@typeInfo(Error) == .error_set);
@@ -154,3 +147,4 @@ const debug = std.debug;
 const log = std.log.scoped(.minefield);
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
+const ErrorType = @import("meta.zig").ErrorType;

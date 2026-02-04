@@ -26,12 +26,17 @@ pub fn structSubset(comptime TSubset: type, @"struct": anytype) TSubset {
     }
 }
 
-/// Extracts the error component of a function's return type,
-/// or, if it doesn't return an error union, simply an empty error set.
-pub fn ErrorType(comptime Func: type) type {
-    return switch (@typeInfo(@typeInfo(Func).@"fn".return_type.?)) {
+/// Extracts the error component of a function's return type, error union, or error set.
+/// If `T` is neither of the above, returns `error{}`.
+pub fn ErrorType(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .@"fn" => |f| switch (@typeInfo(f.return_type.?)) {
+            .error_union => |e| e.error_set,
+            .error_set => f.return_type.?,
+            else => error{},
+        },
         .error_union => |e| e.error_set,
-        .error_set => @compileError("Return type must be an error union or a non-error-set value."),
+        .error_set => T,
         else => error{},
     };
 }
