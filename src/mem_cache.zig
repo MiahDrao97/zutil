@@ -98,24 +98,6 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             }
         };
 
-        /// Returned from `getOrPutEntry` and `getOrPutSliceEntry`
-        /// Don't forget to call `release()` on the reader.
-        pub const GetOrPutResult = struct {
-            /// Whether or not the entry already existed or if a new one was created
-            result: Result,
-            /// `SafeReader` for the current entry - don't forget to call `release()`
-            reader: SafeReader,
-
-            /// Whether or not the entry already existed or if a new one was created
-            pub const Result = enum {
-                /// If the entry already exists, the `createValueFn` was not called.
-                exists,
-                /// The entry was created, which means the `createValueFn` was called,
-                /// and the `mem_cache` will call any necessary cleanup on the entry when it is removed.
-                new_entry,
-            };
-        };
-
         /// Initialize empty cache
         pub const init: Self = .{
             .value_cache = .empty,
@@ -188,9 +170,9 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             expiration: Expiration,
             create_entry_ctx: anytype,
             createEntryFn: fn (@TypeOf(create_entry_ctx), *Expiration.CleanupContextOut) TReturn,
-        ) (ErrorType(TReturn) || Error || error{TooManyOpenReaders})!GetOrPutResult {
+        ) (ErrorType(TReturn) || Error || error{TooManyOpenReaders})!SafeReader {
             if (try self.lockReader(io, key)) |reader| {
-                return .{ .result = .exists, .reader = reader };
+                return reader;
             }
 
             const call = struct {
@@ -214,10 +196,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                 else => |e| return e,
             };
 
-            return .{
-                .result = .new_entry,
-                .reader = (try self.lockReader(io, key)).?,
-            };
+            return (try self.lockReader(io, key)).?;
         }
 
         /// Creates a new slice entry, returning `error.CacheClobber` if an entry with this `key` already exists.
@@ -273,7 +252,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             expiration: Expiration,
             create_entry_ctx: anytype,
             createEntryFn: fn (@TypeOf(create_entry_ctx), *Expiration.CleanupContextOut) TReturn,
-        ) (ErrorType(TReturn) || Error || error{TooManyOpenReaders})!GetOrPutResult {
+        ) (ErrorType(TReturn) || Error || error{TooManyOpenReaders})!SafeReader {
             const SliceType = switch (@typeInfo(ReturnType(TReturn))) {
                 .pointer => |p| switch (p.size) {
                     .slice => p.child,
@@ -293,7 +272,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             errdefer expiration_cpy.cleanup(entry_reader);
 
             if (try self.lockReader(io, key)) |reader| {
-                return .{ .result = .exists, .reader = reader };
+                return reader;
             }
             const v: []align(max_alignment.toByteUnits()) const u8 = try allocSliceEntryValue(SliceType, gpa, val);
             errdefer gpa.free(v);
@@ -304,10 +283,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                 else => |e| return e,
             };
 
-            return .{
-                .result = .new_entry,
-                .reader = (try self.lockReader(io, key)).?,
-            };
+            return (try self.lockReader(io, key)).?;
         }
 
         fn createEntryValue(gpa: Allocator, entry: anytype) Allocator.Error![]align(max_alignment.toByteUnits()) u8 {
@@ -1118,18 +1094,15 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
 
             {
                 // no error and no args in createEntry()
-                const reader: SafeReader = (mem_cache.getOrPutEntry(i32, testing.io, testing.allocator, "my_val", .none, {}, struct {
+                const reader: SafeReader = mem_cache.getOrPutEntry(i32, testing.io, testing.allocator, "my_val", .none, {}, struct {
                     fn createEntry(_: void, _: *Expiration.CleanupContextOut) i32 {
                         return 64;
                     }
                 }.createEntry) catch |err| switch (err) {
                     // I have this here to exemplify how to pivot to wait for a lock if there are too many readers open
-                    error.TooManyOpenReaders => @as(GetOrPutResult, .{
-                        .result = .exists,
-                        .reader = (try mem_cache.waitForReaderLock(testing.io, "my_val")).?,
-                    }),
+                    error.TooManyOpenReaders => (try mem_cache.waitForReaderLock(testing.io, "my_val")).?,
                     else => |e| return e,
-                }).reader;
+                };
                 defer reader.release();
 
                 try testing.expectEqual(64, reader.entry.read(i32).*);
@@ -1165,7 +1138,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                 };
 
                 const entry_manager: EntryManager = .{ .gpa = testing.allocator };
-                const gop: GetOrPutResult = try mem_cache.getOrPutEntry(
+                const reader: SafeReader = try mem_cache.getOrPutEntry(
                     Allocator.Error!*const u32,
                     testing.io,
                     testing.allocator,
@@ -1177,10 +1150,10 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                     entry_manager,
                     EntryManager.createEntry,
                 );
-                defer gop.reader.release();
+                defer reader.release();
 
                 // funky edge case here
-                try testing.expectEqual(25, gop.reader.entry.read(*const u32).*.*);
+                try testing.expectEqual(25, reader.entry.read(*const u32).*.*);
             }
         }
 
@@ -1190,14 +1163,14 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
 
             {
                 // no error and no args in createEntry()
-                const gop: GetOrPutResult = try mem_cache.getOrPutSliceEntry([]const u8, testing.io, testing.allocator, "my_val", .none, {}, struct {
+                const reader: SafeReader = try mem_cache.getOrPutSliceEntry([]const u8, testing.io, testing.allocator, "my_val", .none, {}, struct {
                     fn createEntry(_: void, _: *Expiration.CleanupContextOut) []const u8 {
                         return "blarf";
                     }
                 }.createEntry);
-                defer gop.reader.release();
+                defer reader.release();
 
-                try testing.expectEqualStrings("blarf", gop.reader.entry.readSlice(u8));
+                try testing.expectEqualStrings("blarf", reader.entry.readSlice(u8));
             }
             {
                 // this test exemplifies a pattern for creating a slice entry and the cleanup that may be required when the entry is removed
@@ -1226,7 +1199,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                 };
 
                 const entry_manager: EntryManager = .{ .gpa = testing.allocator };
-                const gop: GetOrPutResult = try mem_cache.getOrPutSliceEntry(
+                const reader: SafeReader = try mem_cache.getOrPutSliceEntry(
                     Allocator.Error![]const u8,
                     testing.io,
                     testing.allocator,
@@ -1238,9 +1211,9 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                     entry_manager,
                     EntryManager.createEntry,
                 );
-                defer gop.reader.release();
+                defer reader.release();
 
-                try testing.expectEqualStrings("whoa", gop.reader.entry.readSlice(u8));
+                try testing.expectEqualStrings("whoa", reader.entry.readSlice(u8));
             }
         }
 
