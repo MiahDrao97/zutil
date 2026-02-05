@@ -108,7 +108,6 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
 
         /// Creates a new entry, returning `error.CacheClobber` if an entry with this `key` already exists.
         /// Ensure that `gpa` is thread-safe.
-        /// Runs `expiration.cleanup()` on error.
         ///
         /// Keys are not stored in this memory cache, so it's the responsibility of the caller to keep track of keys.
         /// The caller must also know the type of the stored values since they're agnostically stored as `[*]const u8`.
@@ -125,10 +124,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         ) (error{CacheClobber} || Error)!void {
             comptime checkAlignment(@TypeOf(entry));
 
-            const entry_reader: EntryReader = .{ .raw_value = &mem.toBytes(entry) };
-            errdefer expiration.cleanup(entry_reader);
-
-            const v: []align(max_alignment.toByteUnits()) const u8 = try createEntryValue(gpa, entry_reader.raw_value);
+            const v: []align(max_alignment.toByteUnits()) const u8 = try createEntryValue(gpa, &mem.toBytes(entry));
             errdefer gpa.free(v);
             try self.putEntry(io, gpa, key, v, expiration, .no_clobber);
         }
@@ -152,15 +148,14 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         ) Error!void {
             comptime checkAlignment(@TypeOf(entry));
 
-            const entry_reader: EntryReader = .{ .raw_value = &mem.toBytes(entry) };
-            errdefer expiration.cleanup(entry_reader);
-
-            const v: []align(max_alignment.toByteUnits()) const u8 = try createEntryValue(gpa, entry_reader.raw_value);
+            const v: []align(max_alignment.toByteUnits()) const u8 = try createEntryValue(gpa, &mem.toBytes(entry));
             errdefer gpa.free(v);
             try self.putEntry(io, gpa, key, v, expiration, .replace);
         }
 
-        /// Returns a `GetOrPutResult`, which contains a `SafeReader` and a result to indicate whether an entry for `key` already existed or a new entry was created.
+        /// First checks if the entry exists.
+        /// If a `SafeReader` can be obtained from an existing entry, it is returned.
+        /// Otherwise, creates an entry using the `createEntryFn` and passed-in context and returns a `SafeReader` to the new entry.
         /// Be sure to call `release()` on the `SafeReader`.
         /// Assumes that the duration of `expiration` is longer than the time it takes to lock a reader.
         ///
@@ -220,10 +215,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         ) (error{CacheClobber} || Error)!void {
             comptime checkAlignment(@TypeOf([]const T));
 
-            const entry_reader: EntryReader = .{ .raw_value = mem.sliceAsBytes(entry) };
-            errdefer expiration.cleanup(entry_reader);
-
-            const v: []align(max_alignment.toByteUnits()) const u8 = try createEntryValue(gpa, entry_reader.raw_value);
+            const v: []align(max_alignment.toByteUnits()) const u8 = try createEntryValue(gpa, mem.sliceAsBytes(entry));
             errdefer gpa.free(v);
             try self.putEntry(io, gpa, key, v, expiration, .no_clobber);
         }
@@ -243,15 +235,14 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         ) Error!void {
             comptime checkAlignment(@TypeOf([]const T));
 
-            const entry_reader: EntryReader = .{ .raw_value = mem.sliceAsBytes(entry) };
-            errdefer expiration.cleanup(entry_reader);
-
-            const v: []align(max_alignment.toByteUnits()) const u8 = try createEntryValue(gpa, entry_reader.raw_value);
+            const v: []align(max_alignment.toByteUnits()) const u8 = try createEntryValue(gpa, mem.sliceAsBytes(entry));
             errdefer gpa.free(v);
             try self.putEntry(io, gpa, key, v, expiration, .replace);
         }
 
-        /// Returns a `GetOrPutResult`, which contains a `SafeReader` and a result to indicate whether an entry for `key` already existed or a new entry was created.
+        /// First checks if the entry exists.
+        /// If a `SafeReader` can be obtained from an existing entry, it is returned.
+        /// Otherwise, creates an entry using the `createEntryFn` and passed-in context and returns a `SafeReader` to the new entry.
         /// Be sure to call `release()` on the `SafeReader`.
         /// Assumes that the reader can be locked before the expiration is up.
         /// The contents of the entry are copied to the cache.
