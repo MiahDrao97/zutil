@@ -108,10 +108,12 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
 
         /// Creates a new entry, returning `error.CacheClobber` if an entry with this `key` already exists.
         /// Ensure that `gpa` is thread-safe.
+        /// Runs `expiration.cleanup()` on error.
         ///
         /// Keys are not stored in this memory cache, so it's the responsibility of the caller to keep track of keys.
         /// The caller must also know the type of the stored values since they're agnostically stored as `[*]const u8`.
         /// Note that this entry is saved as a shallow copy, which means that pointer members are not dereferenced and saved into the cache.
+        ///
         /// Use `newSliceEntry()` to cache a slice.
         pub fn newEntry(
             self: *Self,
@@ -121,16 +123,19 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             entry: anytype,
             expiration: Expiration,
         ) (error{CacheClobber} || Error)!void {
+            comptime checkAlignment(@TypeOf(entry));
+
             const entry_reader: EntryReader = .{ .raw_value = &mem.toBytes(entry) };
             errdefer expiration.cleanup(entry_reader);
 
-            const v: []align(max_alignment.toByteUnits()) const u8 = try createEntryValue(gpa, entry);
+            const v: []align(max_alignment.toByteUnits()) const u8 = try createEntryValue(gpa, entry_reader.raw_value);
             errdefer gpa.free(v);
             try self.putEntry(io, gpa, key, v, expiration, .no_clobber);
         }
 
         /// Creates or overwrites an entry.
         /// Ensure that `gpa` is thread-safe.
+        /// Runs `expiration.cleanup()` on error.
         ///
         /// Keys are not stored in this memory cache, so it's the responsibility of the caller to keep track of keys.
         /// The caller must also know the type of the stored values since they're agnostically stored as `[*]const u8`.
@@ -145,10 +150,12 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             entry: anytype,
             expiration: Expiration,
         ) Error!void {
+            comptime checkAlignment(@TypeOf(entry));
+
             const entry_reader: EntryReader = .{ .raw_value = &mem.toBytes(entry) };
             errdefer expiration.cleanup(entry_reader);
 
-            const v: []align(max_alignment.toByteUnits()) const u8 = try createEntryValue(gpa, entry);
+            const v: []align(max_alignment.toByteUnits()) const u8 = try createEntryValue(gpa, entry_reader.raw_value);
             errdefer gpa.free(v);
             try self.putEntry(io, gpa, key, v, expiration, .replace);
         }
@@ -171,23 +178,22 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             create_entry_ctx: anytype,
             createEntryFn: fn (@TypeOf(create_entry_ctx), *Expiration.CleanupContextOut) TReturn,
         ) (ErrorType(TReturn) || Error || error{TooManyOpenReaders})!SafeReader {
+            comptime checkAlignment(@TypeOf(ReturnType(TReturn)));
+
             if (try self.lockReader(io, key)) |reader| {
                 return reader;
             }
 
-            const call = struct {
-                fn call(ctx: @TypeOf(create_entry_ctx), cleanup_context_out: *Expiration.CleanupContextOut) ErrorType(TReturn)!ReturnType(TReturn) {
-                    return @call(.auto, createEntryFn, .{ ctx, cleanup_context_out });
-                }
-            }.call;
-
             var expiration_cpy: Expiration = expiration;
-            const val: ReturnType(TReturn) = try call(create_entry_ctx, &expiration_cpy.cleanup_context);
+            const val: ReturnType(TReturn) = try @as(
+                ErrorType(TReturn)!ReturnType(TReturn),
+                createEntryFn(create_entry_ctx, &expiration_cpy.cleanup_context),
+            );
 
             const entry_reader: EntryReader = .{ .raw_value = &mem.toBytes(val) };
             errdefer expiration_cpy.cleanup(entry_reader);
 
-            const v: []align(max_alignment.toByteUnits()) const u8 = try createEntryValue(gpa, val);
+            const v: []align(max_alignment.toByteUnits()) const u8 = try createEntryValue(gpa, entry_reader.raw_value);
             errdefer gpa.free(v);
 
             self.putEntry(io, gpa, key, v, expiration_cpy, .no_clobber) catch |err| switch (err) {
@@ -202,6 +208,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         /// Creates a new slice entry, returning `error.CacheClobber` if an entry with this `key` already exists.
         /// Ensure that `gpa` is thread-safe.
         /// The contents of the entry are copied to the cache.
+        /// Runs `expiration.cleanup()` on error.
         pub fn newSliceEntry(
             self: *Self,
             comptime T: type,
@@ -211,10 +218,12 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             entry: []const T,
             expiration: Expiration,
         ) (error{CacheClobber} || Error)!void {
+            comptime checkAlignment(@TypeOf([]const T));
+
             const entry_reader: EntryReader = .{ .raw_value = mem.sliceAsBytes(entry) };
             errdefer expiration.cleanup(entry_reader);
 
-            const v: []align(max_alignment.toByteUnits()) const u8 = try allocSliceEntryValue(T, gpa, entry);
+            const v: []align(max_alignment.toByteUnits()) const u8 = try createEntryValue(gpa, entry_reader.raw_value);
             errdefer gpa.free(v);
             try self.putEntry(io, gpa, key, v, expiration, .no_clobber);
         }
@@ -222,6 +231,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         /// Creates or overwrites a slice entry.
         /// Ensure that `gpa` is thread-safe.
         /// The contents of the entry are copied to the cache.
+        /// Runs `expiration.cleanup()` on error.
         pub fn overwriteSliceEntry(
             self: *Self,
             comptime T: type,
@@ -231,10 +241,12 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             entry: []const T,
             expiration: Expiration,
         ) Error!void {
+            comptime checkAlignment(@TypeOf([]const T));
+
             const entry_reader: EntryReader = .{ .raw_value = mem.sliceAsBytes(entry) };
             errdefer expiration.cleanup(entry_reader);
 
-            const v: []align(max_alignment.toByteUnits()) const u8 = try allocSliceEntryValue(T, gpa, entry);
+            const v: []align(max_alignment.toByteUnits()) const u8 = try createEntryValue(gpa, entry_reader.raw_value);
             errdefer gpa.free(v);
             try self.putEntry(io, gpa, key, v, expiration, .replace);
         }
@@ -260,21 +272,20 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                 },
                 else => @compileError("Expected `createEntryFn` to have a return type coercible to `TError![]const T`"),
             };
-            const call = struct {
-                fn call(ctx: @TypeOf(create_entry_ctx), cleanup_ctx_out: *Expiration.CleanupContextOut) ErrorType(TReturn)![]const SliceType {
-                    return @call(.auto, createEntryFn, .{ ctx, cleanup_ctx_out });
-                }
-            }.call;
+            comptime checkAlignment(@TypeOf([]const SliceType));
 
             var expiration_cpy: Expiration = expiration;
-            const val: []const SliceType = try call(create_entry_ctx, &expiration_cpy.cleanup_context);
+            const val: []const SliceType = try @as(
+                ErrorType(TReturn)![]const SliceType,
+                createEntryFn(create_entry_ctx, &expiration_cpy.cleanup_context),
+            );
             const entry_reader: EntryReader = .{ .raw_value = mem.sliceAsBytes(val) };
             errdefer expiration_cpy.cleanup(entry_reader);
 
             if (try self.lockReader(io, key)) |reader| {
                 return reader;
             }
-            const v: []align(max_alignment.toByteUnits()) const u8 = try allocSliceEntryValue(SliceType, gpa, val);
+            const v: []align(max_alignment.toByteUnits()) const u8 = try createEntryValue(gpa, entry_reader.raw_value);
             errdefer gpa.free(v);
 
             self.putEntry(io, gpa, key, v, expiration_cpy, .no_clobber) catch |err| switch (err) {
@@ -286,38 +297,20 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             return (try self.lockReader(io, key)).?;
         }
 
-        fn createEntryValue(gpa: Allocator, entry: anytype) Allocator.Error![]align(max_alignment.toByteUnits()) u8 {
-            const EntryType = @TypeOf(entry);
-            if (comptime max_alignment.compare(.lt, .of(EntryType))) {
-                @compileError(fmt.comptimePrint("Max alignment is {d}, but alignment of slice entry was {d} ([]const {s}).", .{
-                    max_alignment.toByteUnits(),
-                    @alignOf(EntryType),
-                    @typeName(EntryType),
-                }));
-            }
-            const entry_bytes: [@sizeOf(EntryType)]u8 = mem.toBytes(entry);
-
-            try mine.stepOnSubset(.alloc, Allocator.Error);
-            const v: []align(max_alignment.toByteUnits()) u8 = try gpa.alignedAlloc(u8, max_alignment, entry_bytes.len);
-            @memcpy(v, &entry_bytes);
-            log.debug("Created new entry {*}, len {d} with Allocator impl {*}", .{ v.ptr, v.len, gpa.ptr });
-
-            return v;
-        }
-
-        fn allocSliceEntryValue(comptime T: type, gpa: Allocator, entry: []const T) Allocator.Error![]align(max_alignment.toByteUnits()) u8 {
+        inline fn checkAlignment(comptime T: type) void {
             if (comptime max_alignment.compare(.lt, .of(T))) {
-                @compileError(fmt.comptimePrint("Max alignment is {d}, but alignment of slice entry was {d} ([]const {s}).", .{
+                @compileError(fmt.comptimePrint("Max alignment is {d}, but alignment of entry was {d} ({s}).", .{
                     max_alignment.toByteUnits(),
                     @alignOf(T),
                     @typeName(T),
                 }));
             }
-            const entry_bytes: []align(@alignOf(T)) const u8 = mem.sliceAsBytes(entry);
+        }
 
+        fn createEntryValue(gpa: Allocator, bytes: []const u8) Allocator.Error![]align(max_alignment.toByteUnits()) u8 {
             try mine.stepOnSubset(.alloc, Allocator.Error);
-            const v: []align(max_alignment.toByteUnits()) u8 = try gpa.alignedAlloc(u8, max_alignment, entry_bytes.len);
-            @memcpy(v, entry_bytes);
+            const v: []align(max_alignment.toByteUnits()) u8 = try gpa.alignedAlloc(u8, max_alignment, bytes.len);
+            @memcpy(v, bytes);
             log.debug("Created new entry {*}, len {d} with Allocator impl {*}", .{ v.ptr, v.len, gpa.ptr });
 
             return v;
@@ -1143,10 +1136,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                     testing.io,
                     testing.allocator,
                     "my_other_val",
-                    .{
-                        .timeout = .none,
-                        .runCleanup = EntryManager.cleanup,
-                    },
+                    .{ .timeout = .none, .runCleanup = EntryManager.cleanup },
                     entry_manager,
                     EntryManager.createEntry,
                 );
@@ -1204,10 +1194,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                     testing.io,
                     testing.allocator,
                     "my_other_val",
-                    .{
-                        .timeout = .none,
-                        .runCleanup = EntryManager.cleanup,
-                    },
+                    .{ .timeout = .none, .runCleanup = EntryManager.cleanup },
                     entry_manager,
                     EntryManager.createEntry,
                 );
