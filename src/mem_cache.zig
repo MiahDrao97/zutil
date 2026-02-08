@@ -90,10 +90,6 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             inline fn cleanup(self: Expiration, entry: EntryReader) void {
                 self.runCleanup(self.cleanup_context, entry);
             }
-
-            fn outputContext(self: *Expiration) Expiration.CleanupContextOut {
-                return .{ .ctx = &self.cleanup_context };
-            }
         };
 
         /// Initialize empty cache
@@ -180,7 +176,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             var expiration_cpy: Expiration = expiration;
             const val: ReturnType(TReturn) = try @as(
                 ErrorType(TReturn)!ReturnType(TReturn),
-                createEntryFn(create_entry_ctx, expiration_cpy.outputContext()),
+                createEntryFn(create_entry_ctx, .{ .ctx = &expiration_cpy.cleanup_context }),
             );
 
             const entry_reader: EntryReader = .{ .raw_value = &mem.toBytes(val) };
@@ -266,7 +262,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             var expiration_cpy: Expiration = expiration;
             const val: []const SliceType = try @as(
                 ErrorType(TReturn)![]const SliceType,
-                createEntryFn(create_entry_ctx, expiration_cpy.outputContext()),
+                createEntryFn(create_entry_ctx, .{ .ctx = &expiration_cpy.cleanup_context }),
             );
             const entry_reader: EntryReader = .{ .raw_value = mem.sliceAsBytes(val) };
             errdefer expiration_cpy.cleanup(entry_reader);
