@@ -67,34 +67,32 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             /// Entry's lifetime
             timeout: Io.Timeout,
             /// Optional cleanup context to be passed `runCleanup` (run when the entry is removed).
-            cleanup_context: ?*CleanupContext = null,
+            cleanup_context: ?*anyopaque = null,
             /// Cleanup function to be run when the entry is removed.
-            runCleanup: *const fn (context: ?*CleanupContext, entry: EntryReader) void = noopCleanup,
-
-            /// Opaque context used for cleaning up an entry
-            pub const CleanupContext = opaque {
-                /// Cast any pointer to `*CleanupContext`
-                pub fn from(any_ptr: *anyopaque) *CleanupContext {
-                    return @ptrCast(any_ptr);
-                }
-
-                /// Cast `*CleanupContext` to `*T`
-                pub fn cast(self: *CleanupContext, comptime T: type) *T {
-                    return @ptrCast(@alignCast(self));
-                }
-            };
+            runCleanup: *const fn (context: ?*anyopaque, entry: EntryReader) void = noopCleanup,
 
             /// Assign a context to this out parameter when creating an entry
-            pub const CleanupContextOut = ?*CleanupContext;
+            pub const CleanupContextOut = struct {
+                ctx: *?*anyopaque,
+
+                /// Set the cleanup context to any pointer
+                pub fn setContext(self: CleanupContextOut, any_ptr: *anyopaque) void {
+                    self.ctx.* = any_ptr;
+                }
+            };
 
             /// No expiration: assumes that nothing needs to be run when the entry is removed
             pub const none: Expiration = .{ .timeout = .none };
 
             /// No-op cleanup function
-            pub fn noopCleanup(_: ?*CleanupContext, _: EntryReader) void {}
+            pub fn noopCleanup(_: ?*anyopaque, _: EntryReader) void {}
 
             inline fn cleanup(self: Expiration, entry: EntryReader) void {
                 self.runCleanup(self.cleanup_context, entry);
+            }
+
+            fn outputContext(self: *Expiration) Expiration.CleanupContextOut {
+                return .{ .ctx = &self.cleanup_context };
             }
         };
 
@@ -171,9 +169,9 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             key: []const u8,
             expiration: Expiration,
             create_entry_ctx: anytype,
-            createEntryFn: fn (@TypeOf(create_entry_ctx), *Expiration.CleanupContextOut) TReturn,
+            createEntryFn: fn (@TypeOf(create_entry_ctx), Expiration.CleanupContextOut) TReturn,
         ) (ErrorType(TReturn) || Error || error{TooManyOpenReaders})!SafeReader {
-            comptime checkAlignment(@TypeOf(ReturnType(TReturn)));
+            comptime checkAlignment(ReturnType(TReturn));
 
             if (try self.lockReader(io, key)) |reader| {
                 return reader;
@@ -182,7 +180,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             var expiration_cpy: Expiration = expiration;
             const val: ReturnType(TReturn) = try @as(
                 ErrorType(TReturn)!ReturnType(TReturn),
-                createEntryFn(create_entry_ctx, &expiration_cpy.cleanup_context),
+                createEntryFn(create_entry_ctx, expiration_cpy.outputContext()),
             );
 
             const entry_reader: EntryReader = .{ .raw_value = &mem.toBytes(val) };
@@ -213,7 +211,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             entry: []const T,
             expiration: Expiration,
         ) (error{CacheClobber} || Error)!void {
-            comptime checkAlignment(@TypeOf([]const T));
+            comptime checkAlignment([]const T);
 
             const v: []align(max_alignment.toByteUnits()) const u8 = try createEntryValue(gpa, mem.sliceAsBytes(entry));
             errdefer gpa.free(v);
@@ -233,7 +231,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             entry: []const T,
             expiration: Expiration,
         ) Error!void {
-            comptime checkAlignment(@TypeOf([]const T));
+            comptime checkAlignment([]const T);
 
             const v: []align(max_alignment.toByteUnits()) const u8 = try createEntryValue(gpa, mem.sliceAsBytes(entry));
             errdefer gpa.free(v);
@@ -254,7 +252,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             key: []const u8,
             expiration: Expiration,
             create_entry_ctx: anytype,
-            createEntryFn: fn (@TypeOf(create_entry_ctx), *Expiration.CleanupContextOut) TReturn,
+            createEntryFn: fn (@TypeOf(create_entry_ctx), Expiration.CleanupContextOut) TReturn,
         ) (ErrorType(TReturn) || Error || error{TooManyOpenReaders})!SafeReader {
             const SliceType = switch (@typeInfo(ReturnType(TReturn))) {
                 .pointer => |p| switch (p.size) {
@@ -263,12 +261,12 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                 },
                 else => @compileError("Expected `createEntryFn` to have a return type coercible to `TError![]const T`"),
             };
-            comptime checkAlignment(@TypeOf([]const SliceType));
+            comptime checkAlignment([]const SliceType);
 
             var expiration_cpy: Expiration = expiration;
             const val: []const SliceType = try @as(
                 ErrorType(TReturn)![]const SliceType,
-                createEntryFn(create_entry_ctx, &expiration_cpy.cleanup_context),
+                createEntryFn(create_entry_ctx, expiration_cpy.outputContext()),
             );
             const entry_reader: EntryReader = .{ .raw_value = mem.sliceAsBytes(val) };
             errdefer expiration_cpy.cleanup(entry_reader);
@@ -408,9 +406,9 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                 defer self.mutex.unlock(io);
 
                 metadata = self.metadata_cache.getPtr(k);
+                log.debug("Metadata for key {x} was {s}.", .{ k, if (metadata == null) "found" else "not found" });
             }
 
-            log.debug("Metadata for key {x} was {s}.", .{ k, if (metadata == null) "found" else "not found" });
             if (metadata) |m| switch (try m.safeRead(io)) {
                 .safe => return .{
                     .entry = .{ .raw_value = self.value_cache.get(k).?[0..m.len] },
@@ -1079,7 +1077,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             {
                 // no error and no args in createEntry()
                 const reader: SafeReader = mem_cache.getOrPutEntry(i32, testing.io, testing.allocator, "my_val", .none, {}, struct {
-                    fn createEntry(_: void, _: *Expiration.CleanupContextOut) i32 {
+                    fn createEntry(_: void, _: Expiration.CleanupContextOut) i32 {
                         return 64;
                     }
                 }.createEntry) catch |err| switch (err) {
@@ -1097,7 +1095,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                 const EntryManager = struct {
                     gpa: Allocator,
 
-                    fn createEntry(this: @This(), cleanup_ctx_out: *Expiration.CleanupContextOut) Allocator.Error!*const u32 {
+                    fn createEntry(this: @This(), cleanup_ctx_out: Expiration.CleanupContextOut) Allocator.Error!*const u32 {
                         // In general, this pattern is best for when you have a structure with 1 or more pointer members.
                         // The pointer members can be allocated like so when creating the entry, and a shallow copy of the structure works perfectly.
                         // The pointer(s) remain valid until the entry is cleaned up, which at that point, the pointer(s) can be deallocated.
@@ -1106,15 +1104,15 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                         const this_cpy: *@This() = try this.gpa.create(@This());
                         errdefer this.gpa.destroy(this_cpy);
                         this_cpy.* = this;
-                        cleanup_ctx_out.* = .from(this_cpy);
+                        cleanup_ctx_out.setContext(this_cpy);
 
                         const val: *u32 = try this_cpy.gpa.create(u32);
                         val.* = 25;
                         return val;
                     }
 
-                    fn cleanup(context: ?*Expiration.CleanupContext, entry: EntryReader) void {
-                        const this: *const @This() = context.?.cast(@This());
+                    fn cleanup(context: ?*anyopaque, entry: EntryReader) void {
+                        const this: *const @This() = @ptrCast(@alignCast(context.?));
                         // read returns a *const T, and in this case T = *const u32, so `entry.read()` returns `*const *const u32`
                         this.gpa.destroy(entry.read(*const u32).*);
                         this.gpa.destroy(this);
@@ -1145,7 +1143,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             {
                 // no error and no args in createEntry()
                 const reader: SafeReader = try mem_cache.getOrPutSliceEntry([]const u8, testing.io, testing.allocator, "my_val", .none, {}, struct {
-                    fn createEntry(_: void, _: *Expiration.CleanupContextOut) []const u8 {
+                    fn createEntry(_: void, _: Expiration.CleanupContextOut) []const u8 {
                         return "blarf";
                     }
                 }.createEntry);
@@ -1160,20 +1158,20 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                     gpa: Allocator,
                     created_slice: []const u8 = undefined,
 
-                    fn createEntry(this: @This(), cleanup_ctx_out: *Expiration.CleanupContextOut) Allocator.Error![]const u8 {
+                    fn createEntry(this: @This(), cleanup_ctx_out: Expiration.CleanupContextOut) Allocator.Error![]const u8 {
                         const this_cpy: *@This() = try this.gpa.create(@This());
                         errdefer this.gpa.destroy(this_cpy);
 
                         this_cpy.* = this;
-                        cleanup_ctx_out.* = .from(this_cpy);
+                        cleanup_ctx_out.setContext(this_cpy);
 
                         this_cpy.created_slice = try this_cpy.gpa.dupe(u8, "whoa");
                         return this_cpy.created_slice;
                     }
 
-                    fn cleanup(context: ?*Expiration.CleanupContext, entry: EntryReader) void {
+                    fn cleanup(context: ?*anyopaque, entry: EntryReader) void {
                         _ = entry; // when a slice is entered in the cache, it's copied, so we have to track the slice on this structure
-                        const this: *const @This() = context.?.cast(@This());
+                        const this: *const @This() = @ptrCast(@alignCast(context.?));
                         this.gpa.free(this.created_slice);
                         this.gpa.destroy(this);
                     }
@@ -1226,6 +1224,86 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             // set this back so `clear()` doesn't deadlock
             mem_cache.metadata_cache.getPtr(StringHash.fromStr("my_slice")).?.ref_count.store(.zero, .release);
             try mem_cache.clear(testing.io, testing.allocator);
+        }
+
+        test "probably the most useful pattern" {
+            const DatabaseRow = struct {
+                id: u64,
+                name: []const u8,
+                timestamp: i64,
+            };
+
+            var mem_cache: MemCache = .init;
+            defer mem_cache.deinit(testing.io, testing.allocator);
+
+            const EntryManager = struct {
+                gpa: Allocator,
+                io: Io,
+                id: u64,
+
+                /// Creates the entry if it doesn't already exist.
+                /// Presumably, we're creating memory we won't have access to later, so we need to track allocations,
+                /// which is the purpose of this struct.
+                /// Assign a pointer to this struct to the cleanup context output parameter.
+                /// See `cleanup()` to see how the cleanup context will be used.
+                fn createEntry(
+                    this: @This(),
+                    cleanup_ctx_out: Expiration.CleanupContextOut,
+                ) (Allocator.Error || Io.Clock.Error)!DatabaseRow {
+                    // imagine a database query takes place here...
+                    const timestamp: Io.Timestamp = try Io.Clock.real.now(this.io);
+                    const row: DatabaseRow = .{
+                        .id = this.id,
+                        .name = try this.gpa.dupe(u8, "NameColumn"),
+                        .timestamp = timestamp.toMilliseconds(),
+                    };
+                    errdefer this.gpa.free(row.name);
+
+                    // create a pointer to this structure to assign to the cleanup context output parameter
+                    const this_cpy: *@This() = try this.gpa.create(@This());
+                    this_cpy.* = this;
+                    cleanup_ctx_out.setContext(this_cpy);
+
+                    return row;
+                }
+
+                fn cleanup(context: ?*anyopaque, entry: EntryReader) void {
+                    // cast the cleanup context into a pointer to this struct
+                    const this: *const @This() = @ptrCast(@alignCast(context.?));
+                    const row: *const DatabaseRow = entry.read(DatabaseRow);
+                    this.gpa.free(row.name);
+                    this.gpa.destroy(this);
+                }
+            };
+
+            const entry_manager: EntryManager = .{
+                .gpa = testing.allocator,
+                .io = testing.io,
+                .id = 1,
+            };
+            const expiration: Expiration = .{
+                .runCleanup = EntryManager.cleanup, // this will be run on removal/expiration
+                .timeout = .{
+                    .duration = .{
+                        .raw = .fromSeconds(15),
+                        .clock = .real,
+                    },
+                },
+            };
+            const reader: SafeReader = try mem_cache.getOrPutEntry(
+                (Allocator.Error || Io.Clock.Error)!DatabaseRow,
+                testing.io,
+                testing.allocator,
+                "DbRow(1)",
+                expiration,
+                entry_manager,
+                EntryManager.createEntry,
+            );
+            defer reader.release();
+
+            const entry: *const DatabaseRow = reader.entry.read(DatabaseRow);
+            try testing.expectEqual(1, entry.id);
+            try testing.expectEqualStrings("NameColumn", entry.name);
         }
     };
 }
