@@ -120,10 +120,10 @@ pub const Uuid = extern struct {
 
     /// The first 6 bytes represent a millisecond timestamp, which provides a sense of time-based ordering to the identifier.
     /// The 7th byte starts with a 0x7 since this is version 7 and the rest is random
-    pub fn v7(io: Io) Io.Clock.Error!Uuid {
+    pub fn v7(io: Io) Uuid {
         var uuid: Uuid = undefined;
 
-        const timestamp: Io.Timestamp = try Io.Clock.real.now(io);
+        const timestamp: Io.Timestamp = .now(io, .real);
         const ms: i48 = @truncate(timestamp.toMilliseconds());
         // These need to be represented as big endian
         const ms_bytes: *const [6]u8 = switch (@import("builtin").target.cpu.arch.endian()) {
@@ -305,7 +305,7 @@ pub const Uuid = extern struct {
     test v7 {
         var prev: ?Uuid = null;
         for (0..20) |_| {
-            const uuid: Uuid = try .v7(testing.io);
+            const uuid: Uuid = .v7(testing.io);
             defer prev = uuid;
 
             try testing.expect(uuid.bytes[6] >= 0x70 and uuid.bytes[6] < 0x80);
@@ -315,7 +315,7 @@ pub const Uuid = extern struct {
             }
 
             // need to guarantee they're spaced out by at least 1ms, or else the `lessThan()` check fails
-            try testing.io.sleep(.fromMilliseconds(1), Io.Clock.real);
+            try testing.io.sleep(.fromMilliseconds(1), .awake);
         }
     }
     test from {

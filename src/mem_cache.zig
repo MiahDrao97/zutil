@@ -372,17 +372,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         ) Io.Cancelable!void {
             debug.assert(expiration_timeout != .none);
 
-            expiration_timeout.sleep(io) catch |err| switch (err) {
-                // okay, we've received a cancellation request, which means we're probably clearing the cache or de-initializing
-                Io.SleepError.Canceled => |canceled| return canceled,
-                Io.SleepError.UnsupportedClock => @panic("Clock does not support timeout operation."),
-                Io.SleepError.Unexpected => {
-                    log.warn("Encountered unexpected error when removing expired entry `{s}`. This entry will still be cleared.", .{key});
-                    if (@errorReturnTrace()) |trace| debug.dumpStackTrace(trace);
-                    // I guess we keep going?
-                },
-            };
-
+            try expiration_timeout.sleep(io);
             // this could have been removed before the expiration is reached
             _ = try self.remove(io, gpa, key);
         }
@@ -1245,9 +1235,9 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                 fn createEntry(
                     this: @This(),
                     cleanup_ctx_out: Expiration.CleanupContextOut,
-                ) (Allocator.Error || Io.Clock.Error)!DatabaseRow {
+                ) Allocator.Error!DatabaseRow {
                     // imagine a database query takes place here...
-                    const timestamp: Io.Timestamp = try Io.Clock.real.now(this.io);
+                    const timestamp: Io.Timestamp = .now(this.io, .real);
                     const row: DatabaseRow = .{
                         .id = this.id,
                         .name = try this.gpa.dupe(u8, "NameColumn"),
@@ -1287,7 +1277,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                 },
             };
             const reader: SafeReader = try mem_cache.getOrPutEntry(
-                (Allocator.Error || Io.Clock.Error)!DatabaseRow,
+                Allocator.Error!DatabaseRow,
                 testing.io,
                 testing.allocator,
                 "DbRow(1)",
