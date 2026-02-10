@@ -4,11 +4,8 @@ const gpa: Allocator = switch (@import("builtin").mode) {
     else => std.heap.smp_allocator,
 };
 
-pub fn main() !void {
-    defer if (comptime @import("builtin").mode == .Debug)
-        std.debug.assert(debug_allocator.deinit() == .ok);
-
-    var arg_iter: ArgIter = try std.process.argsWithAllocator(gpa);
+pub fn main(init: std.process.Init) !void {
+    var arg_iter = try init.minimal.args.iterateAllocator(init.gpa);
     defer arg_iter.deinit();
 
     var required: Arg = .unassigned;
@@ -63,5 +60,4 @@ const Flag = zutil.cli.Flag;
 const FlagSet = zutil.cli.FlagSet;
 const Allocator = std.mem.Allocator;
 const DebugAllocator = std.heap.DebugAllocator;
-const ArgIter = std.process.ArgIterator;
 const print = std.debug.print;
