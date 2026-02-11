@@ -1,9 +1,3 @@
-var debug_allocator: DebugAllocator(.{}) = .init;
-const gpa: Allocator = switch (@import("builtin").mode) {
-    .Debug => debug_allocator.allocator(),
-    else => std.heap.smp_allocator,
-};
-
 pub fn main(init: std.process.Init) !void {
     var arg_iter = try init.minimal.args.iterateAllocator(init.gpa);
     defer arg_iter.deinit();

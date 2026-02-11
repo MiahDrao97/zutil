@@ -344,15 +344,15 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                     }
                 } else {
                     value_gop.value_ptr.* = v.ptr;
-                    errdefer debug.assert(self.value_cache.remove(k));
+                    errdefer debug.assert(self.value_cache.swapRemove(k));
 
                     try mine.stepOn(.insert_size_entry);
                     try self.metadata_cache.putNoClobber(gpa, k, .init(@intCast(v.len), expiration));
                 }
             }
             errdefer {
-                debug.assert(self.value_cache.remove(k));
-                debug.assert(self.metadata_cache.remove(k));
+                debug.assert(self.value_cache.swapRemove(k));
+                debug.assert(self.metadata_cache.swapRemove(k));
             }
 
             try mine.stepOn(.start_expiration);
@@ -442,12 +442,12 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                     // spin until ref count reaches 0...
                 }
 
-                const raw: []align(max_alignment.toByteUnits()) const u8 = self.value_cache.fetchRemove(k).?.value[0..m.len];
+                const raw: []align(max_alignment.toByteUnits()) const u8 = self.value_cache.fetchSwapRemove(k).?.value[0..m.len];
                 m.expiration.cleanup(.{ .raw_value = raw });
 
                 log.debug("Freeing entry {*}, len {d} with Allocator impl {*}", .{ raw.ptr, raw.len, gpa.ptr });
                 gpa.free(raw);
-                debug.assert(self.metadata_cache.remove(k));
+                debug.assert(self.metadata_cache.swapRemove(k));
                 return true;
             }
             return false;
@@ -596,15 +596,15 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         };
 
         /// Cache representing the values as raw bytes
-        const ValueCache = std.HashMapUnmanaged(
+        const ValueCache = std.ArrayHashMapUnmanaged(
             StringHash,
             [*]align(max_alignment.toByteUnits()) const u8,
             StringHash.Context,
-            80,
+            false,
         );
 
         /// Cache that contains the size of the stored bytes
-        const MetadataCache = std.HashMapUnmanaged(StringHash, Metadata, StringHash.Context, 80);
+        const MetadataCache = std.ArrayHashMapUnmanaged(StringHash, Metadata, StringHash.Context, false);
 
         /// Represents a string hash
         const StringHash = enum(u32) {
@@ -622,7 +622,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                     return @intFromEnum(k);
                 }
 
-                pub fn eql(_: Context, a: StringHash, b: StringHash) bool {
+                pub fn eql(_: Context, a: StringHash, b: StringHash, _: usize) bool {
                     return a == b;
                 }
             };
