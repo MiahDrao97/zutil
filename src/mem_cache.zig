@@ -67,13 +67,13 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             /// Entry's lifetime
             timeout: Io.Timeout,
             /// Optional cleanup context to be passed `runCleanup` (run when the entry is removed).
-            cleanup_context: ?*anyopaque = null,
+            cleanup_context: *anyopaque = &.{},
             /// Cleanup function to be run when the entry is removed.
-            runCleanup: *const fn (context: ?*anyopaque, entry: EntryReader) void = noopCleanup,
+            runCleanup: *const fn (context: *anyopaque, entry: EntryReader) void = noopCleanup,
 
             /// Assign a context to this out parameter when creating an entry
             pub const CleanupContextOut = struct {
-                ctx: *?*anyopaque,
+                ctx: **anyopaque,
 
                 /// Set the cleanup context to any pointer
                 pub fn setContext(self: CleanupContextOut, any_ptr: *anyopaque) void {
@@ -85,7 +85,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             pub const none: Expiration = .{ .timeout = .none };
 
             /// No-op cleanup function
-            pub fn noopCleanup(_: ?*anyopaque, _: EntryReader) void {}
+            pub fn noopCleanup(_: *anyopaque, _: EntryReader) void {}
 
             inline fn cleanup(self: Expiration, entry: EntryReader) void {
                 self.runCleanup(self.cleanup_context, entry);
@@ -1097,8 +1097,8 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                         return val;
                     }
 
-                    fn cleanup(context: ?*anyopaque, entry: EntryReader) void {
-                        const this: *const @This() = @ptrCast(@alignCast(context.?));
+                    fn cleanup(context: *anyopaque, entry: EntryReader) void {
+                        const this: *const @This() = @ptrCast(@alignCast(context));
                         // read returns a *const T, and in this case T = *const u32, so `entry.read()` returns `*const *const u32`
                         this.gpa.destroy(entry.read(*const u32).*);
                         this.gpa.destroy(this);
@@ -1155,9 +1155,9 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                         return this_cpy.created_slice;
                     }
 
-                    fn cleanup(context: ?*anyopaque, entry: EntryReader) void {
+                    fn cleanup(context: *anyopaque, entry: EntryReader) void {
                         _ = entry; // when a slice is entered in the cache, it's copied, so we have to track the slice on this structure
-                        const this: *const @This() = @ptrCast(@alignCast(context.?));
+                        const this: *const @This() = @ptrCast(@alignCast(context));
                         this.gpa.free(this.created_slice);
                         this.gpa.destroy(this);
                     }
@@ -1253,9 +1253,9 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                     return row;
                 }
 
-                fn cleanup(context: ?*anyopaque, entry: EntryReader) void {
+                fn cleanup(context: *anyopaque, entry: EntryReader) void {
                     // cast the cleanup context into a pointer to this struct
-                    const this: *const @This() = @ptrCast(@alignCast(context.?));
+                    const this: *const @This() = @ptrCast(@alignCast(context));
                     const row: *const DatabaseRow = entry.read(DatabaseRow);
                     this.gpa.free(row.name);
                     this.gpa.destroy(this);
