@@ -1,5 +1,19 @@
 //! Module to assist with meta-programming
 
+pub fn unionAs(comptime T: type, @"union": anytype) ?T {
+    const TUnion = @TypeOf(@"union");
+    switch (@typeInfo(TUnion)) {
+        .@"union" => {
+            const active_tag: [:0]const u8 = @tagName(@"union");
+            return if (@FieldType(TUnion, active_tag) == T)
+                @field(@"union", active_tag)
+            else
+                null;
+        },
+        else => @compileError("Expected union type, but received " ++ @typeName(TUnion)),
+    }
+}
+
 /// `TSubset` must be a subset of `struct`'s type (strictly looking at the names and types of struct members).
 /// Create an instance of `TSubset` from `struct`'s members.
 pub fn structSubset(comptime TSubset: type, @"struct": anytype) TSubset {
@@ -55,3 +69,5 @@ pub fn ReturnType(comptime T: type) type {
         else => T,
     };
 }
+
+const std = @import("std");

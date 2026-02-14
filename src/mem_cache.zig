@@ -313,7 +313,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             .replace => Error,
             .no_clobber => error{CacheClobber} || Error,
         }!void {
-            const k: StringHash = .fromStr(key);
+            const k: StringHash = .hashStr(key);
 
             // critical section
             {
@@ -384,7 +384,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         ///
         /// WARN : If the caller fails to call `release()` on the reader, it may produce a deadlock or segmentation fault later in the program.
         pub fn lockReader(self: *Self, io: Io, key: []const u8) (error{TooManyOpenReaders} || Io.Cancelable)!?SafeReader {
-            const k: StringHash = .fromStr(key);
+            const k: StringHash = .hashStr(key);
 
             var metadata: ?*Metadata = null;
             {
@@ -432,7 +432,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
 
         /// Remove a cache entry, freeing the cached value in the process.
         pub fn remove(self: *Self, io: Io, gpa: Allocator, key: []const u8) Io.Cancelable!bool {
-            const k: StringHash = .fromStr(key);
+            const k: StringHash = .hashStr(key);
 
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
@@ -454,20 +454,18 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         }
 
         /// Clear all entries from the cache, freeing the memory created for the cached values.
-        /// NOTE : This method is thread-safe, but `deinit()` is not,
-        /// so you may want to call this at the end of your application loop/execution scope.
-        pub fn clear(self: *Self, io: Io, gpa: Allocator) Io.Cancelable!void {
+        pub fn clear(self: *Self, io: Io, gpa: Allocator) void {
             self.expiration_group.cancel(io);
 
             debug.assert(self.value_cache.count() == self.metadata_cache.count());
 
-            try self.mutex.lock(io);
+            self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
 
             var iter: ValueCache.Iterator = self.value_cache.iterator();
             while (iter.next()) |entry| {
                 const metadata: *Metadata = self.metadata_cache.getPtr(entry.key_ptr.*).?;
-                while (!try metadata.safeDestroy(io)) {
+                while (!metadata.safeDestroyUncancelable()) {
                     // spin until ref count reaches 0...
                 }
                 const raw: []align(max_alignment.toByteUnits()) const u8 = entry.value_ptr.*[0..metadata.len];
@@ -504,21 +502,8 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         }
 
         /// Deinitialize the memory cache, freeing all entries.
-        /// WARN : This method is not thread-safe.
-        /// It's simply meant for freeing memory on application shutdown (hopefully by then, all readers have been released).
-        /// In order to avoid potential seg faults because of other threads waiting on the mutex or ref counts,
-        /// call `clear()` at the end of your application's run loop/execution scope.
         pub fn deinit(self: *Self, io: Io, gpa: Allocator) void {
-            self.expiration_group.cancel(io);
-
-            debug.assert(self.value_cache.count() == self.metadata_cache.count());
-            var iter: ValueCache.Iterator = self.value_cache.iterator();
-            while (iter.next()) |entry| {
-                const metadata: *const Metadata = self.metadata_cache.getPtr(entry.key_ptr.*).?;
-                const raw: []align(max_alignment.toByteUnits()) const u8 = entry.value_ptr.*[0..metadata.len];
-                metadata.expiration.cleanup(.{ .raw_value = raw });
-                gpa.free(raw);
-            }
+            self.clear(io, gpa);
             self.value_cache.deinit(gpa);
             self.metadata_cache.deinit(gpa);
             self.* = undefined;
@@ -570,6 +555,15 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                 return safe;
             }
 
+            fn safeDestroyUncancelable(self: *Metadata) bool {
+                var safe: bool = true;
+                if (self.ref_count.cmpxchgWeak(.zero, .destroying, .acq_rel, .monotonic)) |count| {
+                    log.debug("{*} is {d}. Not yet safe to destroy value.", .{ &self.ref_count, count });
+                    safe = false;
+                }
+                return safe;
+            }
+
             fn safeRead(self: *Metadata, io: Io) (error{TooManyOpenReaders} || Io.Cancelable)!enum { safe, swapping, destroying } {
                 var refs: RefCount = self.ref_count.load(.monotonic);
                 switch (refs) {
@@ -599,30 +593,30 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         const ValueCache = std.ArrayHashMapUnmanaged(
             StringHash,
             [*]align(max_alignment.toByteUnits()) const u8,
-            StringHash.Context,
+            StringHash.context,
             false,
         );
 
         /// Cache that contains the size of the stored bytes
-        const MetadataCache = std.ArrayHashMapUnmanaged(StringHash, Metadata, StringHash.Context, false);
+        const MetadataCache = std.ArrayHashMapUnmanaged(StringHash, Metadata, StringHash.context, false);
 
         /// Represents a string hash
         const StringHash = enum(u32) {
             _,
 
-            fn fromStr(k: []const u8) StringHash {
+            fn hashStr(k: []const u8) StringHash {
                 return @enumFromInt(
                     @as(u32, @truncate(std.hash.Wyhash.hash(0, k))),
                 );
             }
 
-            const Context = struct {
-                pub fn hash(_: Context, k: StringHash) u32 {
+            const context = struct {
+                pub fn hash(_: context, k: StringHash) u32 {
                     // this already repesents a hash, so just return the u32 value
                     return @intFromEnum(k);
                 }
 
-                pub fn eql(_: Context, a: StringHash, b: StringHash, _: usize) bool {
+                pub fn eql(_: context, a: StringHash, b: StringHash, _: usize) bool {
                     return a == b;
                 }
             };
@@ -898,7 +892,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             else
                 return error.NoEntry;
 
-            try mem_cache.clear(testing.io, testing.allocator);
+            mem_cache.clear(testing.io, testing.allocator);
 
             if (try mem_cache.lockReader(testing.io, "my_slice")) |_| return error.ExpectedNoEntry;
             if (try mem_cache.lockReader(testing.io, "struct_val")) |_| return error.ExpectedNoEntry;
@@ -916,7 +910,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             try mem_cache.newEntry(testing.io, testing.allocator, "struct_value", s, expiration);
 
             // clear before expiration, which should cancel the expiration tasks
-            try mem_cache.clear(testing.io, testing.allocator);
+            mem_cache.clear(testing.io, testing.allocator);
 
             if (try mem_cache.lockReader(testing.io, "my_slice")) |_| return error.ExpectedNoEntry;
             if (try mem_cache.lockReader(testing.io, "struct_val")) |_| return error.ExpectedNoEntry;
@@ -1047,13 +1041,13 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             try mem_cache.overwriteSliceEntry(u8, testing.io, testing.allocator, "my_slice", slice, .none);
 
             // deliberately interfere with the data cuz I don't wanna make 32K references just for a unit test
-            mem_cache.metadata_cache.getPtr(StringHash.fromStr("my_slice")).?.ref_count.store(.max, .release);
+            mem_cache.metadata_cache.getPtr(StringHash.hashStr("my_slice")).?.ref_count.store(.max, .release);
 
             try testing.expectError(error.TooManyOpenReaders, mem_cache.lockReader(testing.io, "my_slice"));
 
             // set this back so `clear()` doesn't deadlock
-            mem_cache.metadata_cache.getPtr(StringHash.fromStr("my_slice")).?.ref_count.store(.zero, .release);
-            try mem_cache.clear(testing.io, testing.allocator);
+            mem_cache.metadata_cache.getPtr(StringHash.hashStr("my_slice")).?.ref_count.store(.zero, .release);
+            mem_cache.clear(testing.io, testing.allocator);
         }
 
         test getOrPutEntry {
@@ -1187,29 +1181,29 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             try mem_cache.overwriteSliceEntry(u8, testing.io, testing.allocator, "my_slice", slice, .none);
 
             // deliberately interfere with the data cuz I don't wanna make 32K references just for a unit test
-            mem_cache.metadata_cache.getPtr(StringHash.fromStr("my_slice")).?.ref_count.store(.max, .release);
+            mem_cache.metadata_cache.getPtr(StringHash.hashStr("my_slice")).?.ref_count.store(.max, .release);
 
             var read_future: Io.Future(Io.Cancelable!?SafeReader) = try testing.io.concurrent(waitForReaderLock, .{ &mem_cache, testing.io, "my_slice" });
             defer _ = read_future.cancel(testing.io) catch {};
 
             // pretend that a reader was just released
-            mem_cache.metadata_cache.getPtr(StringHash.fromStr("my_slice")).?.ref_count.store(RefCount.max.minusOne(), .release);
+            mem_cache.metadata_cache.getPtr(StringHash.hashStr("my_slice")).?.ref_count.store(RefCount.max.minusOne(), .release);
             if (try read_future.await(testing.io)) |final_reader| {
                 defer final_reader.release();
                 try testing.expectEqual(
                     RefCount.max,
-                    mem_cache.metadata_cache.getPtr(StringHash.fromStr("my_slice")).?.ref_count.load(.monotonic),
+                    mem_cache.metadata_cache.getPtr(StringHash.hashStr("my_slice")).?.ref_count.load(.monotonic),
                 );
             } else return error.NoEntry;
 
             try testing.expectEqual(
                 RefCount.max.minusOne(),
-                mem_cache.metadata_cache.getPtr(StringHash.fromStr("my_slice")).?.ref_count.load(.monotonic),
+                mem_cache.metadata_cache.getPtr(StringHash.hashStr("my_slice")).?.ref_count.load(.monotonic),
             );
 
             // set this back so `clear()` doesn't deadlock
-            mem_cache.metadata_cache.getPtr(StringHash.fromStr("my_slice")).?.ref_count.store(.zero, .release);
-            try mem_cache.clear(testing.io, testing.allocator);
+            mem_cache.metadata_cache.getPtr(StringHash.hashStr("my_slice")).?.ref_count.store(.zero, .release);
+            mem_cache.clear(testing.io, testing.allocator);
         }
 
         test "probably the most useful pattern" {

@@ -90,15 +90,13 @@ Use `Arg` for arguments that will be assigned a value.
 Example usage of `Arg`:
 ```zig
 const MyEnum = enum { asdf, blarf };
-const cmd: []const u8 = "MyProgram.exe --some-val asdf";
-const cmd_line_w: []const u16 = try std.unicode.utf8ToUtf16LeAlloc(testing.allocator, cmd);
-defer testing.allocator.free(cmd_line_w);
 
-// yes, I'm on Windows :P
-var iter_windows: ArgIteratorWindows = try .init(testing.allocator, cmd_line_w);
-defer iter_windows.deinit();
+// yes I'm on Windows :P
+const args: std.process.Args = .{ .vector = std.unicode.utf8ToUtf16LeStringLiteral("MyProgram.exe --some-val asdf") };
 
-var iter: ArgIterator = .{ .inner = iter_windows };
+var iter: std.process.Args.Iterator = try args.iterateAllocator(testing.allocator);
+defer iter.deinit();
+
 // this is the argument we'll store the value in
 var some_value: Arg = .unassigned;
 var optional_value: Arg = .defaultValue("foo");
@@ -121,12 +119,10 @@ For boolean values to switch on or off, use the `Flag` type.
 
 Example usage:
 ```zig
-const cmd: []const u8 = "MyProgram.exe -a";
-const cmd_line_w: []const u16 = try std.unicode.utf8ToUtf16LeAlloc(testing.allocator, cmd);
-defer testing.allocator.free(cmd_line_w);
+const args: std.process.Args = .{ .vector = std.unicode.utf8ToUtf16LeStringLiteral("MyProgram.exe -a") };
 
-var iter_windows: ArgIteratorWindows = try .init(testing.allocator, cmd_line_w);
-defer iter_windows.deinit();
+var iter: std.process.Args.Iterator = try args.iterateAllocator(testing.allocator);
+defer iter.deinit();
 
 var iter: ArgIterator = .{ .inner = iter_windows };
 var a: Flag = .off; // can alternatively default to `.on`: `.off` is a false value; `.on` is a true value
@@ -212,7 +208,7 @@ const entry: *const StructValue = reader.entry.read(StructValue);
 // use entry...
 ```
 
-There are more methods available, but I suspect the most useful pattern would be something like the following:
+There are more methods available, but the most useful pattern would be something like the following:
 ```zig
 // assume io: Io and gpa: Allocator exist in this context
 
