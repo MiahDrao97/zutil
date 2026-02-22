@@ -191,7 +191,9 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                 else => |e| return e,
             };
 
-            return (try self.lockReader(io, key)).?;
+            return (try self.lockReader(io, key)) orelse
+                // check if the expiration time is too short and we just lost the race to the lock?
+                debug.panic("Could not create SafeReader because entry '{s}' was not found.", .{key});
         }
 
         /// Creates a new slice entry, returning `error.CacheClobber` if an entry with this `key` already exists.
@@ -279,7 +281,9 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                 else => |e| return e,
             };
 
-            return (try self.lockReader(io, key)).?;
+            return (try self.lockReader(io, key)) orelse
+                // check if the expiration time is too short and we just lost the race to the lock?
+                debug.panic("Could not create SafeReader because entry '{s}' was not found.", .{key});
         }
 
         inline fn checkAlignment(comptime T: type) void {
@@ -326,7 +330,8 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                 if (value_gop.found_existing) switch (comptime put_behavior) {
                     .no_clobber => return error.CacheClobber,
                     .replace => {
-                        const metadata: *Metadata = self.metadata_cache.getPtr(k).?;
+                        const metadata: *Metadata = self.metadata_cache.getPtr(k) orelse
+                            debug.panic("No metadata value was found corresponding to key '{s}' (hash=0x{x}), even though a value entry exists.", .{ key, k });
 
                         while (!try metadata.safeSwap(io)) {
                             // spin until we can safely swap
@@ -396,15 +401,23 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             }
 
             if (metadata) |m| switch (try m.safeRead(io)) {
-                .safe => return .{
-                    .entry = .{ .raw_value = self.value_cache.get(k).?[0..m.len] },
-                    .ref_count = &m.ref_count,
+                .safe => {
+                    const raw: [*]const u8 = self.value_cache.get(k) orelse
+                        debug.panic("No raw value was found for entry '{s}' (hash=0x{x}), even though a metadata value exists.", .{ key, k });
+                    return .{
+                        .entry = .{ .raw_value = raw[0..m.len] },
+                        .ref_count = &m.ref_count,
+                    };
                 },
                 .swapping => while (switch (try m.safeRead(io)) {
                     .swapping => true, // wait for swap operation to complete
-                    .safe => return .{
-                        .entry = .{ .raw_value = self.value_cache.get(k).?[0..m.len] },
-                        .ref_count = &m.ref_count,
+                    .safe => {
+                        const raw: [*]const u8 = self.value_cache.get(k) orelse
+                            debug.panic("No raw value was found for entry '{s}' (hash=0x{x}), even though a metadata value exists.", .{ key, k });
+                        return .{
+                            .entry = .{ .raw_value = raw[0..m.len] },
+                            .ref_count = &m.ref_count,
+                        };
                     },
                     .destroying => return null,
                 }) {},
@@ -442,11 +455,13 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                     // spin until ref count reaches 0...
                 }
 
-                const raw: []align(max_alignment.toByteUnits()) const u8 = self.value_cache.fetchSwapRemove(k).?.value[0..m.len];
+                const value_kv: ValueCache.KV = self.value_cache.fetchSwapRemove(k) orelse
+                    debug.panic("No raw value for entry '{s}' (hash=0x{x}) was found, even though a metadata value exists.", .{ key, k });
+                const raw: []align(max_alignment.toByteUnits()) const u8 = value_kv.value[0..m.len];
                 m.expiration.cleanup(.{ .raw_value = raw });
 
                 log.debug("Freeing entry {*}, len {d} with Allocator impl {*}", .{ raw.ptr, raw.len, gpa.ptr });
-                gpa.free(raw);
+                gpa.free(raw[0..m.len]);
                 debug.assert(self.metadata_cache.swapRemove(k));
                 return true;
             }
@@ -464,7 +479,8 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
 
             var iter: ValueCache.Iterator = self.value_cache.iterator();
             while (iter.next()) |entry| {
-                const metadata: *Metadata = self.metadata_cache.getPtr(entry.key_ptr.*).?;
+                const metadata: *Metadata = self.metadata_cache.getPtr(entry.key_ptr.*) orelse
+                    debug.panic("No metadata entry found for hash 0x{x}, even though a value entry exists.", .{entry.key_ptr.*});
                 while (!metadata.safeDestroyUncancelable()) {
                     // spin until ref count reaches 0...
                 }
