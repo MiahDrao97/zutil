@@ -130,7 +130,7 @@ pub const Uuid = extern struct {
             .little => little_endian: {
                 var ms_big: [6]u8 = undefined;
                 const ms_little: *const [6]u8 = @ptrCast(&ms);
-                inline for (&ms_big, 1..) |*b, i| b.* = ms_little[6 - i];
+                for (&ms_big, 1..) |*b, i| b.* = ms_little[6 - i];
                 break :little_endian &ms_big;
             },
             .big => @ptrCast(&ms),
@@ -156,8 +156,8 @@ pub const Uuid = extern struct {
             16 => raw(str[0..16]),
             32 => hex_digits_no_separators: {
                 var uuid: Uuid = undefined;
-                comptime var i: usize = 0;
-                inline for (0..16) |j| {
+                var i: usize = 0;
+                for (0..16) |j| {
                     uuid.bytes[j] = try std.fmt.parseUnsigned(u8, str[i..][0..2], 16);
                     i += 2;
                 }
@@ -166,7 +166,7 @@ pub const Uuid = extern struct {
             36 => hex_digits_with_separators: {
                 const separator_indices: [4]usize = .{ 8, 13, 18, 23 };
                 var separators: [4]u8 = undefined;
-                inline for (&separators, separator_indices) |*s, i| s.* = str[i];
+                for (&separators, separator_indices) |*s, i| s.* = str[i];
 
                 const first: u8 = separators[0];
                 if (@reduce(.And, @as(@Vector(4, u8), separators)) != first) {
@@ -178,8 +178,8 @@ pub const Uuid = extern struct {
                 }
 
                 var uuid: Uuid = undefined;
-                comptime var i: usize = 0;
-                inline for (0..16) |j| {
+                var i: usize = 0;
+                for (0..16) |j| {
                     uuid.bytes[j] = try std.fmt.parseUnsigned(u8, str[i..][0..2], 16);
                     i += 2;
                     const current: @Vector(4, usize) = @splat(i);
@@ -278,7 +278,7 @@ pub const Uuid = extern struct {
     /// Use this to sort UUIDs.
     /// Generally, sorting doesn't make much sense outside of generating UUIDs with v7, since those begin with a ms timestamp of their creation time.
     pub fn lessThan(a: Uuid, b: Uuid) bool {
-        return inline for (&a.bytes, &b.bytes) |x, y| {
+        return for (&a.bytes, &b.bytes) |x, y| {
             if (x < y) break true;
             if (x > y) break false;
         } else false;
