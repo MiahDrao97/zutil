@@ -24,6 +24,8 @@ pub fn set(comptime F: type, comptime E: anytype) type {
 
         pub const live: bool = builtin.is_test;
 
+        var suppress_minefield_logs: bool = false;
+
         // static map of mines
         var mine_map: MineMap = .{};
 
@@ -84,7 +86,9 @@ pub fn set(comptime F: type, comptime E: anytype) type {
             var iter: MineMap.Iterator = mine_map.iterator();
             while (iter.next()) |m| {
                 if (!m.value.detonated) {
-                    log.err("Un-detonated mine for fuse {t}", .{m.key});
+                    if (!suppress_minefield_logs) {
+                        std.log.scoped(.minefield).err("Un-detonated mine for fuse '{t}'", .{m.key});
+                    }
                     missed = true;
                 }
             }
@@ -132,10 +136,16 @@ test set {
     const wpath: []const u16 = try testFunc(testing.allocator, "yayz");
     defer testing.allocator.free(wpath);
 
-    try testing.expectError(error.DetonationMissed, landmine.cleanup(.retain));
-    const m: landmine.Mine = landmine.mine_map.get(.open) orelse return error.MineNotFound;
-    try testing.expectEqual(1, m.safety_threshold);
-    try testing.expectEqual(1, m.reached);
+    {
+        // suppress logs for this test
+        landmine.suppress_minefield_logs = true;
+        defer landmine.suppress_minefield_logs = false;
+
+        try testing.expectError(error.DetonationMissed, landmine.cleanup(.retain));
+        const m: landmine.Mine = landmine.mine_map.get(.open) orelse return error.MineNotFound;
+        try testing.expectEqual(1, m.safety_threshold);
+        try testing.expectEqual(1, m.reached);
+    }
 
     try testing.expectError(error.OpenError, testFunc(testing.allocator, "blarf"));
     try landmine.cleanup(.reset);
@@ -144,7 +154,6 @@ test set {
 const std = @import("std");
 const builtin = @import("builtin");
 const debug = std.debug;
-const log = std.log.scoped(.minefield);
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const ErrorType = @import("meta.zig").ErrorType;

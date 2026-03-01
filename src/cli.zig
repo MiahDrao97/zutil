@@ -373,10 +373,17 @@ comptime {
     }
 }
 
+const log = if (@import("builtin").is_test) struct {
+    fn err(comptime format: []const u8, args: anytype) void {
+        // this at least ensure that we're compiling our format correctly
+        var null_logger: std.Io.Writer.Discarding = .init(&.{});
+        null_logger.writer.print(format, args) catch {};
+    }
+} else std.log.scoped(.@"zutil.cli");
+
 const std = @import("std");
 const testing = std.testing;
 const process = std.process;
-const log = std.log.scoped(.@"zutil.cli");
 const FixedBufferAllocator = std.heap.FixedBufferAllocator;
 const Allocator = std.mem.Allocator;
 const utf16 = std.unicode.utf8ToUtf16LeStringLiteral;
