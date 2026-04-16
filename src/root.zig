@@ -56,7 +56,7 @@ pub fn Managed(comptime T: type) type {
             self.arena.deinit();
         }
 
-        test Managed {
+        test create {
             const Value = struct {
                 str: []const u8,
             };

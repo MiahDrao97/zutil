@@ -297,7 +297,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         }
 
         fn createEntryValue(gpa: Allocator, bytes: []const u8) Allocator.Error![]align(max_alignment.toByteUnits()) u8 {
-            try mine.stepOnSubset(.alloc, Allocator.Error);
+            try minefield.stepOnSubset(.alloc, Allocator.Error);
             const v: []align(max_alignment.toByteUnits()) u8 = try gpa.alignedAlloc(u8, max_alignment, bytes.len);
             @memcpy(v, bytes);
             log.debug("Created new entry {*}, len {d} with Allocator impl {*}", .{ v.ptr, v.len, gpa.ptr });
@@ -321,11 +321,11 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
 
             // critical section
             {
-                try mine.stepOn(.lock_mutex);
+                try minefield.stepOn(.lock_mutex);
                 try self.mutex.lock(io);
                 defer self.mutex.unlock(io);
 
-                try mine.stepOn(.insert_value_entry);
+                try minefield.stepOn(.insert_value_entry);
                 const value_gop: ValueCache.GetOrPutResult = try self.value_cache.getOrPut(gpa, k);
                 if (value_gop.found_existing) switch (comptime put_behavior) {
                     .no_clobber => return error.CacheClobber,
@@ -351,7 +351,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                     value_gop.value_ptr.* = v.ptr;
                     errdefer debug.assert(self.value_cache.swapRemove(k));
 
-                    try mine.stepOn(.insert_size_entry);
+                    try minefield.stepOn(.insert_size_entry);
                     try self.metadata_cache.putNoClobber(gpa, k, .init(@intCast(v.len), expiration));
                 }
             }
@@ -360,7 +360,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                 debug.assert(self.metadata_cache.swapRemove(k));
             }
 
-            try mine.stepOn(.start_expiration);
+            try minefield.stepOn(.start_expiration);
             switch (expiration.timeout) {
                 .none => {},
                 else => try self.expiration_group.concurrent(io, handleExpiration, .{ self, io, gpa, key, expiration.timeout }),
@@ -400,18 +400,11 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                 log.debug("Metadata for key {x} was {s}.", .{ k, if (metadata == null) "found" else "not found" });
             }
 
-            if (metadata) |m| switch (try m.safeRead(io)) {
-                .safe => {
-                    const raw: [*]const u8 = self.value_cache.get(k) orelse
-                        debug.panic("No raw value was found for entry '{s}' (hash=0x{x}), even though a metadata value exists.", .{ key, k });
-                    return .{
-                        .entry = .{ .raw_value = raw[0..m.len] },
-                        .ref_count = &m.ref_count,
-                    };
-                },
-                .swapping => while (switch (try m.safeRead(io)) {
-                    .swapping => true, // wait for swap operation to complete
+            if (metadata) |m| {
+                while (switch (try m.safeRead(io)) {
+                    .swapping => true,
                     .safe => {
+                        // ref count is incremented in the metadata's `safeRead()` method
                         const raw: [*]const u8 = self.value_cache.get(k) orelse
                             debug.panic("No raw value was found for entry '{s}' (hash=0x{x}), even though a metadata value exists.", .{ key, k });
                         return .{
@@ -419,10 +412,11 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                             .ref_count = &m.ref_count,
                         };
                     },
-                    .destroying => return null,
-                }) {},
-                .destroying => {}, // welp, this entry is currently being destroyed
-            };
+                    .destroying => false, // welp, this entry is being destroyed
+                }) {
+                    // snip until swap operation completes
+                }
+            }
             return null;
         }
 
@@ -526,7 +520,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         }
 
         /// Landmines to test with
-        const mine = @import("minefield.zig").set(enum {
+        const minefield = @import("minefield.zig").set(enum {
             alloc,
             lock_mutex,
             insert_value_entry,
@@ -640,8 +634,8 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
 
         /// Used to count references on an entry
         const RefCount = enum(i16) {
-            swapping = -2,
-            destroying = -1,
+            destroying = -2,
+            swapping = -1,
             zero = 0,
             one = 1,
             max = std.math.maxInt(i16),
@@ -772,48 +766,48 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             };
             const s: StructValue = .{ .a = 3.14, .b = 5 };
 
-            mine.detonateOn(.alloc, Allocator.Error.OutOfMemory);
+            minefield.detonateOn(.alloc, Allocator.Error.OutOfMemory);
             try testing.expectError(
                 Allocator.Error.OutOfMemory,
                 mem_cache.newEntry(testing.io, testing.allocator, "struct_value", s, .none),
             );
-            try mine.cleanup(.reset);
+            try minefield.cleanup(.reset);
             try testing.expectEqual(0, mem_cache.value_cache.count());
             try testing.expectEqual(0, mem_cache.metadata_cache.count());
 
-            mine.detonateOn(.lock_mutex, Io.Cancelable.Canceled);
+            minefield.detonateOn(.lock_mutex, Io.Cancelable.Canceled);
             try testing.expectError(
                 Io.Cancelable.Canceled,
                 mem_cache.newEntry(testing.io, testing.allocator, "struct_value", s, .none),
             );
-            try mine.cleanup(.reset);
+            try minefield.cleanup(.reset);
             try testing.expectEqual(0, mem_cache.value_cache.count());
             try testing.expectEqual(0, mem_cache.metadata_cache.count());
 
-            mine.detonateOn(.insert_value_entry, Allocator.Error.OutOfMemory);
+            minefield.detonateOn(.insert_value_entry, Allocator.Error.OutOfMemory);
             try testing.expectError(
                 Allocator.Error.OutOfMemory,
                 mem_cache.newEntry(testing.io, testing.allocator, "struct_value", s, .none),
             );
-            try mine.cleanup(.reset);
+            try minefield.cleanup(.reset);
             try testing.expectEqual(0, mem_cache.value_cache.count());
             try testing.expectEqual(0, mem_cache.metadata_cache.count());
 
-            mine.detonateOn(.insert_size_entry, Allocator.Error.OutOfMemory);
+            minefield.detonateOn(.insert_size_entry, Allocator.Error.OutOfMemory);
             try testing.expectError(
                 Allocator.Error.OutOfMemory,
                 mem_cache.newEntry(testing.io, testing.allocator, "struct_value", s, .none),
             );
-            try mine.cleanup(.reset);
+            try minefield.cleanup(.reset);
             try testing.expectEqual(0, mem_cache.value_cache.count());
             try testing.expectEqual(0, mem_cache.metadata_cache.count());
 
-            mine.detonateOn(.start_expiration, Io.Cancelable.Canceled);
+            minefield.detonateOn(.start_expiration, Io.Cancelable.Canceled);
             try testing.expectError(
                 Io.Cancelable.Canceled,
                 mem_cache.newEntry(testing.io, testing.allocator, "struct_value", s, .none),
             );
-            try mine.cleanup(.reset);
+            try minefield.cleanup(.reset);
             try testing.expectEqual(0, mem_cache.value_cache.count());
             try testing.expectEqual(0, mem_cache.metadata_cache.count());
         }
@@ -824,48 +818,48 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
 
             const arr: [3]u32 = .{ 1, 2, 3 };
 
-            mine.detonateOn(.alloc, Allocator.Error.OutOfMemory);
+            minefield.detonateOn(.alloc, Allocator.Error.OutOfMemory);
             try testing.expectError(
                 Allocator.Error.OutOfMemory,
                 mem_cache.newSliceEntry(u32, testing.io, testing.allocator, "my_slice", &arr, .none),
             );
-            try mine.cleanup(.reset);
+            try minefield.cleanup(.reset);
             try testing.expectEqual(0, mem_cache.value_cache.count());
             try testing.expectEqual(0, mem_cache.metadata_cache.count());
 
-            mine.detonateOn(.lock_mutex, Io.Cancelable.Canceled);
+            minefield.detonateOn(.lock_mutex, Io.Cancelable.Canceled);
             try testing.expectError(
                 Io.Cancelable.Canceled,
                 mem_cache.newEntry(testing.io, testing.allocator, "my_slice", &arr, .none),
             );
-            try mine.cleanup(.reset);
+            try minefield.cleanup(.reset);
             try testing.expectEqual(0, mem_cache.value_cache.count());
             try testing.expectEqual(0, mem_cache.metadata_cache.count());
 
-            mine.detonateOn(.insert_value_entry, Allocator.Error.OutOfMemory);
+            minefield.detonateOn(.insert_value_entry, Allocator.Error.OutOfMemory);
             try testing.expectError(
                 Allocator.Error.OutOfMemory,
                 mem_cache.newSliceEntry(u32, testing.io, testing.allocator, "my_slice", &arr, .none),
             );
-            try mine.cleanup(.reset);
+            try minefield.cleanup(.reset);
             try testing.expectEqual(0, mem_cache.value_cache.count());
             try testing.expectEqual(0, mem_cache.metadata_cache.count());
 
-            mine.detonateOn(.insert_size_entry, Allocator.Error.OutOfMemory);
+            minefield.detonateOn(.insert_size_entry, Allocator.Error.OutOfMemory);
             try testing.expectError(
                 Allocator.Error.OutOfMemory,
                 mem_cache.newSliceEntry(u32, testing.io, testing.allocator, "my_slice", &arr, .none),
             );
-            try mine.cleanup(.reset);
+            try minefield.cleanup(.reset);
             try testing.expectEqual(0, mem_cache.value_cache.count());
             try testing.expectEqual(0, mem_cache.metadata_cache.count());
 
-            mine.detonateOn(.start_expiration, Io.Cancelable.Canceled);
+            minefield.detonateOn(.start_expiration, Io.Cancelable.Canceled);
             try testing.expectError(
                 Io.Cancelable.Canceled,
                 mem_cache.newSliceEntry(u32, testing.io, testing.allocator, "my_slice", &arr, .none),
             );
-            try mine.cleanup(.reset);
+            try minefield.cleanup(.reset);
             try testing.expectEqual(0, mem_cache.value_cache.count());
             try testing.expectEqual(0, mem_cache.metadata_cache.count());
         }
