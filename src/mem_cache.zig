@@ -1,0 +1,1315 @@
+//! The purpose of a memory cache is to memoize values that would otherwise take longer to fetch again.
+//! Namely, this would be data from database queries or network calls that'd you rather not make very often or more than once.
+//! However, because this memory cache can store data of any type, the memory allocated is fragmented and varied in size.
+//! As a result, do not treat this cache as a data-oriented design technique, since the cached entries are almost guaranteed to use RAM.
+//! Rather, this is meant to save on network/IO/SYSCALLs that would be more expensive than RAM usage.
+
+/// Aligned to cache line alignment boundary to prevent CPU cache invalidation.
+/// It's expected for memory in this cache to be accessed via RAM rather than CPU caches.
+pub const MemCache = MemCacheAligned(.fromByteUnits(std.atomic.cache_line));
+
+/// All entries are aligned to this max alignment.
+pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
+    return struct {
+        /// The cache of raw values
+        value_cache: ValueCache,
+        /// The cache containing the length of each value and its reference count
+        metadata_cache: MetadataCache,
+        /// Io group that handles entry expirations
+        expiration_group: Io.Group,
+        /// Mutex that guards reads/writes to the cache
+        mutex: Io.Mutex,
+
+        const Self = @This();
+
+        /// Possible errors returned when adding a new entry
+        pub const Error = Allocator.Error || Io.Cancelable || Io.ConcurrentError;
+
+        /// Simple reader
+        pub const EntryReader = struct {
+            /// Raw cache entry as bytes
+            raw_value: []const u8,
+
+            /// Read this entry as `*const T
+            pub fn read(self: EntryReader, comptime T: type) *const T {
+                debug.assert(@sizeOf(T) == self.raw_value.len);
+                return @alignCast(mem.bytesAsValue(T, self.raw_value));
+            }
+
+            /// Read this entry as `[]const T`
+            pub fn readSlice(self: EntryReader, comptime T: type) []const T {
+                debug.assert(@rem(self.raw_value.len, @sizeOf(T)) == 0);
+                return @alignCast(mem.bytesAsSlice(T, self.raw_value));
+            }
+        };
+
+        /// Allows one to pull an entry from the cache and have it safely read until `release()` is called on this reader.
+        /// Each active reader represents one unit on the entry's reference_count (max active references for an entry is 32767).
+        pub const SafeReader = struct {
+            /// Reference count for the number of references to this particular cache entry
+            ref_count: *Atomic(RefCount),
+            /// The entry
+            entry: EntryReader,
+
+            /// After this call, the entry is no longer safe to read
+            pub fn release(self: SafeReader) void {
+                const count_as_int: *Atomic(i16) = @ptrCast(self.ref_count);
+                const prev_count: RefCount = @enumFromInt(count_as_int.fetchSub(1, .release));
+                // The previous ref count must be some value between 1 and 32767.
+                // Otherwise, something's broken...
+                debug.assert(prev_count.compare(.gt, .zero));
+                debug.assert(prev_count.compare(.lte, .max));
+            }
+        };
+
+        /// An entry's expiration
+        pub const Expiration = struct {
+            /// Entry's lifetime
+            timeout: Io.Timeout,
+            /// Optional cleanup context to be passed `runCleanup` (run when the entry is removed).
+            cleanup_context: *anyopaque = &.{},
+            /// Cleanup function to be run when the entry is removed.
+            runCleanup: *const fn (context: *anyopaque, entry: EntryReader) void = noopCleanup,
+
+            /// Assign a context to this out parameter when creating an entry
+            pub const CleanupContextOut = struct {
+                ctx: **anyopaque,
+
+                /// Set the cleanup context to any pointer
+                pub fn setContext(self: CleanupContextOut, any_ptr: *anyopaque) void {
+                    self.ctx.* = any_ptr;
+                }
+            };
+
+            /// No expiration: assumes that nothing needs to be run when the entry is removed
+            pub const none: Expiration = .{ .timeout = .none };
+
+            /// No-op cleanup function
+            pub fn noopCleanup(_: *anyopaque, _: EntryReader) void {}
+
+            inline fn cleanup(self: Expiration, entry: EntryReader) void {
+                self.runCleanup(self.cleanup_context, entry);
+            }
+        };
+
+        /// Initialize empty cache
+        pub const init: Self = .{
+            .value_cache = .empty,
+            .metadata_cache = .empty,
+            .expiration_group = .init,
+            .mutex = .init,
+        };
+
+        /// Creates a new entry, returning `error.CacheClobber` if an entry with this `key` already exists.
+        /// Ensure that `gpa` is thread-safe.
+        ///
+        /// Keys are not stored in this memory cache, so it's the responsibility of the caller to keep track of keys.
+        /// The caller must also know the type of the stored values since they're agnostically stored as `[*]const u8`.
+        /// Note that this entry is saved as a shallow copy, which means that pointer members are not dereferenced and saved into the cache.
+        ///
+        /// Use `newSliceEntry()` to cache a slice.
+        pub fn newEntry(
+            self: *Self,
+            io: Io,
+            gpa: Allocator,
+            key: []const u8,
+            entry: anytype,
+            expiration: Expiration,
+        ) (error{CacheClobber} || Error)!void {
+            comptime checkAlignment(@TypeOf(entry));
+
+            const v: []align(max_alignment.toByteUnits()) const u8 = try createEntryValue(gpa, &mem.toBytes(entry));
+            errdefer gpa.free(v);
+            try self.putEntry(io, gpa, key, v, expiration, .no_clobber);
+        }
+
+        /// Creates or overwrites an entry.
+        /// Ensure that `gpa` is thread-safe.
+        /// Runs `expiration.cleanup()` on error.
+        ///
+        /// Keys are not stored in this memory cache, so it's the responsibility of the caller to keep track of keys.
+        /// The caller must also know the type of the stored values since they're agnostically stored as `[*]const u8`.
+        /// Note that this entry is saved as a shallow copy, which means that pointer members are not dereferenced and saved into the cache.
+        ///
+        /// Use `overwriteSliceEntry()` to create/overwrite a slice.
+        pub fn overwriteEntry(
+            self: *Self,
+            io: Io,
+            gpa: Allocator,
+            key: []const u8,
+            entry: anytype,
+            expiration: Expiration,
+        ) Error!void {
+            comptime checkAlignment(@TypeOf(entry));
+
+            const v: []align(max_alignment.toByteUnits()) const u8 = try createEntryValue(gpa, &mem.toBytes(entry));
+            errdefer gpa.free(v);
+            try self.putEntry(io, gpa, key, v, expiration, .replace);
+        }
+
+        /// First checks if the entry exists.
+        /// If a `SafeReader` can be obtained from an existing entry, it is returned.
+        /// Otherwise, creates an entry using the `createEntryFn` and passed-in context and returns a `SafeReader` to the new entry.
+        /// Be sure to call `release()` on the `SafeReader`.
+        /// Assumes that the duration of `expiration` is longer than the time it takes to lock a reader.
+        ///
+        /// Keys are not stored in this memory cache, so it's the responsibility of the caller to keep track of keys.
+        /// Note that this entry is saved as a shallow copy, which means that pointer members are not dereferenced and saved into the cache.
+        ///
+        /// Use `getOrPutSliceEntry()` for slices.
+        pub fn getOrPutEntry(
+            self: *Self,
+            comptime TReturn: type,
+            io: Io,
+            gpa: Allocator,
+            key: []const u8,
+            expiration: Expiration,
+            create_entry_ctx: anytype,
+            createEntryFn: fn (@TypeOf(create_entry_ctx), Expiration.CleanupContextOut) TReturn,
+        ) (ErrorType(TReturn) || Error || error{TooManyOpenReaders})!SafeReader {
+            comptime checkAlignment(ReturnType(TReturn));
+
+            if (try self.lockReader(io, key)) |reader| {
+                return reader;
+            }
+
+            var expiration_cpy: Expiration = expiration;
+            const val: ReturnType(TReturn) = try @as(
+                ErrorType(TReturn)!ReturnType(TReturn),
+                createEntryFn(create_entry_ctx, .{ .ctx = &expiration_cpy.cleanup_context }),
+            );
+
+            const entry_reader: EntryReader = .{ .raw_value = &mem.toBytes(val) };
+            errdefer expiration_cpy.cleanup(entry_reader);
+
+            const v: []align(max_alignment.toByteUnits()) const u8 = try createEntryValue(gpa, entry_reader.raw_value);
+            errdefer gpa.free(v);
+
+            self.putEntry(io, gpa, key, v, expiration_cpy, .no_clobber) catch |err| switch (err) {
+                // shouldn't be possible, but if it's better to crash and investigate than pretend everything's fine
+                error.CacheClobber => unreachable,
+                else => |e| return e,
+            };
+
+            return (try self.lockReader(io, key)) orelse
+                // check if the expiration time is too short and we just lost the race to the lock?
+                debug.panic("Could not create SafeReader because entry '{s}' was not found.", .{key});
+        }
+
+        /// Creates a new slice entry, returning `error.CacheClobber` if an entry with this `key` already exists.
+        /// Ensure that `gpa` is thread-safe.
+        /// The contents of the entry are copied to the cache.
+        /// Runs `expiration.cleanup()` on error.
+        pub fn newSliceEntry(
+            self: *Self,
+            comptime T: type,
+            io: Io,
+            gpa: Allocator,
+            key: []const u8,
+            entry: []const T,
+            expiration: Expiration,
+        ) (error{CacheClobber} || Error)!void {
+            comptime checkAlignment([]const T);
+
+            const v: []align(max_alignment.toByteUnits()) const u8 = try createEntryValue(gpa, mem.sliceAsBytes(entry));
+            errdefer gpa.free(v);
+            try self.putEntry(io, gpa, key, v, expiration, .no_clobber);
+        }
+
+        /// Creates or overwrites a slice entry.
+        /// Ensure that `gpa` is thread-safe.
+        /// The contents of the entry are copied to the cache.
+        /// Runs `expiration.cleanup()` on error.
+        pub fn overwriteSliceEntry(
+            self: *Self,
+            comptime T: type,
+            io: Io,
+            gpa: Allocator,
+            key: []const u8,
+            entry: []const T,
+            expiration: Expiration,
+        ) Error!void {
+            comptime checkAlignment([]const T);
+
+            const v: []align(max_alignment.toByteUnits()) const u8 = try createEntryValue(gpa, mem.sliceAsBytes(entry));
+            errdefer gpa.free(v);
+            try self.putEntry(io, gpa, key, v, expiration, .replace);
+        }
+
+        /// First checks if the entry exists.
+        /// If a `SafeReader` can be obtained from an existing entry, it is returned.
+        /// Otherwise, creates an entry using the `createEntryFn` and passed-in context and returns a `SafeReader` to the new entry.
+        /// Be sure to call `release()` on the `SafeReader`.
+        /// Assumes that the reader can be locked before the expiration is up.
+        /// The contents of the entry are copied to the cache.
+        pub fn getOrPutSliceEntry(
+            self: *Self,
+            comptime TReturn: type,
+            io: Io,
+            gpa: Allocator,
+            key: []const u8,
+            expiration: Expiration,
+            create_entry_ctx: anytype,
+            createEntryFn: fn (@TypeOf(create_entry_ctx), Expiration.CleanupContextOut) TReturn,
+        ) (ErrorType(TReturn) || Error || error{TooManyOpenReaders})!SafeReader {
+            const SliceType = switch (@typeInfo(ReturnType(TReturn))) {
+                .pointer => |p| switch (p.size) {
+                    .slice => p.child,
+                    else => @compileError("Expected `createEntryFn` to have a return type coercible to `TError![]const T`"),
+                },
+                else => @compileError("Expected `createEntryFn` to have a return type coercible to `TError![]const T`"),
+            };
+            comptime checkAlignment([]const SliceType);
+
+            var expiration_cpy: Expiration = expiration;
+            const val: []const SliceType = try @as(
+                ErrorType(TReturn)![]const SliceType,
+                createEntryFn(create_entry_ctx, .{ .ctx = &expiration_cpy.cleanup_context }),
+            );
+            const entry_reader: EntryReader = .{ .raw_value = mem.sliceAsBytes(val) };
+            errdefer expiration_cpy.cleanup(entry_reader);
+
+            if (try self.lockReader(io, key)) |reader| {
+                return reader;
+            }
+            const v: []align(max_alignment.toByteUnits()) const u8 = try createEntryValue(gpa, entry_reader.raw_value);
+            errdefer gpa.free(v);
+
+            self.putEntry(io, gpa, key, v, expiration_cpy, .no_clobber) catch |err| switch (err) {
+                // shouldn't be possible, but if it's better to crash and investigate than pretend everything's fine
+                error.CacheClobber => unreachable,
+                else => |e| return e,
+            };
+
+            return (try self.lockReader(io, key)) orelse
+                // check if the expiration time is too short and we just lost the race to the lock?
+                debug.panic("Could not create SafeReader because entry '{s}' was not found.", .{key});
+        }
+
+        inline fn checkAlignment(comptime T: type) void {
+            if (comptime max_alignment.compare(.lt, .of(T))) {
+                @compileError(fmt.comptimePrint("Max alignment is {d}, but alignment of entry was {d} ({s}).", .{
+                    max_alignment.toByteUnits(),
+                    @alignOf(T),
+                    @typeName(T),
+                }));
+            }
+        }
+
+        fn createEntryValue(gpa: Allocator, bytes: []const u8) Allocator.Error![]align(max_alignment.toByteUnits()) u8 {
+            try minefield.stepOnSubset(.alloc, Allocator.Error);
+            const v: []align(max_alignment.toByteUnits()) u8 = try gpa.alignedAlloc(u8, max_alignment, bytes.len);
+            @memcpy(v, bytes);
+            log.debug("Created new entry {*}, len {d} with Allocator impl {*}", .{ v.ptr, v.len, gpa.ptr });
+
+            return v;
+        }
+
+        fn putEntry(
+            self: *Self,
+            io: Io,
+            gpa: Allocator,
+            key: []const u8,
+            v: []align(max_alignment.toByteUnits()) const u8,
+            expiration: Expiration,
+            comptime put_behavior: PutBehavior,
+        ) switch (put_behavior) {
+            .replace => Error,
+            .no_clobber => error{CacheClobber} || Error,
+        }!void {
+            const k: StringHash = .hashStr(key);
+
+            // critical section
+            {
+                try minefield.stepOn(.lock_mutex);
+                try self.mutex.lock(io);
+                defer self.mutex.unlock(io);
+
+                try minefield.stepOn(.insert_value_entry);
+                const value_gop: ValueCache.GetOrPutResult = try self.value_cache.getOrPut(gpa, k);
+                if (value_gop.found_existing) switch (comptime put_behavior) {
+                    .no_clobber => return error.CacheClobber,
+                    .replace => {
+                        const metadata: *Metadata = self.metadata_cache.getPtr(k) orelse
+                            debug.panic("No metadata value was found corresponding to key '{s}' (hash=0x{x}), even though a value entry exists.", .{ key, k });
+
+                        while (!try metadata.safeSwap(io)) {
+                            // spin until we can safely swap
+                        }
+                        const raw: []align(max_alignment.toByteUnits()) const u8 = value_gop.value_ptr.*[0..metadata.len];
+                        metadata.expiration.cleanup(.{ .raw_value = raw });
+                        // free the previous value
+                        gpa.free(raw);
+                        // replace...
+                        value_gop.value_ptr.* = v.ptr;
+                        metadata.len = @intCast(v.len);
+                        // let other threads know that this can be safely read
+                        metadata.ref_count.store(.zero, .release);
+                        metadata.expiration = expiration;
+                    }
+                } else {
+                    value_gop.value_ptr.* = v.ptr;
+                    errdefer debug.assert(self.value_cache.swapRemove(k));
+
+                    try minefield.stepOn(.insert_size_entry);
+                    try self.metadata_cache.putNoClobber(gpa, k, .init(@intCast(v.len), expiration));
+                }
+            }
+            errdefer {
+                debug.assert(self.value_cache.swapRemove(k));
+                debug.assert(self.metadata_cache.swapRemove(k));
+            }
+
+            try minefield.stepOn(.start_expiration);
+            switch (expiration.timeout) {
+                .none => {},
+                else => try self.expiration_group.concurrent(io, handleExpiration, .{ self, io, gpa, key, expiration.timeout }),
+            }
+        }
+
+        /// Waits for the expiration to complete before removing the entries and freeing related memory
+        fn handleExpiration(
+            self: *Self,
+            io: Io,
+            gpa: Allocator,
+            key: []const u8,
+            expiration_timeout: Io.Timeout,
+        ) Io.Cancelable!void {
+            debug.assert(expiration_timeout != .none);
+
+            try expiration_timeout.sleep(io);
+            // this could have been removed before the expiration is reached
+            _ = try self.remove(io, gpa, key);
+        }
+
+        /// Lock an entry, producing a `SafeReader` that repesents an active read on the entry.
+        /// Until the `SafeReader` is released, this entry is safe to read.
+        /// Returns null if no entry exists with this key.
+        /// Returns `error.TooManyOpenReaders` if the ref count would exceed 32767.
+        ///
+        /// WARN : If the caller fails to call `release()` on the reader, it may produce a deadlock or segmentation fault later in the program.
+        pub fn lockReader(self: *Self, io: Io, key: []const u8) (error{TooManyOpenReaders} || Io.Cancelable)!?SafeReader {
+            const k: StringHash = .hashStr(key);
+
+            var metadata: ?*Metadata = null;
+            {
+                try self.mutex.lock(io);
+                defer self.mutex.unlock(io);
+
+                metadata = self.metadata_cache.getPtr(k);
+                log.debug("Metadata for key {x} was {s}.", .{ k, if (metadata == null) "found" else "not found" });
+            }
+
+            if (metadata) |m| {
+                while (switch (try m.safeRead(io)) {
+                    .swapping => true,
+                    .safe => {
+                        // ref count is incremented in the metadata's `safeRead()` method
+                        const raw: [*]const u8 = self.value_cache.get(k) orelse
+                            debug.panic("No raw value was found for entry '{s}' (hash=0x{x}), even though a metadata value exists.", .{ key, k });
+                        return .{
+                            .entry = .{ .raw_value = raw[0..m.len] },
+                            .ref_count = &m.ref_count,
+                        };
+                    },
+                    .destroying => false, // welp, this entry is being destroyed
+                }) {
+                    // snip until swap operation completes
+                }
+            }
+            return null;
+        }
+
+        /// Call this function instead of `lockReader()` so you don't have to handle `error.TooManyOpenReaders`.
+        /// In the event that the max number of readers are open, will simply wait until the next reader is released.
+        /// Until the resulting `SafeReader` is released, this entry is safe to read.
+        /// Returns null if no entry exists with this key.
+        ///
+        /// WARN : If the caller fails to call `release()` on the reader, it may produce a deadlock or segmentation fault later in the program.
+        pub fn waitForReaderLock(self: *Self, io: Io, key: []const u8) Io.Cancelable!?SafeReader {
+            while (true) {
+                if (self.lockReader(io, key) catch |err| switch (err) {
+                    Io.Cancelable.Canceled => |canceled| return canceled,
+                    error.TooManyOpenReaders => continue,
+                }) |reader| {
+                    return reader;
+                } else return null;
+            }
+        }
+
+        /// Remove a cache entry, freeing the cached value in the process.
+        pub fn remove(self: *Self, io: Io, gpa: Allocator, key: []const u8) Io.Cancelable!bool {
+            const k: StringHash = .hashStr(key);
+
+            try self.mutex.lock(io);
+            defer self.mutex.unlock(io);
+
+            if (self.metadata_cache.getPtr(k)) |m| {
+                while (!try m.safeDestroy(io)) {
+                    // spin until ref count reaches 0...
+                }
+
+                const value_kv: ValueCache.KV = self.value_cache.fetchSwapRemove(k) orelse
+                    debug.panic("No raw value for entry '{s}' (hash=0x{x}) was found, even though a metadata value exists.", .{ key, k });
+                const raw: []align(max_alignment.toByteUnits()) const u8 = value_kv.value[0..m.len];
+                m.expiration.cleanup(.{ .raw_value = raw });
+
+                log.debug("Freeing entry {*}, len {d} with Allocator impl {*}", .{ raw.ptr, raw.len, gpa.ptr });
+                gpa.free(raw[0..m.len]);
+                debug.assert(self.metadata_cache.swapRemove(k));
+                return true;
+            }
+            return false;
+        }
+
+        /// Clear all entries from the cache, freeing the memory created for the cached values.
+        pub fn clear(self: *Self, io: Io, gpa: Allocator) void {
+            self.expiration_group.cancel(io);
+
+            debug.assert(self.value_cache.count() == self.metadata_cache.count());
+
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+
+            var iter: ValueCache.Iterator = self.value_cache.iterator();
+            while (iter.next()) |entry| {
+                const metadata: *Metadata = self.metadata_cache.getPtr(entry.key_ptr.*) orelse
+                    debug.panic("No metadata entry found for hash 0x{x}, even though a value entry exists.", .{entry.key_ptr.*});
+                while (!metadata.safeDestroyUncancelable()) {
+                    // spin until ref count reaches 0...
+                }
+                const raw: []align(max_alignment.toByteUnits()) const u8 = entry.value_ptr.*[0..metadata.len];
+                metadata.expiration.cleanup(.{ .raw_value = raw });
+                gpa.free(raw);
+            }
+
+            self.value_cache.clearRetainingCapacity();
+            self.metadata_cache.clearRetainingCapacity();
+        }
+
+        /// Dumps the contents of the cache.
+        /// NOT thread-safe, but this method needs to be public so that `Io.Writer` can leverage the `{f}` specifier in `print()`.
+        pub fn format(self: *const Self, writer: *Io.Writer) Io.Writer.Error!void {
+            var value_iter: ValueCache.Iterator = self.value_cache.iterator();
+            try writer.writeAll("Values:\n");
+            while (value_iter.next()) |val| {
+                try writer.print("{{ key = {x}, value = {*} }} ", .{ val.key_ptr.*, val.value_ptr.* });
+            }
+            var metadata_iter: MetadataCache.Iterator = self.metadata_cache.iterator();
+            try writer.writeAll("\nMetadata:\n");
+            while (metadata_iter.next()) |val| {
+                try writer.print("{{ key = {x}, value = {f} }} ", .{ val.key_ptr.*, val.value_ptr.* });
+            }
+            try writer.writeAll("\n\n");
+        }
+
+        /// Dumps the contents of the mem cache to a writer in a thread-safe way.
+        pub fn threadsafeDump(self: *Self, io: Io, writer: *Io.Writer) (Io.Writer.Error || Io.Cancelable)!void {
+            try self.mutex.lock(io);
+            defer self.mutex.unlock(io);
+
+            try self.format(writer);
+        }
+
+        /// Deinitialize the memory cache, freeing all entries.
+        pub fn deinit(self: *Self, io: Io, gpa: Allocator) void {
+            self.clear(io, gpa);
+            self.value_cache.deinit(gpa);
+            self.metadata_cache.deinit(gpa);
+            self.* = undefined;
+        }
+
+        /// Landmines to test with
+        const minefield = @import("minefield.zig").set(enum {
+            alloc,
+            lock_mutex,
+            insert_value_entry,
+            insert_size_entry,
+            start_expiration,
+        }, Error);
+
+        /// Metadata on a cache entry, containg the length of the entry and its reference count
+        const Metadata = struct {
+            /// Entry expiration
+            expiration: Expiration,
+            /// Length of the cache entry
+            len: u32,
+            /// Number of references reading this cache entry
+            ref_count: Atomic(RefCount),
+
+            fn init(len: u32, expiration: Expiration) Metadata {
+                return .{
+                    .expiration = expiration,
+                    .len = len,
+                    .ref_count = .init(.zero),
+                };
+            }
+
+            fn safeSwap(self: *Metadata, io: Io) Io.Cancelable!bool {
+                try io.checkCancel();
+                var safe: bool = true;
+                if (self.ref_count.cmpxchgWeak(.zero, .swapping, .acq_rel, .monotonic)) |count| {
+                    log.debug("{*} is {d}. Not yet safe to swap value.", .{ &self.ref_count, count });
+                    safe = false;
+                }
+                return safe;
+            }
+
+            fn safeDestroy(self: *Metadata, io: Io) Io.Cancelable!bool {
+                try io.checkCancel();
+                var safe: bool = true;
+                if (self.ref_count.cmpxchgWeak(.zero, .destroying, .acq_rel, .monotonic)) |count| {
+                    log.debug("{*} is {d}. Not yet safe to destroy value.", .{ &self.ref_count, count });
+                    safe = false;
+                }
+                return safe;
+            }
+
+            fn safeDestroyUncancelable(self: *Metadata) bool {
+                var safe: bool = true;
+                if (self.ref_count.cmpxchgWeak(.zero, .destroying, .acq_rel, .monotonic)) |count| {
+                    log.debug("{*} is {d}. Not yet safe to destroy value.", .{ &self.ref_count, count });
+                    safe = false;
+                }
+                return safe;
+            }
+
+            fn safeRead(self: *Metadata, io: Io) (error{TooManyOpenReaders} || Io.Cancelable)!enum { safe, swapping, destroying } {
+                var refs: RefCount = self.ref_count.load(.monotonic);
+                switch (refs) {
+                    .destroying => return .destroying,
+                    .max => return error.TooManyOpenReaders,
+                    else => |x| if (x.compare(.lt, .zero)) return .swapping, // assuming all other negative values are a swap
+                }
+
+                while (self.ref_count.cmpxchgWeak(refs, refs.plusOne(), .acquire, .monotonic)) |count| : (refs = count) {
+                    log.debug("{*} is {d}. May not be safe to read.", .{ &self.ref_count, count });
+                    switch (count) {
+                        .destroying => return .destroying,
+                        .max => return error.TooManyOpenReaders,
+                        else => |x| if (x.compare(.lt, .zero)) return .swapping,
+                    }
+                    try io.checkCancel();
+                }
+                return .safe;
+            }
+
+            pub fn format(self: *const Metadata, writer: *Io.Writer) Io.Writer.Error!void {
+                try writer.print("{{ .len = {d}, .ref_count = {d} }}", .{ self.len, self.ref_count.load(.monotonic) });
+            }
+        };
+
+        /// Cache representing the values as raw bytes
+        const ValueCache = std.ArrayHashMapUnmanaged(
+            StringHash,
+            [*]align(max_alignment.toByteUnits()) const u8,
+            StringHash.context,
+            false,
+        );
+
+        /// Cache that contains the size of the stored bytes
+        const MetadataCache = std.ArrayHashMapUnmanaged(StringHash, Metadata, StringHash.context, false);
+
+        /// Represents a string hash
+        const StringHash = enum(u32) {
+            _,
+
+            fn hashStr(k: []const u8) StringHash {
+                return @enumFromInt(
+                    @as(u32, @truncate(std.hash.Wyhash.hash(0, k))),
+                );
+            }
+
+            const context = struct {
+                pub fn hash(_: context, k: StringHash) u32 {
+                    // this already repesents a hash, so just return the u32 value
+                    return @intFromEnum(k);
+                }
+
+                pub fn eql(_: context, a: StringHash, b: StringHash, _: usize) bool {
+                    return a == b;
+                }
+            };
+        };
+
+        /// Used to count references on an entry
+        const RefCount = enum(i16) {
+            destroying = -2,
+            swapping = -1,
+            zero = 0,
+            one = 1,
+            max = std.math.maxInt(i16),
+            _,
+
+            fn compare(lh: RefCount, op: std.math.CompareOperator, rh: RefCount) bool {
+                const lh_int: i16 = @intFromEnum(lh);
+                const rh_int: i16 = @intFromEnum(rh);
+
+                return switch (op) {
+                    .lt => lh_int < rh_int,
+                    .lte => lh_int <= rh_int,
+                    .eq => lh_int == rh_int,
+                    .gte => lh_int >= rh_int,
+                    .gt => lh_int > rh_int,
+                    .neq => lh_int != rh_int,
+                };
+            }
+
+            fn plusOne(count: RefCount) RefCount {
+                return @enumFromInt(@intFromEnum(count) + 1);
+            }
+
+            fn minusOne(count: RefCount) RefCount {
+                return @enumFromInt(@intFromEnum(count) - 1);
+            }
+        };
+
+        /// Determines behavior when a key already exists
+        const PutBehavior = enum {
+            /// No clobbering allowed
+            no_clobber,
+            /// Replace a previous entry, if it exists
+            replace,
+        };
+
+        test lockReader {
+            var mem_cache: MemCache = .init;
+            defer mem_cache.deinit(testing.io, testing.allocator);
+
+            const StructValue = struct {
+                a: f32,
+                b: u16,
+            };
+
+            const s: StructValue = .{ .a = 3.14, .b = 5 };
+            try mem_cache.newEntry(testing.io, testing.allocator, "struct_val", s, .none);
+
+            if (try mem_cache.lockReader(testing.io, "struct_val")) |reader| {
+                try testing.expectEqual(.one, reader.ref_count.load(.monotonic));
+
+                const entry: *const StructValue = reader.entry.read(StructValue);
+                try testing.expectEqual(s.a, entry.a);
+                try testing.expectEqual(s.b, entry.b);
+
+                reader.release(); // normally, you'd want to call this in a defer at the top of your scope
+                try testing.expectEqual(.zero, reader.ref_count.load(.monotonic));
+            } else return error.NoEntry;
+
+            const num: u32 = 90;
+            try testing.expectError(
+                error.CacheClobber,
+                mem_cache.newEntry(testing.io, testing.allocator, "struct_val", num, .none),
+            );
+            try testing.expectError(
+                error.CacheClobber,
+                mem_cache.newSliceEntry(u8, testing.io, testing.allocator, "struct_val", "oh my", .none),
+            );
+
+            const arr: [3]u32 = .{ 1, 2, 3 };
+            try mem_cache.newSliceEntry(u32, testing.io, testing.allocator, "slice", &arr, .none);
+            if (try mem_cache.lockReader(testing.io, "slice")) |reader| {
+                try testing.expectEqual(.one, reader.ref_count.load(.monotonic));
+
+                const entry: []const u32 = reader.entry.readSlice(u32);
+                try testing.expectEqualSlices(u32, &arr, entry);
+
+                reader.release(); // normally, you'd want to call this in a defer at the top of your scope
+                try testing.expectEqual(.zero, reader.ref_count.load(.monotonic));
+            } else return error.NoEntry;
+
+            try testing.expectError(
+                error.CacheClobber,
+                mem_cache.newEntry(testing.io, testing.allocator, "slice", num, .none),
+            );
+            try testing.expectError(
+                error.CacheClobber,
+                mem_cache.newSliceEntry(u8, testing.io, testing.allocator, "slice", "oh my", .none),
+            );
+        }
+
+        test handleExpiration {
+            var mem_cache: MemCache = .init;
+            defer mem_cache.deinit(testing.io, testing.allocator);
+
+            const StructValue = struct {
+                a: f32,
+                b: u16,
+            };
+
+            const s: StructValue = .{ .a = 3.14, .b = 5 };
+            const expiration: Io.Timeout = .{
+                .duration = .{
+                    .raw = .fromMilliseconds(1),
+                    .clock = .awake,
+                },
+            };
+
+            try mem_cache.newEntry(testing.io, testing.allocator, "struct_val", s, .{ .timeout = expiration });
+
+            if (try mem_cache.lockReader(testing.io, "struct_val")) |reader| {
+                try testing.expectEqual(.one, reader.ref_count.load(.monotonic));
+                reader.release();
+                try testing.expectEqual(.zero, reader.ref_count.load(.monotonic));
+            } else return error.NoEntry;
+            try testing.io.sleep(.fromMilliseconds(20), .awake); // give this a good buffer of time to let this expire (flaky test if sleep time is too close to expiration time)
+
+            if (try mem_cache.lockReader(testing.io, "struct_val")) |_| return error.ExpectedNoEntry;
+        }
+
+        test newEntry {
+            var mem_cache: MemCache = .init;
+            defer mem_cache.deinit(testing.io, testing.allocator);
+
+            const StructValue = struct {
+                a: f32,
+                b: u16,
+            };
+            const s: StructValue = .{ .a = 3.14, .b = 5 };
+
+            minefield.detonateOn(.alloc, Allocator.Error.OutOfMemory);
+            try testing.expectError(
+                Allocator.Error.OutOfMemory,
+                mem_cache.newEntry(testing.io, testing.allocator, "struct_value", s, .none),
+            );
+            try minefield.cleanup(.reset);
+            try testing.expectEqual(0, mem_cache.value_cache.count());
+            try testing.expectEqual(0, mem_cache.metadata_cache.count());
+
+            minefield.detonateOn(.lock_mutex, Io.Cancelable.Canceled);
+            try testing.expectError(
+                Io.Cancelable.Canceled,
+                mem_cache.newEntry(testing.io, testing.allocator, "struct_value", s, .none),
+            );
+            try minefield.cleanup(.reset);
+            try testing.expectEqual(0, mem_cache.value_cache.count());
+            try testing.expectEqual(0, mem_cache.metadata_cache.count());
+
+            minefield.detonateOn(.insert_value_entry, Allocator.Error.OutOfMemory);
+            try testing.expectError(
+                Allocator.Error.OutOfMemory,
+                mem_cache.newEntry(testing.io, testing.allocator, "struct_value", s, .none),
+            );
+            try minefield.cleanup(.reset);
+            try testing.expectEqual(0, mem_cache.value_cache.count());
+            try testing.expectEqual(0, mem_cache.metadata_cache.count());
+
+            minefield.detonateOn(.insert_size_entry, Allocator.Error.OutOfMemory);
+            try testing.expectError(
+                Allocator.Error.OutOfMemory,
+                mem_cache.newEntry(testing.io, testing.allocator, "struct_value", s, .none),
+            );
+            try minefield.cleanup(.reset);
+            try testing.expectEqual(0, mem_cache.value_cache.count());
+            try testing.expectEqual(0, mem_cache.metadata_cache.count());
+
+            minefield.detonateOn(.start_expiration, Io.Cancelable.Canceled);
+            try testing.expectError(
+                Io.Cancelable.Canceled,
+                mem_cache.newEntry(testing.io, testing.allocator, "struct_value", s, .none),
+            );
+            try minefield.cleanup(.reset);
+            try testing.expectEqual(0, mem_cache.value_cache.count());
+            try testing.expectEqual(0, mem_cache.metadata_cache.count());
+        }
+
+        test newSliceEntry {
+            var mem_cache: MemCache = .init;
+            defer mem_cache.deinit(testing.io, testing.allocator);
+
+            const arr: [3]u32 = .{ 1, 2, 3 };
+
+            minefield.detonateOn(.alloc, Allocator.Error.OutOfMemory);
+            try testing.expectError(
+                Allocator.Error.OutOfMemory,
+                mem_cache.newSliceEntry(u32, testing.io, testing.allocator, "my_slice", &arr, .none),
+            );
+            try minefield.cleanup(.reset);
+            try testing.expectEqual(0, mem_cache.value_cache.count());
+            try testing.expectEqual(0, mem_cache.metadata_cache.count());
+
+            minefield.detonateOn(.lock_mutex, Io.Cancelable.Canceled);
+            try testing.expectError(
+                Io.Cancelable.Canceled,
+                mem_cache.newEntry(testing.io, testing.allocator, "my_slice", &arr, .none),
+            );
+            try minefield.cleanup(.reset);
+            try testing.expectEqual(0, mem_cache.value_cache.count());
+            try testing.expectEqual(0, mem_cache.metadata_cache.count());
+
+            minefield.detonateOn(.insert_value_entry, Allocator.Error.OutOfMemory);
+            try testing.expectError(
+                Allocator.Error.OutOfMemory,
+                mem_cache.newSliceEntry(u32, testing.io, testing.allocator, "my_slice", &arr, .none),
+            );
+            try minefield.cleanup(.reset);
+            try testing.expectEqual(0, mem_cache.value_cache.count());
+            try testing.expectEqual(0, mem_cache.metadata_cache.count());
+
+            minefield.detonateOn(.insert_size_entry, Allocator.Error.OutOfMemory);
+            try testing.expectError(
+                Allocator.Error.OutOfMemory,
+                mem_cache.newSliceEntry(u32, testing.io, testing.allocator, "my_slice", &arr, .none),
+            );
+            try minefield.cleanup(.reset);
+            try testing.expectEqual(0, mem_cache.value_cache.count());
+            try testing.expectEqual(0, mem_cache.metadata_cache.count());
+
+            minefield.detonateOn(.start_expiration, Io.Cancelable.Canceled);
+            try testing.expectError(
+                Io.Cancelable.Canceled,
+                mem_cache.newSliceEntry(u32, testing.io, testing.allocator, "my_slice", &arr, .none),
+            );
+            try minefield.cleanup(.reset);
+            try testing.expectEqual(0, mem_cache.value_cache.count());
+            try testing.expectEqual(0, mem_cache.metadata_cache.count());
+        }
+
+        test remove {
+            var mem_cache: MemCache = .init;
+            defer mem_cache.deinit(testing.io, testing.allocator);
+
+            const arr: [3]u32 = .{ 1, 2, 3 };
+            try mem_cache.newSliceEntry(u32, testing.io, testing.allocator, "my_slice", &arr, .none);
+            if (try mem_cache.lockReader(testing.io, "my_slice")) |reader|
+                reader.release()
+            else
+                return error.NoEntry;
+
+            try testing.expect(try mem_cache.remove(testing.io, testing.allocator, "my_slice"));
+            if (try mem_cache.lockReader(testing.io, "my_slice")) |_| return error.ExpectedNoEntry;
+        }
+
+        test clear {
+            var mem_cache: MemCache = .init;
+            defer mem_cache.deinit(testing.io, testing.allocator);
+
+            const StructValue = struct {
+                a: f32,
+                b: u16,
+            };
+
+            const s: StructValue = .{ .a = 3.14, .b = 5 };
+            const arr: [3]u32 = .{ 1, 2, 3 };
+            try mem_cache.newSliceEntry(u32, testing.io, testing.allocator, "my_slice", &arr, .none);
+            try mem_cache.newEntry(testing.io, testing.allocator, "struct_val", s, .none);
+
+            if (try mem_cache.lockReader(testing.io, "my_slice")) |reader|
+                reader.release()
+            else
+                return error.NoEntry;
+            if (try mem_cache.lockReader(testing.io, "struct_val")) |reader|
+                reader.release()
+            else
+                return error.NoEntry;
+
+            mem_cache.clear(testing.io, testing.allocator);
+
+            if (try mem_cache.lockReader(testing.io, "my_slice")) |_| return error.ExpectedNoEntry;
+            if (try mem_cache.lockReader(testing.io, "struct_val")) |_| return error.ExpectedNoEntry;
+
+            const expiration: Expiration = .{
+                .timeout = .{
+                    .duration = .{
+                        .raw = .fromMilliseconds(5),
+                        .clock = .awake,
+                    },
+                },
+            };
+            // re-add with expiration
+            try mem_cache.newSliceEntry(u32, testing.io, testing.allocator, "my_slice", &arr, expiration);
+            try mem_cache.newEntry(testing.io, testing.allocator, "struct_value", s, expiration);
+
+            // clear before expiration, which should cancel the expiration tasks
+            mem_cache.clear(testing.io, testing.allocator);
+
+            if (try mem_cache.lockReader(testing.io, "my_slice")) |_| return error.ExpectedNoEntry;
+            if (try mem_cache.lockReader(testing.io, "struct_val")) |_| return error.ExpectedNoEntry;
+
+            // re-add AGAIN... to make sure we can cancel again and free everything as expected
+            try mem_cache.newSliceEntry(u32, testing.io, testing.allocator, "my_slice", &arr, expiration);
+            try mem_cache.newEntry(testing.io, testing.allocator, "struct_value", s, expiration);
+        }
+
+        test overwriteEntry {
+            var mem_cache: MemCache = .init;
+            defer mem_cache.deinit(testing.io, testing.allocator);
+
+            const num: i32 = 64;
+            const num2: i32 = -72;
+
+            try mem_cache.overwriteEntry(testing.io, testing.allocator, "my_entry", num, .none);
+            try mem_cache.overwriteEntry(testing.io, testing.allocator, "my_entry", num2, .none);
+
+            if (try mem_cache.lockReader(testing.io, "my_entry")) |reader| {
+                defer reader.release();
+
+                try testing.expectEqual(num2, reader.entry.read(i32).*);
+            }
+        }
+
+        test overwriteSliceEntry {
+            var mem_cache: MemCache = .init;
+            defer mem_cache.deinit(testing.io, testing.allocator);
+
+            const slice1: []const u8 = "asdf";
+            const slice2: []const u8 = "blarf";
+
+            try mem_cache.overwriteSliceEntry(u8, testing.io, testing.allocator, "my_slice", slice1, .none);
+            try mem_cache.overwriteSliceEntry(u8, testing.io, testing.allocator, "my_slice", slice2, .none);
+
+            if (try mem_cache.lockReader(testing.io, "my_slice")) |reader| {
+                defer reader.release();
+
+                try testing.expectEqualStrings(slice2, reader.entry.readSlice(u8));
+            }
+        }
+
+        test "muliple removes" {
+            debug.assert(!builtin.single_threaded);
+
+            var mem_cache: MemCache = .init;
+            defer mem_cache.deinit(testing.io, testing.allocator);
+
+            const slice: []const u8 = "asdf";
+            try mem_cache.overwriteSliceEntry(u8, testing.io, testing.allocator, "my_slice", slice, .none);
+
+            const removeEntry = struct {
+                fn removeEntry(start: *Atomic(bool), cache: *MemCache, io: Io, gpa: Allocator, key: []const u8) Io.Cancelable!void {
+                    while (!start.load(.monotonic)) {}
+                    _ = try cache.remove(io, gpa, key);
+                }
+            }.removeEntry;
+
+            var start: Atomic(bool) = .init(false);
+            var group: Io.Group = .init;
+            group.async(testing.io, removeEntry, .{ &start, &mem_cache, testing.io, testing.allocator, "my_slice" });
+            group.async(testing.io, removeEntry, .{ &start, &mem_cache, testing.io, testing.allocator, "my_slice" });
+            group.async(testing.io, removeEntry, .{ &start, &mem_cache, testing.io, testing.allocator, "my_slice" });
+
+            start.store(true, .release);
+            try group.await(testing.io);
+
+            if (try mem_cache.lockReader(testing.io, "my_slice")) |_| return error.ExpectedNoEntry;
+        }
+
+        test "read and remove conflict" {
+            debug.assert(!builtin.single_threaded);
+
+            var mem_cache: MemCache = .init;
+            defer mem_cache.deinit(testing.io, testing.allocator);
+
+            const slice: []const u8 = "asdf";
+            try mem_cache.overwriteSliceEntry(u8, testing.io, testing.allocator, "my_slice", slice, .none);
+
+            const removeEntry = struct {
+                fn removeEntry(start: *Atomic(bool), cache: *MemCache, io: Io, gpa: Allocator, key: []const u8) Io.Cancelable!void {
+                    while (!start.load(.monotonic)) {}
+                    _ = try cache.remove(io, gpa, key);
+                }
+            }.removeEntry;
+
+            const readEntry = struct {
+                fn readEntry(start: *Atomic(bool), cache: *MemCache, io: Io, key: []const u8) Io.Cancelable!void {
+                    while (!start.load(.monotonic)) {}
+                    if (cache.lockReader(io, key) catch |err| switch (err) {
+                        Io.Cancelable.Canceled => |canceled| return canceled,
+                        error.TooManyOpenReaders => unreachable,
+                    }) |reader| {
+                        defer reader.release();
+                        testing.expectEqualStrings(slice, reader.entry.readSlice(u8)) catch unreachable;
+                    }
+                }
+            }.readEntry;
+
+            var start: Atomic(bool) = .init(false);
+            var group: Io.Group = .init;
+            group.async(testing.io, readEntry, .{ &start, &mem_cache, testing.io, "my_slice" });
+            group.async(testing.io, removeEntry, .{ &start, &mem_cache, testing.io, testing.allocator, "my_slice" });
+
+            start.store(true, .release);
+            try group.await(testing.io);
+
+            if (try mem_cache.lockReader(testing.io, "my_slice")) |_| return error.ExpectedNoEntry;
+
+            start.store(false, .release);
+            group.async(testing.io, removeEntry, .{ &start, &mem_cache, testing.io, testing.allocator, "my_slice" });
+            group.async(testing.io, readEntry, .{ &start, &mem_cache, testing.io, "my_slice" });
+
+            start.store(true, .release);
+            try group.await(testing.io);
+
+            if (try mem_cache.lockReader(testing.io, "my_slice")) |_| return error.ExpectedNoEntry;
+        }
+
+        test "too many open readers" {
+            debug.assert(!builtin.single_threaded);
+
+            var mem_cache: MemCache = .init;
+            defer mem_cache.deinit(testing.io, testing.allocator);
+
+            const slice: []const u8 = "asdf";
+            try mem_cache.overwriteSliceEntry(u8, testing.io, testing.allocator, "my_slice", slice, .none);
+
+            // deliberately interfere with the data cuz I don't wanna make 32K references just for a unit test
+            mem_cache.metadata_cache.getPtr(StringHash.hashStr("my_slice")).?.ref_count.store(.max, .release);
+
+            try testing.expectError(error.TooManyOpenReaders, mem_cache.lockReader(testing.io, "my_slice"));
+
+            // set this back so `clear()` doesn't deadlock
+            mem_cache.metadata_cache.getPtr(StringHash.hashStr("my_slice")).?.ref_count.store(.zero, .release);
+            mem_cache.clear(testing.io, testing.allocator);
+        }
+
+        test getOrPutEntry {
+            var mem_cache: MemCache = .init;
+            defer mem_cache.deinit(testing.io, testing.allocator);
+
+            {
+                // no error and no args in createEntry()
+                const reader: SafeReader = mem_cache.getOrPutEntry(i32, testing.io, testing.allocator, "my_val", .none, {}, struct {
+                    fn createEntry(_: void, _: Expiration.CleanupContextOut) i32 {
+                        return 64;
+                    }
+                }.createEntry) catch |err| switch (err) {
+                    // I have this here to exemplify how to pivot to wait for a lock if there are too many readers open
+                    error.TooManyOpenReaders => (try mem_cache.waitForReaderLock(testing.io, "my_val")).?,
+                    else => |e| return e,
+                };
+                defer reader.release();
+
+                try testing.expectEqual(64, reader.entry.read(i32).*);
+            }
+            {
+                // this test exemplifies a pattern for creating an entry and the cleanup that may be required when the entry is removed
+
+                const EntryManager = struct {
+                    gpa: Allocator,
+
+                    fn createEntry(this: @This(), cleanup_ctx_out: Expiration.CleanupContextOut) Allocator.Error!*const u32 {
+                        // In general, this pattern is best for when you have a structure with 1 or more pointer members.
+                        // The pointer members can be allocated like so when creating the entry, and a shallow copy of the structure works perfectly.
+                        // The pointer(s) remain valid until the entry is cleaned up, which at that point, the pointer(s) can be deallocated.
+
+                        // create a pointer to the entry manager and assign it to `cleanup_ctx_out`
+                        const this_cpy: *@This() = try this.gpa.create(@This());
+                        errdefer this.gpa.destroy(this_cpy);
+                        this_cpy.* = this;
+                        cleanup_ctx_out.setContext(this_cpy);
+
+                        const val: *u32 = try this_cpy.gpa.create(u32);
+                        val.* = 25;
+                        return val;
+                    }
+
+                    fn cleanup(context: *anyopaque, entry: EntryReader) void {
+                        const this: *const @This() = @ptrCast(@alignCast(context));
+                        // read returns a *const T, and in this case T = *const u32, so `entry.read()` returns `*const *const u32`
+                        this.gpa.destroy(entry.read(*const u32).*);
+                        this.gpa.destroy(this);
+                    }
+                };
+
+                const entry_manager: EntryManager = .{ .gpa = testing.allocator };
+                const reader: SafeReader = try mem_cache.getOrPutEntry(
+                    Allocator.Error!*const u32,
+                    testing.io,
+                    testing.allocator,
+                    "my_other_val",
+                    .{ .timeout = .none, .runCleanup = EntryManager.cleanup },
+                    entry_manager,
+                    EntryManager.createEntry,
+                );
+                defer reader.release();
+
+                // funky edge case here
+                try testing.expectEqual(25, reader.entry.read(*const u32).*.*);
+            }
+        }
+
+        test getOrPutSliceEntry {
+            var mem_cache: MemCache = .init;
+            defer mem_cache.deinit(testing.io, testing.allocator);
+
+            {
+                // no error and no args in createEntry()
+                const reader: SafeReader = try mem_cache.getOrPutSliceEntry([]const u8, testing.io, testing.allocator, "my_val", .none, {}, struct {
+                    fn createEntry(_: void, _: Expiration.CleanupContextOut) []const u8 {
+                        return "blarf";
+                    }
+                }.createEntry);
+                defer reader.release();
+
+                try testing.expectEqualStrings("blarf", reader.entry.readSlice(u8));
+            }
+            {
+                // this test exemplifies a pattern for creating a slice entry and the cleanup that may be required when the entry is removed
+
+                const EntryManager = struct {
+                    gpa: Allocator,
+                    created_slice: []const u8 = undefined,
+
+                    fn createEntry(this: @This(), cleanup_ctx_out: Expiration.CleanupContextOut) Allocator.Error![]const u8 {
+                        const this_cpy: *@This() = try this.gpa.create(@This());
+                        errdefer this.gpa.destroy(this_cpy);
+
+                        this_cpy.* = this;
+                        cleanup_ctx_out.setContext(this_cpy);
+
+                        this_cpy.created_slice = try this_cpy.gpa.dupe(u8, "whoa");
+                        return this_cpy.created_slice;
+                    }
+
+                    fn cleanup(context: *anyopaque, entry: EntryReader) void {
+                        _ = entry; // when a slice is entered in the cache, it's copied, so we have to track the slice on this structure
+                        const this: *const @This() = @ptrCast(@alignCast(context));
+                        this.gpa.free(this.created_slice);
+                        this.gpa.destroy(this);
+                    }
+                };
+
+                const entry_manager: EntryManager = .{ .gpa = testing.allocator };
+                const reader: SafeReader = try mem_cache.getOrPutSliceEntry(
+                    Allocator.Error![]const u8,
+                    testing.io,
+                    testing.allocator,
+                    "my_other_val",
+                    .{ .timeout = .none, .runCleanup = EntryManager.cleanup },
+                    entry_manager,
+                    EntryManager.createEntry,
+                );
+                defer reader.release();
+
+                try testing.expectEqualStrings("whoa", reader.entry.readSlice(u8));
+            }
+        }
+
+        test waitForReaderLock {
+            var mem_cache: MemCache = .init;
+            defer mem_cache.deinit(testing.io, testing.allocator);
+
+            const slice: []const u8 = "asdf";
+            try mem_cache.overwriteSliceEntry(u8, testing.io, testing.allocator, "my_slice", slice, .none);
+
+            // deliberately interfere with the data cuz I don't wanna make 32K references just for a unit test
+            mem_cache.metadata_cache.getPtr(StringHash.hashStr("my_slice")).?.ref_count.store(.max, .release);
+
+            var read_future: Io.Future(Io.Cancelable!?SafeReader) = try testing.io.concurrent(waitForReaderLock, .{ &mem_cache, testing.io, "my_slice" });
+            defer _ = read_future.cancel(testing.io) catch {};
+
+            // pretend that a reader was just released
+            mem_cache.metadata_cache.getPtr(StringHash.hashStr("my_slice")).?.ref_count.store(RefCount.max.minusOne(), .release);
+            if (try read_future.await(testing.io)) |final_reader| {
+                defer final_reader.release();
+                try testing.expectEqual(
+                    RefCount.max,
+                    mem_cache.metadata_cache.getPtr(StringHash.hashStr("my_slice")).?.ref_count.load(.monotonic),
+                );
+            } else return error.NoEntry;
+
+            try testing.expectEqual(
+                RefCount.max.minusOne(),
+                mem_cache.metadata_cache.getPtr(StringHash.hashStr("my_slice")).?.ref_count.load(.monotonic),
+            );
+
+            // set this back so `clear()` doesn't deadlock
+            mem_cache.metadata_cache.getPtr(StringHash.hashStr("my_slice")).?.ref_count.store(.zero, .release);
+            mem_cache.clear(testing.io, testing.allocator);
+        }
+
+        test "probably the most useful pattern" {
+            const DatabaseRow = struct {
+                id: u64,
+                name: []const u8,
+                timestamp: i64,
+            };
+
+            var mem_cache: MemCache = .init;
+            defer mem_cache.deinit(testing.io, testing.allocator);
+
+            const EntryManager = struct {
+                gpa: Allocator,
+                io: Io,
+                id: u64,
+
+                /// Creates the entry if it doesn't already exist.
+                /// Presumably, we're creating memory we won't have access to later, so we need to track allocations,
+                /// which is the purpose of this struct.
+                /// Assign a pointer to this struct to the cleanup context output parameter.
+                /// See `cleanup()` to see how the cleanup context will be used.
+                fn createEntry(
+                    this: @This(),
+                    cleanup_ctx_out: Expiration.CleanupContextOut,
+                ) Allocator.Error!DatabaseRow {
+                    // imagine a database query takes place here...
+                    const timestamp: Io.Timestamp = .now(this.io, .real);
+                    const row: DatabaseRow = .{
+                        .id = this.id,
+                        .name = try this.gpa.dupe(u8, "NameColumn"),
+                        .timestamp = timestamp.toMilliseconds(),
+                    };
+                    errdefer this.gpa.free(row.name);
+
+                    // create a pointer to this structure to assign to the cleanup context output parameter
+                    const this_cpy: *@This() = try this.gpa.create(@This());
+                    this_cpy.* = this;
+                    cleanup_ctx_out.setContext(this_cpy);
+
+                    return row;
+                }
+
+                fn cleanup(context: *anyopaque, entry: EntryReader) void {
+                    // cast the cleanup context into a pointer to this struct
+                    const this: *const @This() = @ptrCast(@alignCast(context));
+                    const row: *const DatabaseRow = entry.read(DatabaseRow);
+                    this.gpa.free(row.name);
+                    this.gpa.destroy(this);
+                }
+            };
+
+            const entry_manager: EntryManager = .{
+                .gpa = testing.allocator,
+                .io = testing.io,
+                .id = 1,
+            };
+            const expiration: Expiration = .{
+                .runCleanup = EntryManager.cleanup, // this will be run on removal/expiration
+                .timeout = .{
+                    .duration = .{
+                        .raw = .fromSeconds(15),
+                        .clock = .real,
+                    },
+                },
+            };
+            const reader: SafeReader = try mem_cache.getOrPutEntry(
+                Allocator.Error!DatabaseRow,
+                testing.io,
+                testing.allocator,
+                "DbRow(1)",
+                expiration,
+                entry_manager,
+                EntryManager.createEntry,
+            );
+            defer reader.release();
+
+            const entry: *const DatabaseRow = reader.entry.read(DatabaseRow);
+            try testing.expectEqual(1, entry.id);
+            try testing.expectEqualStrings("NameColumn", entry.name);
+        }
+    };
+}
+
+const std = @import("std");
+const builtin = @import("builtin");
+const meta = @import("meta.zig");
+const debug = std.debug;
+const testing = std.testing;
+const mem = std.mem;
+const fmt = std.fmt;
+const log = std.log.scoped(.MemCache);
+const Allocator = mem.Allocator;
+const Io = std.Io;
+const Alignment = mem.Alignment;
+const Atomic = std.atomic.Value;
+const ArgsTuple = std.meta.ArgsTuple;
+const ErrorType = meta.ErrorType;
+const ReturnType = meta.ReturnType;

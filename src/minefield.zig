@@ -1,7 +1,7 @@
 //! Really, just a reskinning of Mitchell Hashimoto's [TripWire](https://mitchellh.com/writing/tripwire)
 //! OG source code mimicked from here: https://github.com/ghostty-org/ghostty/blob/main/src/tripwire.zig
 //!
-//! This is was a convention created by Mitchell Hashimoto for the Ghostty project to ensure testing of `errdefer` paths.
+//! This is a convention created by Mitchell Hashimoto for the Ghostty project to ensure testing of `errdefer` paths.
 //! Essentially, right before any failable function call, you can simply place a mine before.
 //! If the mine is set to detonate when stepped on (or when stepped on a certain number of times),
 //! the specified error will be returned, thereby testing the `errdefer` logic path.
@@ -9,33 +9,32 @@
 
 /// Setup a minefield:
 /// `F` - a set of fuses (an enum that represents various error-testing scenarios)
-/// `E` - an error set, error union, or failable function (the minefield we're planting mines in).
+/// `E` - an error set, error union, or failable function (the minefield we're planting mines in). Empty error sets are not allowed. `anyerror` is allowed.
 pub fn set(comptime F: type, comptime E: anytype) type {
     return struct {
-        /// Expose `Fuse` back
+        /// Expose `F` back
         pub const Fuse = F;
         /// Expose `E` back
-        pub const Error = err: {
-            const T = if (@TypeOf(E) == type) E else @TypeOf(E);
-            break :err switch (@typeInfo(T)) {
-                .error_set => T,
-                .error_union => |e| e.error_set,
-                .@"fn" => |f| @typeInfo(f.return_type.?).error_union.error_set,
-                else => @compileError("Expected error union, error set, or function but received " ++ @typeName(T)),
-            };
-        };
+        pub const Error = ErrorType(if (@TypeOf(E) == type) E else @TypeOf(E));
+
         comptime {
             debug.assert(@typeInfo(Fuse) == .@"enum");
-            debug.assert(@typeInfo(Error) == .error_set);
+            // anyerror makes this null
+            if (@typeInfo(Error).error_set) |error_set| {
+                // empty error sets are not allowed
+                if (error_set.len == 0) {
+                    @compileError("Error set from type `" ++ @typeName(if (@TypeOf(E) == type) E else @TypeOf(E)) ++ "` must not be empty.");
+                }
+            }
         }
 
         pub const live: bool = builtin.is_test;
 
+        var suppress_minefield_logs: bool = false;
+
         // static map of mines
         var mine_map: MineMap = .{};
 
-        /// Inline when not live so that no machine code will be produced
-        const cc: std.builtin.CallingConvention = if (live) .auto else .@"inline";
         /// Map of all active fuses
         const MineMap = std.EnumMap(Fuse, Mine);
         /// The mine itself
@@ -61,11 +60,17 @@ pub fn set(comptime F: type, comptime E: anytype) type {
         /// Step on a mine with a given fuse.
         /// It will only detonate if configured to.
         /// In non-test builds (releases and even debug), this function has no effect and doesn't even emit machine code.
-        pub fn stepOn(fuse: Fuse) callconv(cc) Error!void {
+        pub inline fn stepOn(fuse: Fuse) Error!void {
+            if (!comptime live) return;
+            try stepOnSubset(fuse, Error);
+        }
+
+        /// Step on a mine with a given fuse, but it can only return a subset of `Error`
+        pub inline fn stepOnSubset(fuse: Fuse, comptime ErrorSubset: type) ErrorSubset!void {
             if (!comptime live) return;
 
             const m: *Mine = mine_map.getPtr(fuse) orelse return;
-            try m.step();
+            return @errorCast(m.step());
         }
 
         /// Activates a mine with the corresponding fuse.
@@ -87,7 +92,9 @@ pub fn set(comptime F: type, comptime E: anytype) type {
             var iter: MineMap.Iterator = mine_map.iterator();
             while (iter.next()) |m| {
                 if (!m.value.detonated) {
-                    log.err("Un-detonated mine for fuse {t}", .{m.key});
+                    if (!suppress_minefield_logs) {
+                        std.log.scoped(.minefield).err("Un-detonated mine for fuse '{t}'", .{m.key});
+                    }
                     missed = true;
                 }
             }
@@ -135,10 +142,16 @@ test set {
     const wpath: []const u16 = try testFunc(testing.allocator, "yayz");
     defer testing.allocator.free(wpath);
 
-    try testing.expectError(error.DetonationMissed, landmine.cleanup(.retain));
-    const m: landmine.Mine = landmine.mine_map.get(.open) orelse return error.MineNotFound;
-    try testing.expectEqual(1, m.safety_threshold);
-    try testing.expectEqual(1, m.reached);
+    {
+        // suppress logs for this test
+        landmine.suppress_minefield_logs = true;
+        defer landmine.suppress_minefield_logs = false;
+
+        try testing.expectError(error.DetonationMissed, landmine.cleanup(.retain));
+        const m: landmine.Mine = landmine.mine_map.get(.open) orelse return error.MineNotFound;
+        try testing.expectEqual(1, m.safety_threshold);
+        try testing.expectEqual(1, m.reached);
+    }
 
     try testing.expectError(error.OpenError, testFunc(testing.allocator, "blarf"));
     try landmine.cleanup(.reset);
@@ -147,6 +160,6 @@ test set {
 const std = @import("std");
 const builtin = @import("builtin");
 const debug = std.debug;
-const log = std.log.scoped(.minefield);
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
+const ErrorType = @import("meta.zig").ErrorType;
