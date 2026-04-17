@@ -9,7 +9,7 @@
 
 /// Setup a minefield:
 /// `F` - a set of fuses (an enum that represents various error-testing scenarios)
-/// `E` - an error set, error union, or failable function (the minefield we're planting mines in).
+/// `E` - an error set, error union, or failable function (the minefield we're planting mines in). Empty error sets are not allowed. `anyerror` is allowed.
 pub fn set(comptime F: type, comptime E: anytype) type {
     return struct {
         /// Expose `F` back
@@ -19,7 +19,13 @@ pub fn set(comptime F: type, comptime E: anytype) type {
 
         comptime {
             debug.assert(@typeInfo(Fuse) == .@"enum");
-            debug.assert(@typeInfo(Error) == .error_set);
+            // anyerror makes this null
+            if (@typeInfo(Error).error_set) |error_set| {
+                // empty error sets are not allowed
+                if (error_set.len == 0) {
+                    @compileError("Error set from type `" ++ @typeName(if (@TypeOf(E) == type) E else @TypeOf(E)) ++ "` must not be empty.");
+                }
+            }
         }
 
         pub const live: bool = builtin.is_test;
