@@ -7,6 +7,8 @@ pub const cli = @import("cli.zig");
 pub const string = struct {
     /// Casing utilities
     pub const Casing = @import("string/Casing.zig");
+    /// Date format utilities
+    pub const DateFormat = @import("string//DateFormat.zig");
 };
 /// Minefield namespace for testing error paths, exactly like M. Hashimoto's Tripwire
 pub const minefield = @import("minefield.zig");
@@ -91,6 +93,7 @@ pub fn Managed(comptime T: type) type {
 
 comptime {
     _ = string.Casing;
+    _ = string.DateFormat;
     _ = cli;
     _ = minefield;
     _ = Uuid;
