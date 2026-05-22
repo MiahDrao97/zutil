@@ -108,7 +108,7 @@ pub fn fmt(comptime format_str: []const u8, timestamp: Io.Timestamp) DateFormat 
                 's' => .second,
                 'f' => .subsecond,
                 'T', 'Z', '-', ':', ' ', '.' => null, // separator characters or 'Z' for UTC timezone indication
-                // TODO : Timezone crap
+                // TODO : Timezone crap (should be runtime)
                 else => @compileError("Unexpected character '" ++ @as([]const u8, &.{char}) ++ "' in date-time format."),
             };
             if (current_element) |current| {
@@ -234,37 +234,29 @@ pub fn format(self: DateFormat, writer: *Io.Writer) Io.Writer.Error!void {
         .subsecond => |s| switch (s) {
             0 => {}, // ignore
             inline 1...7 => |places| {
-                var buf: [places]u8 = undefined;
-                var formatter: Io.Writer = .fixed(&buf);
-                const seconds_long: i96 = @as(i96, sec_now) * std.time.ns_per_s;
-                const subseconds: i96 = self.timestamp.nanoseconds - seconds_long;
-                formatter.print("{d}", .{@abs(subseconds)}) catch {}; // expected to overflow; we're simply doing a truncate
-                try writer.print("{s}{s}", .{ buf, x.value.fill });
+                // write all nanoseconds to a buffer and strategically truncate
+                var buf: [32]u8 = undefined;
+                var full_ns_writer: Io.Writer = .fixed(&buf);
+                full_ns_writer.print("{d}", .{self.timestamp.nanoseconds}) catch unreachable;
+
+                // get the last 9 characters
+                const full_ns: []const u8 = full_ns_writer.buffered();
+                const subseconds: []const u8 = full_ns[full_ns.len - 9 ..];
+
+                try writer.print("{s}{s}", .{ subseconds[0..places], x.value.fill });
             },
         }
     };
 }
 
 test "number 1" {
-    const f: DateFormat = .iso(.now(testing.io, .real));
-    try testing.expect(f.order.count() > 0);
-    var order_cpy = f.order;
-    var iter = order_cpy.iterator();
-    while (iter.next()) |elem| {
-        var buf: [32]u8 = undefined;
-        var formatter: Io.Writer = .fixed(&buf);
-        switch (elem.value.fmt) {
-            .year => |y| try formatter.print("{d}", .{y}),
-            .month => |m| try formatter.print("{t}", .{m}),
-            .day => |d| try formatter.print("{t}", .{d}),
-            .hour => |h| try formatter.print("{t}", .{h}),
-            .minute => |m| try formatter.print("{t}", .{m}),
-            .second => |s| try formatter.print("{t}", .{s}),
-            .subsecond => |s| try formatter.print("{d}", .{s}),
-        }
-        debug.print("  {t}({s}){s}\n", .{ elem.value.fmt, formatter.buffered(), elem.value.fill });
-    }
-    debug.print("{f}\n", .{f});
+    const nanoseconds: i96 = 1779486527036758700; // Friday, May 22, 2026 at 9:48:47.036 PM (UTC)
+
+    var stream: Io.Writer.Allocating = .init(testing.allocator);
+    defer stream.deinit();
+    try stream.writer.print("{f}", .{DateFormat.iso(.fromNanoseconds(nanoseconds))});
+
+    try testing.expectEqualStrings("2026-05-22T21:48:47.036Z", stream.written());
 }
 
 const std = @import("std");
