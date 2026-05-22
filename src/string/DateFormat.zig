@@ -249,7 +249,7 @@ pub fn format(self: DateFormat, writer: *Io.Writer) Io.Writer.Error!void {
     };
 }
 
-test "number 1" {
+test iso {
     const nanoseconds: i96 = 1779486527036758700; // Friday, May 22, 2026 at 9:48:47.036 PM (UTC)
 
     var stream: Io.Writer.Allocating = .init(testing.allocator);
