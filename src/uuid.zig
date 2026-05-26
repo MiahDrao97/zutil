@@ -315,7 +315,7 @@ pub const Uuid = extern struct {
             }
 
             // need to guarantee they're spaced out by at least 1ms, or else the `lessThan()` check fails
-            try testing.io.sleep(.fromMilliseconds(1), .awake);
+            try testing.io.sleep(.fromMilliseconds(2), .awake);
         }
     }
     test from {

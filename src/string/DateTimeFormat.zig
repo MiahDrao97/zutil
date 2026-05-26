@@ -1,18 +1,36 @@
-//! Use this for writing various date formats
-pub const DateFormat = @This();
+//! Use this for writing various date/time formats
+pub const DateTimeFormat = @This();
 
 /// Timestamp itself
 timestamp: Io.Timestamp,
 /// Ordering of the fields and separator characters
 order: EnumMap(DateTimeElement, FullFormat),
+/// Time zone
+timezone: TimeZone,
 
-const DateTimeElement = enum {
+/// Time zone info
+pub const TimeZone = union(enum) {
+    /// UTC time
+    utc,
+    /// Offset from UTC (positive/negative)
+    utc_offset: i6,
+};
+
+/// Element of a date-time
+pub const DateTimeElement = enum {
+    /// Year
     year,
+    /// Month
     month,
+    /// Day of the month
     day,
+    /// Hours
     hour,
+    /// Minutes
     minute,
+    /// Seconds
     second,
+    /// Subseconds, represented in up to 7 places
     subsecond,
 
     fn toFormat(self: DateTimeElement, elem_len: comptime_int) DateTimeElementFormat {
@@ -86,11 +104,11 @@ const FullFormat = struct {
 };
 
 /// Format like `yyyy-MM-ddThh:mm:ss.fffZ`
-pub fn iso(timestamp: Io.Timestamp) DateFormat {
-    return .fmt("yyyy-MM-ddThh:mm:ss.fffZ", timestamp);
+pub fn iso(timestamp: Io.Timestamp) DateTimeFormat {
+    return .fmt("yyyy-MM-ddThh:mm:ss.fffZ", timestamp, .utc);
 }
 
-pub fn fmt(comptime format_str: []const u8, timestamp: Io.Timestamp) DateFormat {
+pub fn fmt(comptime format_str: []const u8, timestamp: Io.Timestamp, timezone: TimeZone) DateTimeFormat {
     comptime var order: EnumMap(DateTimeElement, FullFormat) = .init(.{});
     comptime {
         var current_element: ?DateTimeElement = null;
@@ -108,7 +126,9 @@ pub fn fmt(comptime format_str: []const u8, timestamp: Io.Timestamp) DateFormat 
                 's' => .second,
                 'f' => .subsecond,
                 'T', 'Z', '-', ':', ' ', '.' => null, // separator characters or 'Z' for UTC timezone indication
-                // TODO : Timezone crap (should be runtime)
+                // TODO :
+                // - Timezone crap (should be runtime, maybe as an option when initializing this struct)
+                // - Name of the day (abbreviated or full name)
                 else => @compileError("Unexpected character '" ++ @as([]const u8, &.{char}) ++ "' in date-time format."),
             };
             if (current_element) |current| {
@@ -156,10 +176,14 @@ pub fn fmt(comptime format_str: []const u8, timestamp: Io.Timestamp) DateFormat 
             }
         }
     }
-    return .{ .timestamp = timestamp, .order = order };
+    return .{
+        .timestamp = timestamp,
+        .order = order,
+        .timezone = timezone,
+    };
 }
 
-pub fn format(self: DateFormat, writer: *Io.Writer) Io.Writer.Error!void {
+pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
     const ms_now: i64 = self.timestamp.toMilliseconds();
     const sec_now: i64 = @divFloor(ms_now, 1000);
     const minutes_now: i64 = @divFloor(sec_now, 60);
@@ -231,32 +255,38 @@ pub fn format(self: DateFormat, writer: *Io.Writer) Io.Writer.Error!void {
             .natural => try writer.print("{d}{s}", .{ @abs(sec), x.value.fill }),
             .zero_filled => try writer.print("{d:0>2}{s}", .{ @abs(sec), x.value.fill }),
         },
-        .subsecond => |s| switch (s) {
-            0 => {}, // ignore
-            inline 1...7 => |places| {
-                // write all nanoseconds to a buffer and strategically truncate
-                var buf: [32]u8 = undefined;
-                var full_ns_writer: Io.Writer = .fixed(&buf);
-                full_ns_writer.print("{d}", .{self.timestamp.nanoseconds}) catch unreachable;
+        .subsecond => |places| if (places > 0) {
+            // write all nanoseconds to a buffer and strategically truncate
+            var buf: [32]u8 = undefined;
+            var full_ns_writer: Io.Writer = .fixed(&buf);
+            full_ns_writer.print("{d}", .{self.timestamp.nanoseconds}) catch unreachable;
 
-                // get the last 9 characters
-                const full_ns: []const u8 = full_ns_writer.buffered();
-                const subseconds: []const u8 = full_ns[full_ns.len - 9 ..];
+            // get the last 9 characters
+            const full_ns: []const u8 = full_ns_writer.buffered();
+            const subseconds: []const u8 = full_ns[full_ns.len - 9 ..];
 
-                try writer.print("{s}{s}", .{ subseconds[0..places], x.value.fill });
-            },
+            try writer.print("{s}{s}", .{ subseconds[0..places], x.value.fill });
         }
     };
 }
+
+// TODO : parse
 
 test iso {
     const nanoseconds: i96 = 1779486527036758700; // Friday, May 22, 2026 at 9:48:47.036 PM (UTC)
 
     var stream: Io.Writer.Allocating = .init(testing.allocator);
     defer stream.deinit();
-    try stream.writer.print("{f}", .{DateFormat.iso(.fromNanoseconds(nanoseconds))});
+    try stream.writer.print("{f}", .{DateTimeFormat.iso(.fromNanoseconds(nanoseconds))});
 
+    // this is a good test case because the milliseconds start with a leading zero
     try testing.expectEqualStrings("2026-05-22T21:48:47.036Z", stream.written());
+}
+test "max i96 buf" {
+    var buf: [32]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buf);
+    try writer.print("{d}", .{std.math.maxInt(i96)});
+    try testing.expectEqual(29, writer.buffered().len);
 }
 
 const std = @import("std");
