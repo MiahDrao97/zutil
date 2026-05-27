@@ -13,7 +13,15 @@ pub const TimeZone = union(enum) {
     /// UTC time
     utc,
     /// Offset from UTC (positive/negative)
-    utc_offset: i6,
+    utc_offset: UtcOffset,
+};
+
+/// Offset from UTC time
+pub const UtcOffset = packed struct(u8) {
+    /// Positive or negative offset in hours
+    hours: i6,
+    /// Possible quarter hours (0, 1, 2, or 3 for xx:00, xx:15, xx:30, and xx:45 respectively)
+    quarter_hours: u2,
 };
 
 /// Element of a date-time
@@ -271,6 +279,18 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
 }
 
 // TODO : parse
+pub fn parse(str: []const u8, expected_elements: []const DateTimeElement) error{InvalidDateTimeFormat}!DateTimeFormat {
+    debug.assert(expected_elements.len > 0);
+
+    var element_idx: usize = 0;
+    _ = &element_idx;
+    for (str, 0..) |char, i| {
+        _ = char;
+        _ = i;
+    }
+
+    debug.panic("Not implemented", .{});
+}
 
 test iso {
     const nanoseconds: i96 = 1779486527036758700; // Friday, May 22, 2026 at 9:48:47.036 PM (UTC)
