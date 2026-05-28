@@ -6,15 +6,7 @@ timestamp: Io.Timestamp,
 /// Ordering of the fields and separator characters
 order: EnumMap(DateTimeElement, FullFormat),
 /// Time zone
-timezone: TimeZone,
-
-/// Time zone info
-pub const TimeZone = union(enum) {
-    /// UTC time
-    utc,
-    /// Offset from UTC (positive/negative)
-    utc_offset: UtcOffset,
-};
+utc_offset: UtcOffset,
 
 /// Offset from UTC time
 pub const UtcOffset = packed struct(u8) {
@@ -22,6 +14,21 @@ pub const UtcOffset = packed struct(u8) {
     hours: i6,
     /// Possible quarter hours (0, 1, 2, or 3 for xx:00, xx:15, xx:30, and xx:45 respectively)
     quarter_hours: u2,
+
+    /// Zero-offset (aka UTC time)
+    pub const utc: UtcOffset = .{ .hours = 0, .quarter_hours = 0 };
+
+    pub fn format(self: UtcOffset, writer: *Io.Writer) Io.Writer.Error!void {
+        // TODO : This was the easy way, but I think we should allow more formats such as:
+        // +00:00
+        // +0
+        // 0200
+        if (self == utc) {
+            try writer.writeByte('Z');
+            return;
+        }
+        try writer.print("{d:0>2}:{d:0>2}", .{ self.hours, self.quarter_hours });
+    }
 };
 
 /// Element of a date-time
@@ -40,6 +47,8 @@ pub const DateTimeElement = enum {
     second,
     /// Subseconds, represented in up to 7 places
     subsecond,
+    /// Timezone info
+    timezone,
 
     fn toFormat(self: DateTimeElement, elem_len: comptime_int) DateTimeElementFormat {
         return switch (self) {
@@ -85,6 +94,7 @@ pub const DateTimeElement = enum {
                 },
             },
             .subsecond => .{ .subsecond = elem_len },
+            .timezone => .timezone,
         };
     }
 };
@@ -104,6 +114,8 @@ const DateTimeElementFormat = union(DateTimeElement) {
     second: enum { natural, zero_filled },
     /// Number of places to show
     subsecond: u3,
+    /// Timezone format, whether or not to include
+    timezone,
 };
 
 const FullFormat = struct {
@@ -116,7 +128,9 @@ pub fn iso(timestamp: Io.Timestamp) DateTimeFormat {
     return .fmt("yyyy-MM-ddThh:mm:ss.fffZ", timestamp, .utc);
 }
 
-pub fn fmt(comptime format_str: []const u8, timestamp: Io.Timestamp, timezone: TimeZone) DateTimeFormat {
+/// Assumes that the timestamp is already UTC.
+/// Then we'll apply the offset to the existing `timestamp`.
+pub fn fmt(comptime format_str: []const u8, timestamp: Io.Timestamp, utc_offset: UtcOffset) DateTimeFormat {
     comptime var order: EnumMap(DateTimeElement, FullFormat) = .init(.{});
     comptime {
         var current_element: ?DateTimeElement = null;
@@ -133,10 +147,8 @@ pub fn fmt(comptime format_str: []const u8, timestamp: Io.Timestamp, timezone: T
                 'm' => .minute,
                 's' => .second,
                 'f' => .subsecond,
-                'T', 'Z', '-', ':', ' ', '.' => null, // separator characters or 'Z' for UTC timezone indication
-                // TODO :
-                // - Timezone crap (should be runtime, maybe as an option when initializing this struct)
-                // - Name of the day (abbreviated or full name)
+                'Z', 'z' => .timezone,
+                'T', '/', '-', ':', ' ', '.' => null, // separator characters
                 else => @compileError("Unexpected character '" ++ @as([]const u8, &.{char}) ++ "' in date-time format."),
             };
             if (current_element) |current| {
@@ -158,6 +170,13 @@ pub fn fmt(comptime format_str: []const u8, timestamp: Io.Timestamp, timezone: T
                     } else if (fill_start) |_| current_fmt.fill.len += 1;
                 } else if (next) |n| {
                     fill_start = null;
+                    if (current_fmt.fmt != current) {
+                        // this is a quick turnaround where we don't have a separator between elements, so fill is empty
+                        current_fmt = .{
+                            .fmt = current.toFormat(elem_len),
+                            .fill = "",
+                        };
+                    }
                     if (order.fetchPut(current, current_fmt)) |_| {
                         @compileError(comptimePrint("Found redundant formatting for {t}: '{s}'", .{ current, format_str }));
                     }
@@ -171,7 +190,7 @@ pub fn fmt(comptime format_str: []const u8, timestamp: Io.Timestamp, timezone: T
             }
 
             // we're at the end with no separator
-            if (next == null and i + 1 == format_str.len) {
+            if (next != null and i + 1 == format_str.len) {
                 if (current_element) |current| {
                     current_fmt = .{
                         .fmt = current.toFormat(elem_len),
@@ -187,7 +206,7 @@ pub fn fmt(comptime format_str: []const u8, timestamp: Io.Timestamp, timezone: T
     return .{
         .timestamp = timestamp,
         .order = order,
-        .timezone = timezone,
+        .utc_offset = utc_offset,
     };
 }
 
@@ -274,7 +293,8 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
             const subseconds: []const u8 = full_ns[full_ns.len - 9 ..];
 
             try writer.print("{s}{s}", .{ subseconds[0..places], x.value.fill });
-        }
+        },
+        .timezone => try writer.print("{f}", .{self.utc_offset}),
     };
 }
 
