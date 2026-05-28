@@ -27,7 +27,7 @@ pub const UtcOffset = packed struct(u8) {
             try writer.writeByte('Z');
             return;
         }
-        try writer.print("{d:0>2}:{d:0>2}", .{ self.hours, self.quarter_hours });
+        try writer.print("{d:0>2}:{d:0>2}", .{ self.hours, @as(u16, self.quarter_hours) * 15 });
     }
 };
 
@@ -241,7 +241,7 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
             .natural => try writer.print("{d}{s}", .{ month_day.month, x.value.fill }),
             .zero_filled => try writer.print("{d:0>2}{s}", .{ month_day.month, x.value.fill }),
             .abbreviation => {
-                var buf: [3]u8 = undefined;
+                var buf: [4]u8 = undefined;
                 var formatter: Io.Writer = .fixed(&buf);
                 formatter.print("{t}", .{month_day.month}) catch unreachable;
                 buf[0] = std.ascii.toUpper(buf[0]);
@@ -299,17 +299,38 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
 }
 
 // TODO : parse
-pub fn parse(str: []const u8, expected_elements: []const DateTimeElement) error{InvalidDateTimeFormat}!DateTimeFormat {
+pub fn parse(str: []const u8, expected_elements: []const DateTimeElement) error{InvalidDateTimeFormat}!Io.Timestamp {
     debug.assert(expected_elements.len > 0);
 
+    var nanoseconds: i96 = 0;
     var element_idx: usize = 0;
-    _ = &element_idx;
-    for (str, 0..) |char, i| {
-        _ = char;
-        _ = i;
-    }
+    var current_element: DateTimeElement = expected_elements[element_idx];
+    var element_len: usize = 0;
+    var element_start: usize = 0;
+    for (str, 0..) |char, i| switch (char) {
+        '0'...'9' => {
+            element_len += 1;
+        },
+        else => {
+            const slice: []const u8 = str[element_start..element_len];
+            switch (current_element) {
+                .year => {
+                    const year: u16 = std.fmt.parseUnsigned(u16, slice, 10) catch return error.InvalidDateTimeFormat;
+                    nanoseconds += (year * std.time.epoch.secs_per_day * std.time.s_per_day);
+                },
+                else => {},
+            }
 
-    debug.panic("Not implemented", .{});
+            element_start = i;
+            element_len = 0;
+            element_idx += 1;
+            if (element_idx < expected_elements.len) {
+                current_element = expected_elements[element_idx];
+            } else break;
+        },
+    };
+
+    return .fromNanoseconds(nanoseconds);
 }
 
 test iso {
