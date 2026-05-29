@@ -69,8 +69,8 @@ pub const DateTimeElement = enum {
     second,
     /// Subseconds, represented in up to 7 places
     subsecond,
-    /// Timezone info
-    timezone,
+    /// UTC offset
+    utc_offset,
 
     fn toFormat(self: DateTimeElement, elem_len: comptime_int) DateTimeElementFormat {
         return switch (self) {
@@ -123,7 +123,7 @@ pub const DateTimeElement = enum {
                 },
             },
             .subsecond => .{ .subsecond = elem_len },
-            .timezone => .timezone,
+            .utc_offset => .utc_offset,
         };
     }
 };
@@ -145,8 +145,8 @@ const DateTimeElementFormat = union(DateTimeElement) {
     second: enum { natural, zero_filled },
     /// Number of places to show
     subsecond: u3,
-    /// Timezone format, whether or not to include
-    timezone,
+    /// UTC offset format, whether or not to include
+    utc_offset,
 };
 
 const FullFormat = struct {
@@ -194,7 +194,7 @@ pub fn fmt(comptime format_str: []const u8, timestamp: Io.Timestamp, utc_offset:
                 'm' => .minute,
                 's' => .second,
                 'f' => .subsecond,
-                'Z', 'z' => .timezone,
+                'Z', 'z' => .utc_offset,
                 else => if (mem.findScalar(u8, separator_characters, char)) |_|
                     null
                 else
@@ -290,7 +290,7 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
             .natural => try writer.print("{d}{s}", .{ month_day.month, x.value.fill }),
             .zero_filled => try writer.print("{d:0>2}{s}", .{ month_day.month, x.value.fill }),
             .abbreviation => {
-                var buf: [4]u8 = undefined;
+                var buf: [3]u8 = undefined;
                 var formatter: Io.Writer = .fixed(&buf);
                 formatter.print("{t}", .{month_day.month}) catch unreachable;
                 buf[0] = std.ascii.toUpper(buf[0]);
@@ -348,7 +348,7 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
 
             try writer.print("{s}{s}", .{ subseconds[0..places], x.value.fill });
         },
-        .timezone => try writer.print("{f}", .{self.utc_offset}),
+        .utc_offset => try writer.print("{f}", .{self.utc_offset}),
     };
 }
 
@@ -398,7 +398,7 @@ pub fn parseExact(str: []const u8, expected_elements: []const DateTimeElement) (
     return try parseInner(&map);
 }
 
-fn parseInner(map: *const EnumMap(DateTimeElement, []const u8)) ParseError!Io.Timestamp {
+fn parseInner(map: *EnumMap(DateTimeElement, []const u8)) ParseError!Io.Timestamp {
     var nanoseconds: i96 = 0;
     var iter: EnumMap(DateTimeElement, []const u8).Iterator = map.iterator();
     while (iter.next()) |kvp| switch (kvp.key) {
@@ -441,7 +441,7 @@ fn parseInner(map: *const EnumMap(DateTimeElement, []const u8)) ParseError!Io.Ti
             // okay, we have to determine the length of the slice to how many places we're talking about
             _ = subseconds;
         },
-        .timezone => {
+        .utc_offset => {
             // TODO :
         }
     };
