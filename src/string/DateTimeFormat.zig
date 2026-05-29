@@ -31,6 +31,26 @@ pub const UtcOffset = packed struct(u8) {
     }
 };
 
+/// Various possible parse errors that could be returned from `parse(...)`
+pub const ParseError = error{
+    UnrecognizedSegment,
+    InvalidYear,
+    InvalidMonth,
+    InvalidDay,
+    InvalidHour,
+    InvalidMinute,
+    InvalidSecond,
+    InvalidSubsecond,
+    InvalidUtcOffset,
+    MissingYear,
+    MissingMonth,
+    MissingDay,
+    MissingHour,
+    MissingSecond,
+    MissingSubsecond,
+    MissingUtcOffset,
+};
+
 /// Element of a date-time
 pub const DateTimeElement = enum {
     /// Year
@@ -39,6 +59,8 @@ pub const DateTimeElement = enum {
     month,
     /// Day of the month
     day,
+    /// Day of the week (its name)
+    weekday,
     /// Hours
     hour,
     /// Minutes
@@ -70,6 +92,13 @@ pub const DateTimeElement = enum {
                     0, 1 => .natural,
                     2 => .zero_filled,
                     else => @compileError(comptimePrint("Invalid day format '{s}'", .{&@as([elem_len]u8, @splat('d'))})),
+                },
+            },
+            .weekday => .{
+                .weekday = switch (elem_len) {
+                    0, 1 => .abbrevation,
+                    2 => .full_name,
+                    else => @compileError(comptimePrint("Invalid weekday format '{s}'", .{&@as([elem_len]u8, @splat('D'))})),
                 },
             },
             .hour => .{
@@ -106,6 +135,8 @@ const DateTimeElementFormat = union(DateTimeElement) {
     month: enum { natural, zero_filled, abbreviation, full_name },
     /// Day display strategy
     day: enum { natural, zero_filled },
+    /// Day of the week display strategy
+    weekday: enum { abbrevation, full_name },
     /// Hour display strategy
     hour: enum { natural, zero_filled },
     /// Minute display strategy
@@ -122,6 +153,21 @@ const FullFormat = struct {
     fmt: DateTimeElementFormat,
     fill: []const u8,
 };
+
+/// Expected/allowed separator characters between the various elements.
+/// 'Z' is not exactly a "separator", but it can usually be found to indicate that the date-time is UTC.
+const separator_characters: []const u8 = &.{ ' ', '/', '-', '+', '_', '.', ',', ':', 'T', 'Z' };
+
+const log = if (@import("builtin").is_test) struct {
+    fn err(comptime fmt_str: []const u8, args: anytype) void {
+        if (testing.log_level == .Debug) {
+            debug.print(fmt_str ++ &.{'\n'}, args);
+        } else {
+            var null_writer: Io.Writer.Discarding = .init(&.{});
+            null_writer.writer.print(fmt_str, args);
+        }
+    }
+} else std.log.scoped(.DateTimeFormat);
 
 /// Format like `yyyy-MM-ddThh:mm:ss.fffZ`
 pub fn iso(timestamp: Io.Timestamp) DateTimeFormat {
@@ -143,13 +189,16 @@ pub fn fmt(comptime format_str: []const u8, timestamp: Io.Timestamp, utc_offset:
                 'y' => .year,
                 'M' => .month,
                 'd' => .day,
+                'D' => .weekday,
                 'h' => .hour,
                 'm' => .minute,
                 's' => .second,
                 'f' => .subsecond,
                 'Z', 'z' => .timezone,
-                'T', '/', '-', ':', ' ', '.' => null, // separator characters
-                else => @compileError("Unexpected character '" ++ @as([]const u8, &.{char}) ++ "' in date-time format."),
+                else => if (mem.findScalar(u8, separator_characters, char)) |_|
+                    null
+                else
+                    @compileError("Unexpected character '" ++ @as([]const u8, &.{char}) ++ "' in date-time format."),
             };
             if (current_element) |current| {
                 if (next == current) {
@@ -267,6 +316,11 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
             .natural => try writer.print("{d}{s}", .{ month_day.day_index + 1, x.value.fill }),
             .zero_filled => try writer.print("{d:0>2}{s}", .{ month_day.day_index + 1, x.value.fill }),
         },
+        .weekday => |w| switch (w) {
+            else => {
+                // TODO :
+            }
+        },
         .hour => |h| switch (h) {
             // day index starts at 0
             .natural => try writer.print("{d}{s}", .{ @abs(hour), x.value.fill }),
@@ -298,39 +352,107 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
     };
 }
 
-// TODO : parse
-pub fn parse(str: []const u8, expected_elements: []const DateTimeElement) error{InvalidDateTimeFormat}!Io.Timestamp {
+pub fn parse(str: []const u8, expected_elements: []const DateTimeElement) ParseError!Io.Timestamp {
     debug.assert(expected_elements.len > 0);
 
-    var nanoseconds: i96 = 0;
-    var element_idx: usize = 0;
-    var current_element: DateTimeElement = expected_elements[element_idx];
-    var element_len: usize = 0;
-    var element_start: usize = 0;
-    for (str, 0..) |char, i| switch (char) {
-        '0'...'9' => {
-            element_len += 1;
-        },
-        else => {
-            const slice: []const u8 = str[element_start..element_len];
-            switch (current_element) {
-                .year => {
-                    const year: u16 = std.fmt.parseUnsigned(u16, slice, 10) catch return error.InvalidDateTimeFormat;
-                    nanoseconds += (year * std.time.epoch.secs_per_day * std.time.s_per_day);
-                },
-                else => {},
-            }
+    var map: EnumMap(DateTimeElement, []const u8) = .init(.{});
 
-            element_start = i;
-            element_len = 0;
-            element_idx += 1;
-            if (element_idx < expected_elements.len) {
-                current_element = expected_elements[element_idx];
-            } else break;
+    // The downside of tokenizing like this is the potential of NO separator characters between elements...
+    // Although, whoever formats dates like that is insane.
+    var tokenizer: mem.TokenIterator(u8, .any) = mem.tokenizeAny(u8, str, separator_characters);
+    var element_idx: usize = 0;
+    while (tokenizer.next()) |segment| : (element_idx += 1) {
+        if (segment.len > 0) {
+            if (element_idx >= expected_elements.len) break;
+            if (map.fetchPut(expected_elements[element_idx], segment)) |_| {
+                debug.panic("Date-time element {t} was present more than once in the slice of expected elements.", .{expected_elements[element_idx]});
+            }
+        }
+        // ignore empty strings
+    }
+    return try parseInner(&map);
+}
+
+/// Like `parse(...)`, but will return an error when there are more parsable segments after assigning segmenets to each of the expected elements.
+pub fn parseExact(str: []const u8, expected_elements: []const DateTimeElement) (ParseError || error{UnrecognizedSegment})!Io.Timestamp {
+    debug.assert(expected_elements.len > 0);
+
+    var map: EnumMap(DateTimeElement, []const u8) = .init(.{});
+
+    var tokenizer: mem.TokenIterator(u8, .any) = mem.tokenizeAny(u8, str, separator_characters);
+    var element_idx: usize = 0;
+    while (tokenizer.next()) |segment| : (element_idx += 1) {
+        if (segment.len > 0) {
+            if (element_idx >= expected_elements.len) {
+                log.err("Unrecognized segment '{s}' in date-time string '{s}'. This occurs when there are more parsable segments than expected. Assigned segments are:", .{ segment, str });
+                var iter: EnumMap(DateTimeElement, []const u8).Iterator = map.iterator();
+                while (iter.next()) |kvp| log.err("  {t}: '{s}'", .{ kvp.key, kvp.value.* });
+                return error.UnrecognizedSegment;
+            }
+            if (map.fetchPut(expected_elements[element_idx], segment)) |_| {
+                debug.panic("Date-time element {t} was present more than once in the slice of expected elements.", .{expected_elements[element_idx]});
+            }
+        }
+        // ignore empty strings
+    }
+    return try parseInner(&map);
+}
+
+fn parseInner(map: *const EnumMap(DateTimeElement, []const u8)) ParseError!Io.Timestamp {
+    var nanoseconds: i96 = 0;
+    var iter: EnumMap(DateTimeElement, []const u8).Iterator = map.iterator();
+    while (iter.next()) |kvp| switch (kvp.key) {
+        .year => {
+            const year: u16 = parseUnsigned(u16, kvp.value.*, 10) catch return error.InvalidYear;
+            nanoseconds += (time.epoch.getDaysInYear(year.?) * time.ns_per_day);
         },
+        .month => {
+            const month: Month = try parseMonth(kvp.value.*);
+            const year_slice: []const u8 = map.get(.year) orelse return error.MissingYear;
+            const year: u16 = parseUnsigned(u16, year_slice, 10) catch return error.InvalidYear;
+            // this loop intentionally stops before the present month since the "days" value informs us how far into the present month we are
+            for (1..@intFromEnum(month)) |m| {
+                nanoseconds += (time.epoch.getDaysInMonth(year, @enumFromInt(m)) * time.ns_per_day);
+            }
+        },
+        .day => {
+            const day: u5 = parseUnsigned(u5, kvp.value.*, 10) catch return error.InvalidDay;
+            const month: Month = try parseMonth(map.get(.month) orelse return error.MissingYear);
+            if (day < 1 or day > time.epoch.getDaysInMonth(month)) return error.InvalidDay;
+            nanoseconds += (day * time.ns_per_day);
+        },
+        .hour => {
+            const hour: u5 = parseUnsigned(u5, kvp.value.*, 10) catch return error.InvalidHour;
+            if (hour > 23) return error.InvalidHour;
+            nanoseconds += (hour * time.ns_per_hour);
+        },
+        .minute => {
+            const minute: u6 = parseUnsigned(u6, kvp.value.*, 10) catch return error.InvalidMinute;
+            if (minute > 59) return error.InvalidMinute;
+            nanoseconds += (minute * time.ns_per_min);
+        },
+        .second => {
+            const second: u6 = parseUnsigned(u6, kvp.value.*, 10) catch return error.InvalidSecond;
+            if (second > 59) return error.InvalidSecond;
+            nanoseconds += (second * time.ns_per_s);
+        },
+        .subsecond => {
+            const subseconds: u32 = parseUnsigned(u32, kvp.value.*, 10) catch return error.InvalidSubsecond;
+            // okay, we have to determine the length of the slice to how many places we're talking about
+            _ = subseconds;
+        },
+        .timezone => {
+            // TODO :
+        }
     };
 
     return .fromNanoseconds(nanoseconds);
+}
+
+fn parseMonth(slice: []const u8) error{InvalidMonth}!Month {
+    // TODO : Parse as string
+    const month: u4 = parseUnsigned(u4, slice, 10) catch return error.InvalidMonth;
+    return std.enums.fromInt(Month, month) orelse return error.InvalidMonth;
 }
 
 test iso {
@@ -353,10 +475,14 @@ test "max i96 buf" {
 const std = @import("std");
 const debug = std.debug;
 const testing = std.testing;
+const time = std.time;
+const mem = std.mem;
 const comptimePrint = std.fmt.comptimePrint;
+const parseUnsigned = std.fmt.parseUnsigned;
 const Io = std.Io;
-const EpochSeconds = std.time.epoch.EpochSeconds;
-const EpochDay = std.time.epoch.EpochDay;
-const YearAndDay = std.time.epoch.YearAndDay;
-const MonthAndDay = std.time.epoch.MonthAndDay;
+const EpochSeconds = time.epoch.EpochSeconds;
+const EpochDay = time.epoch.EpochDay;
+const YearAndDay = time.epoch.YearAndDay;
+const MonthAndDay = time.epoch.MonthAndDay;
+const Month = time.epoch.Month;
 const EnumMap = std.EnumMap;
