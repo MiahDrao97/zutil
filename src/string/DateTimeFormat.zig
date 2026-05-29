@@ -411,13 +411,13 @@ fn parseInner(map: *EnumMap(DateTimeElement, []const u8)) ParseError!Io.Timestam
             const year_slice: []const u8 = map.get(.year) orelse return error.MissingYear;
             const year: u16 = parseUnsigned(u16, year_slice, 10) catch return error.InvalidYear;
             // this loop intentionally stops before the present month since the "days" value informs us how far into the present month we are
-            for (1..@intFromEnum(month)) |m| {
+            for (@intFromEnum(Month.jan)..@intFromEnum(month)) |m| {
                 nanoseconds += (time.epoch.getDaysInMonth(year, @enumFromInt(m)) * time.ns_per_day);
             }
         },
         .day => {
             const day: u5 = parseUnsigned(u5, kvp.value.*, 10) catch return error.InvalidDay;
-            const month: Month = try parseMonth(map.get(.month) orelse return error.MissingYear);
+            const month: Month = try parseMonth(map.get(.month) orelse return error.MissingMonth);
             if (day < 1 or day > time.epoch.getDaysInMonth(month)) return error.InvalidDay;
             nanoseconds += (day * time.ns_per_day);
         },
