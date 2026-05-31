@@ -210,9 +210,18 @@ const FullFormat = struct {
 const separator_characters: []const u8 = &.{ ' ', '/', '-', '+', '_', '.', ',', ':', 'T', 'Z' };
 
 const log = if (@import("builtin").is_test) struct {
+    fn debug(comptime fmt_str: []const u8, args: anytype) void {
+        if (testing.log_level == .debug) {
+            std.debug.print(fmt_str ++ @as([]const u8, &.{'\n'}), args);
+        } else {
+            var null_writer: Io.Writer.Discarding = .init(&.{});
+            null_writer.writer.print(fmt_str, args) catch {};
+        }
+    }
+
     fn err(comptime fmt_str: []const u8, args: anytype) void {
         if (testing.log_level == .debug) {
-            debug.print(fmt_str ++ @as([]const u8, &.{'\n'}), args);
+            std.debug.print(fmt_str ++ @as([]const u8, &.{'\n'}), args);
         } else {
             var null_writer: Io.Writer.Discarding = .init(&.{});
             null_writer.writer.print(fmt_str, args) catch {};
@@ -407,7 +416,7 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
 }
 
 pub fn parse(str: []const u8, expected_elements: []const DateTimeElement) ParseError!Io.Timestamp {
-    debug.assert(expected_elements.len > 0);
+    assert(expected_elements.len > 0);
 
     var map: EnumMap(DateTimeElement, []const u8) = .init(.{});
 
@@ -419,9 +428,9 @@ pub fn parse(str: []const u8, expected_elements: []const DateTimeElement) ParseE
         if (segment.len > 0) {
             if (element_idx >= expected_elements.len) break;
             if (map.fetchPut(expected_elements[element_idx], segment)) |_| {
-                debug.panic("Date-time element {t} was present more than once in the slice of expected elements.", .{expected_elements[element_idx]});
+                panic("Date-time element {t} was present more than once in the slice of expected elements.", .{expected_elements[element_idx]});
             }
-            debug.print("Segment {d}: '{s}'\n", .{ element_idx, segment });
+            log.debug("Segment {d} ({t}): '{s}'", .{ element_idx, expected_elements[element_idx], segment });
         }
         // ignore empty strings
     }
@@ -430,7 +439,7 @@ pub fn parse(str: []const u8, expected_elements: []const DateTimeElement) ParseE
 
 /// Like `parse(...)`, but will return an error when there are more parsable segments after assigning segmenets to each of the expected elements.
 pub fn parseExact(str: []const u8, expected_elements: []const DateTimeElement) (ParseError || error{UnrecognizedSegment})!Io.Timestamp {
-    debug.assert(expected_elements.len > 0);
+    assert(expected_elements.len > 0);
 
     var map: EnumMap(DateTimeElement, []const u8) = .init(.{});
 
@@ -445,9 +454,9 @@ pub fn parseExact(str: []const u8, expected_elements: []const DateTimeElement) (
                 return error.UnrecognizedSegment;
             }
             if (map.fetchPut(expected_elements[element_idx], segment)) |_| {
-                debug.panic("Date-time element {t} was present more than once in the slice of expected elements.", .{expected_elements[element_idx]});
+                panic("Date-time element {t} was present more than once in the slice of expected elements.", .{expected_elements[element_idx]});
             }
-            debug.print("Segment {d}: '{s}'\n", .{ element_idx, segment });
+            log.debug("Segment {d} ({t}): '{s}'", .{ element_idx, expected_elements[element_idx], segment });
         }
         // ignore empty strings
     }
@@ -460,7 +469,13 @@ fn parseInner(map: *EnumMap(DateTimeElement, []const u8)) ParseError!Io.Timestam
     while (iter.next()) |kvp| switch (kvp.key) {
         .year => {
             const year: u16 = parseUnsigned(u16, kvp.value.*, 10) catch return error.InvalidYear;
-            nanoseconds += (@as(i96, @intCast(time.epoch.getDaysInYear(year))) * time.ns_per_day);
+            if (year < 1970) {
+                log.err("Year {d} predates UNIX epoch. I haven't implemented date-time parsing for years before the UNIX epoch. You can open an issue or I might get around to it later. :)", .{year});
+                return error.InvalidYear;
+            }
+            for (1970..year) |y| {
+                nanoseconds += (@as(i96, @intCast(time.epoch.getDaysInYear(@intCast(y)))) * time.ns_per_day);
+            }
         },
         .month => {
             const month: Month = try parseMonth(kvp.value.*);
@@ -477,7 +492,8 @@ fn parseInner(map: *EnumMap(DateTimeElement, []const u8)) ParseError!Io.Timestam
             const year: u16 = parseUnsigned(u16, year_slice, 10) catch return error.InvalidYear;
             const month: Month = try parseMonth(map.get(.month) orelse return error.MissingMonth);
             if (day < 1 or day > time.epoch.getDaysInMonth(year, month)) return error.InvalidDay;
-            nanoseconds += (@as(i96, @intCast(day)) * time.ns_per_day);
+            // have to subtract one because the day you're ON might not be complete
+            nanoseconds += (@as(i96, @intCast(day - 1)) * time.ns_per_day);
         },
         .weekday => {
             // this has no bearing on the actual timestamp
@@ -540,12 +556,8 @@ test "max i96 buf" {
     try testing.expectEqual(29, writer.buffered().len);
 }
 test parse {
-    testing.log_level = .debug;
-    defer testing.log_level = .warn;
-
     const date_str = "2026-05-22T21:48:47.036Z";
     const timestamp: Io.Timestamp = try DateTimeFormat.parse(date_str, &.{ .year, .month, .day, .hour, .minute, .second, .subsecond });
-    errdefer debug.print("Expected: {d}, Actual: {d}, Diff: {d}\n", .{ 1779486527036000000, timestamp.nanoseconds, @abs(1779486527036000000 - timestamp.nanoseconds) });
 
     try testing.expectEqual(1779486527036000000, timestamp.nanoseconds);
 }
@@ -555,12 +567,13 @@ comptime {
 }
 
 const std = @import("std");
-const debug = std.debug;
 const testing = std.testing;
 const time = std.time;
 const mem = std.mem;
 const comptimePrint = std.fmt.comptimePrint;
 const parseUnsigned = std.fmt.parseUnsigned;
+const assert = std.debug.assert;
+const panic = std.debug.panic;
 const Io = std.Io;
 const EpochSeconds = time.epoch.EpochSeconds;
 const EpochDay = time.epoch.EpochDay;
