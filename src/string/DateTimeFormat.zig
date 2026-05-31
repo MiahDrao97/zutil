@@ -52,7 +52,7 @@ pub const ParseError = error{
 };
 
 pub const WeekDay = enum(u4) {
-    Sunday = 1,
+    Sunday,
     Monday,
     Tuesday,
     Wednesday,
@@ -62,8 +62,8 @@ pub const WeekDay = enum(u4) {
 
     pub fn fromTimestamp(timestamp: Io.Timestamp) WeekDay {
         // Fun fact: Jan. 1, 1970 was a Thursday, so we need add Thursday as an offset
-        const days: u64 = @abs(timestamp.toSeconds() * time.s_per_day) + @intFromEnum(WeekDay.Thursday);
-        return @enumFromInt(@mod(days, 7) + 1);
+        const days: u64 = @divTrunc(@abs(timestamp.toSeconds()), time.s_per_day) + @intFromEnum(WeekDay.Thursday);
+        return @enumFromInt(@mod(days, 7));
     }
 
     /// Abbreviate to the first 3 letters
@@ -288,9 +288,9 @@ pub fn fmt(comptime format_str: []const u8, timestamp: Io.Timestamp, utc_offset:
 
 pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
     const ms_now: i64 = self.timestamp.toMilliseconds();
-    const sec_now: i64 = @divFloor(ms_now, 1000);
-    const minutes_now: i64 = @divFloor(sec_now, 60);
-    const hours_now: i64 = @divFloor(minutes_now, 60);
+    const sec_now: i64 = @divTrunc(ms_now, 1000);
+    const minutes_now: i64 = @divTrunc(sec_now, 60);
+    const hours_now: i64 = @divTrunc(minutes_now, 60);
 
     const sec: i64 = @mod(sec_now, 60);
     const min: i64 = @mod(minutes_now, 60);
