@@ -51,6 +51,33 @@ pub const ParseError = error{
     MissingUtcOffset,
 };
 
+pub const WeekDay = enum(u4) {
+    Sunday = 1,
+    Monday,
+    Tuesday,
+    Wednesday,
+    Thursday,
+    Friday,
+    Saturday,
+
+    pub fn fromTimestamp(timestamp: Io.Timestamp) WeekDay {
+        // Fun fact: Jan. 1, 1970 was a Thursday, so we need add Thursday as an offset
+        const days: u64 = @abs(timestamp.toSeconds() * time.s_per_day) + @intFromEnum(WeekDay.Thursday);
+        return @enumFromInt(@mod(days, 7) + 1);
+    }
+
+    /// Abbreviate to the first 3 letters
+    pub fn abbreviate(self: WeekDay, buf: *[3]u8) []const u8 {
+        return std.fmt.bufPrint(buf, "{t}", .{self}) catch buf;
+    }
+
+    test fromTimestamp {
+        const nanoseconds: i96 = 1779486527036758700; // Friday, May 22, 2026 at 9:48:47.036 PM (UTC)
+        const day_of_week: WeekDay = .fromTimestamp(.fromNanoseconds(nanoseconds));
+        try testing.expectEqual(WeekDay.Friday, day_of_week);
+    }
+};
+
 /// Element of a date-time
 pub const DateTimeElement = enum {
     /// Year
@@ -82,7 +109,7 @@ pub const DateTimeElement = enum {
                 .month = switch (elem_len) {
                     0, 1 => .natural,
                     2 => .zero_filled,
-                    3 => .abbrevation,
+                    3 => .abbreviation,
                     4 => .full_name,
                     else => @compileError(comptimePrint("Invalid month format '{s}'", .{&@as([elem_len]u8, @splat('M'))})),
                 },
@@ -96,7 +123,7 @@ pub const DateTimeElement = enum {
             },
             .weekday => .{
                 .weekday = switch (elem_len) {
-                    0, 1 => .abbrevation,
+                    0, 1 => .abbreviation,
                     2 => .full_name,
                     else => @compileError(comptimePrint("Invalid weekday format '{s}'", .{&@as([elem_len]u8, @splat('D'))})),
                 },
@@ -136,7 +163,7 @@ const DateTimeElementFormat = union(DateTimeElement) {
     /// Day display strategy
     day: enum { natural, zero_filled },
     /// Day of the week display strategy
-    weekday: enum { abbrevation, full_name },
+    weekday: enum { abbreviation, full_name },
     /// Hour display strategy
     hour: enum { natural, zero_filled },
     /// Minute display strategy
@@ -317,9 +344,15 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
             .zero_filled => try writer.print("{d:0>2}{s}", .{ month_day.day_index + 1, x.value.fill }),
         },
         .weekday => |w| switch (w) {
-            else => {
-                // TODO :
-            }
+            .abbreviation => {
+                const weekday: WeekDay = .fromTimestamp(self.timestamp);
+                var buf: [3]u8 = undefined;
+                try writer.print("{s}{s}", .{ weekday.abbreviate(&buf), x.value.fill });
+            },
+            .full_name => {
+                const weekday: WeekDay = .fromTimestamp(self.timestamp);
+                try writer.print("{t}{s}", .{ weekday, x.value.fill });
+            },
         },
         .hour => |h| switch (h) {
             // day index starts at 0
@@ -339,11 +372,8 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
         .subsecond => |places| if (places > 0) {
             // write all nanoseconds to a buffer and strategically truncate
             var buf: [32]u8 = undefined;
-            var full_ns_writer: Io.Writer = .fixed(&buf);
-            full_ns_writer.print("{d}", .{self.timestamp.nanoseconds}) catch unreachable;
-
+            const full_ns: []const u8 = std.fmt.bufPrint(&buf, "{d}", .{self.timestamp.nanoseconds}) catch unreachable;
             // get the last 9 characters
-            const full_ns: []const u8 = full_ns_writer.buffered();
             const subseconds: []const u8 = full_ns[full_ns.len - 9 ..];
 
             try writer.print("{s}{s}", .{ subseconds[0..places], x.value.fill });
@@ -470,6 +500,10 @@ test "max i96 buf" {
     var writer: Io.Writer = .fixed(&buf);
     try writer.print("{d}", .{std.math.maxInt(i96)});
     try testing.expectEqual(29, writer.buffered().len);
+}
+
+comptime {
+    _ = WeekDay;
 }
 
 const std = @import("std");
