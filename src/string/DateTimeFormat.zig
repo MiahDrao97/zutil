@@ -4,7 +4,7 @@ pub const DateTimeFormat = @This();
 /// Timestamp itself
 timestamp: Io.Timestamp,
 /// Ordering of the fields and separator characters
-order: EnumMap(DateTimeElement, FullFormat),
+order: EnumMap(Element, FullFormat),
 /// Time zone
 utc_offset: UtcOffset,
 
@@ -29,10 +29,19 @@ pub const UtcOffset = packed struct(u8) {
         }
         try writer.print("{d:0>2}:{d:0>2}", .{ self.hours, @as(u16, self.quarter_hours) * 15 });
     }
+
+    pub fn parse(str: []const u8) ?UtcOffset {
+        if (str.len == 1 and str[0] == 'Z') {
+            return .utc;
+        }
+        // TODO : Parse more formats
+        return null;
+    }
 };
 
 /// Various possible parse errors that could be returned from `parse(...)`
 pub const ParseError = error{
+    UnexpectedCharacter,
     UnrecognizedSegment,
     InvalidYear,
     InvalidMonth,
@@ -103,7 +112,7 @@ pub const WeekDay = enum(u4) {
 };
 
 /// Element of a date-time
-pub const DateTimeElement = enum {
+pub const Element = enum {
     /// Year
     year,
     /// Month
@@ -123,7 +132,7 @@ pub const DateTimeElement = enum {
     /// UTC offset
     utc_offset,
 
-    fn toFormat(self: DateTimeElement, elem_len: comptime_int) DateTimeElementFormat {
+    fn toFormat(self: Element, elem_len: comptime_int) ElementFormat {
         return switch (self) {
             .year => if (elem_len <= 5)
                 .{ .year = elem_len }
@@ -179,7 +188,7 @@ pub const DateTimeElement = enum {
     }
 };
 
-const DateTimeElementFormat = union(DateTimeElement) {
+const ElementFormat = union(Element) {
     /// The number of places to show
     year: u3,
     /// Month display strategy
@@ -201,13 +210,68 @@ const DateTimeElementFormat = union(DateTimeElement) {
 };
 
 const FullFormat = struct {
-    fmt: DateTimeElementFormat,
+    fmt: ElementFormat,
     fill: []const u8,
+};
+
+const Tokenizer = struct {
+    inner: mem.TokenIterator(u8, .any),
+    current: ?[]const u8,
+    idx: usize,
+
+    const TokenCategory = enum { numeric, alpha };
+
+    fn init(str: []const u8) Tokenizer {
+        return .{
+            .inner = mem.tokenizeAny(u8, str, separator_characters),
+            .current = null,
+            .idx = 0,
+        };
+    }
+
+    fn next(self: *Tokenizer) error{UnexpectedCharacter}!?[]const u8 {
+        return loop: switch ({}) {
+            else => {
+                if (self.current) |str| {
+                    var category: ?TokenCategory = null;
+                    const start: usize = self.idx;
+                    while (self.idx < str.len) : (self.idx += 1) {
+                        if (std.ascii.isAlphabetic(str[self.idx])) {
+                            if (category) |c| if (c != .alpha) {
+                                break :loop str[start..self.idx];
+                            };
+                            category = .alpha;
+                        } else if (std.ascii.isDigit(str[self.idx])) {
+                            if (category) |c| if (c != .numeric) {
+                                break :loop str[start..self.idx];
+                            };
+                            category = .numeric;
+                        } else {
+                            log.err("Encountered unexpected character '{c}' at index {d} in date-time string '{s}'.", .{
+                                str[self.idx],
+                                mem.indexOfScalar(u8, self.inner.buffer, str[self.idx]).?,
+                                self.inner.buffer,
+                            });
+                            return error.UnexpectedCharacter;
+                        }
+                    }
+                    if (self.idx != start) break :loop str[start..self.idx];
+                    self.current = null;
+                }
+                if (self.inner.next()) |n| {
+                    self.idx = 0;
+                    self.current = n;
+                    continue :loop {};
+                }
+                break :loop null;
+            }
+        };
+    }
 };
 
 /// Expected/allowed separator characters between the various elements.
 /// 'Z' is not exactly a "separator", but it can usually be found to indicate that the date-time is UTC.
-const separator_characters: []const u8 = &.{ ' ', '/', '-', '+', '_', '.', ',', ':', 'T', 'Z' };
+const separator_characters: []const u8 = &.{ ' ', '/', '-', '+', '_', '.', ',', ':', 'T' };
 
 const log = if (@import("builtin").is_test) struct {
     fn debug(comptime fmt_str: []const u8, args: anytype) void {
@@ -237,15 +301,15 @@ pub fn iso(timestamp: Io.Timestamp) DateTimeFormat {
 /// Assumes that the timestamp is already UTC.
 /// Then we'll apply the offset to the existing `timestamp`.
 pub fn fmt(comptime format_str: []const u8, timestamp: Io.Timestamp, utc_offset: UtcOffset) DateTimeFormat {
-    comptime var order: EnumMap(DateTimeElement, FullFormat) = .init(.{});
+    comptime var order: EnumMap(Element, FullFormat) = .init(.{});
     comptime {
-        var current_element: ?DateTimeElement = null;
+        var current_element: ?Element = null;
         var elem_len: usize = 0;
         var fill_start: ?usize = null;
         var current_fmt: FullFormat = undefined;
 
         for (format_str, 0..) |char, i| {
-            const next: ?DateTimeElement = switch (char) {
+            const next: ?Element = switch (char) {
                 'y' => .year,
                 'M' => .month,
                 'd' => .day,
@@ -334,8 +398,8 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
     const year_day: YearAndDay = epoch_day.calculateYearDay();
     const month_day: MonthAndDay = year_day.calculateMonthDay();
 
-    var order_cpy: EnumMap(DateTimeElement, FullFormat) = self.order;
-    var iter: EnumMap(DateTimeElement, FullFormat).Iterator = order_cpy.iterator();
+    var order_cpy: EnumMap(Element, FullFormat) = self.order;
+    var iter: EnumMap(Element, FullFormat).Iterator = order_cpy.iterator();
     while (iter.next()) |x| switch (x.value.fmt) {
         .year => |y| switch (y) {
             0 => {}, // ignore
@@ -415,16 +479,16 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
     };
 }
 
-pub fn parse(str: []const u8, expected_elements: []const DateTimeElement) ParseError!Io.Timestamp {
+pub fn parse(str: []const u8, expected_elements: []const Element) ParseError!Io.Timestamp {
     assert(expected_elements.len > 0);
 
-    var map: EnumMap(DateTimeElement, []const u8) = .init(.{});
+    var map: EnumMap(Element, []const u8) = .init(.{});
 
     // The downside of tokenizing like this is the potential of NO separator characters between elements...
     // Although, whoever formats dates like that is insane.
-    var tokenizer: mem.TokenIterator(u8, .any) = mem.tokenizeAny(u8, str, separator_characters);
+    var tokenizer: Tokenizer = .init(str);
     var element_idx: usize = 0;
-    while (tokenizer.next()) |segment| : (element_idx += 1) {
+    while (try tokenizer.next()) |segment| : (element_idx += 1) {
         if (segment.len > 0) {
             if (element_idx >= expected_elements.len) break;
             if (map.fetchPut(expected_elements[element_idx], segment)) |_| {
@@ -438,18 +502,18 @@ pub fn parse(str: []const u8, expected_elements: []const DateTimeElement) ParseE
 }
 
 /// Like `parse(...)`, but will return an error when there are more parsable segments after assigning segmenets to each of the expected elements.
-pub fn parseExact(str: []const u8, expected_elements: []const DateTimeElement) (ParseError || error{UnrecognizedSegment})!Io.Timestamp {
+pub fn parseExact(str: []const u8, expected_elements: []const Element) (ParseError || error{UnrecognizedSegment})!Io.Timestamp {
     assert(expected_elements.len > 0);
 
-    var map: EnumMap(DateTimeElement, []const u8) = .init(.{});
+    var map: EnumMap(Element, []const u8) = .init(.{});
 
-    var tokenizer: mem.TokenIterator(u8, .any) = mem.tokenizeAny(u8, str, separator_characters);
+    var tokenizer: Tokenizer = .init(str);
     var element_idx: usize = 0;
-    while (tokenizer.next()) |segment| : (element_idx += 1) {
+    while (try tokenizer.next()) |segment| : (element_idx += 1) {
         if (segment.len > 0) {
             if (element_idx >= expected_elements.len) {
                 log.err("Unrecognized segment '{s}' in date-time string '{s}'. This occurs when there are more parsable segments than expected. Assigned segments are:", .{ segment, str });
-                var iter: EnumMap(DateTimeElement, []const u8).Iterator = map.iterator();
+                var iter: EnumMap(Element, []const u8).Iterator = map.iterator();
                 while (iter.next()) |kvp| log.err("  {t}: '{s}'", .{ kvp.key, kvp.value.* });
                 return error.UnrecognizedSegment;
             }
@@ -463,14 +527,14 @@ pub fn parseExact(str: []const u8, expected_elements: []const DateTimeElement) (
     return try parseInner(&map);
 }
 
-fn parseInner(map: *EnumMap(DateTimeElement, []const u8)) ParseError!Io.Timestamp {
+fn parseInner(map: *EnumMap(Element, []const u8)) ParseError!Io.Timestamp {
     var nanoseconds: i96 = 0;
-    var iter: EnumMap(DateTimeElement, []const u8).Iterator = map.iterator();
+    var iter: EnumMap(Element, []const u8).Iterator = map.iterator();
     while (iter.next()) |kvp| switch (kvp.key) {
         .year => {
             const year: u16 = parseUnsigned(u16, kvp.value.*, 10) catch return error.InvalidYear;
             if (year < 1970) {
-                log.err("Year {d} predates UNIX epoch. I haven't implemented date-time parsing for years before the UNIX epoch. You can open an issue or I might get around to it later. :)", .{year});
+                log.err("Year {d} predates UNIX epoch. I haven't implemented date-time parsing for years before the UNIX epoch. You can open an issue or I might get around to it later. :) -MiahDrao97", .{year});
                 return error.InvalidYear;
             }
             for (1970..year) |y| {
@@ -526,7 +590,9 @@ fn parseInner(map: *EnumMap(DateTimeElement, []const u8)) ParseError!Io.Timestam
             nanoseconds += subseconds;
         },
         .utc_offset => {
-            // TODO :
+            const offset: UtcOffset = UtcOffset.parse(kvp.value.*) orelse return error.InvalidUtcOffset;
+            nanoseconds += (@as(i96, offset.hours) * time.ns_per_hour);
+            nanoseconds += (@as(i96, @intCast(offset.quarter_hours)) * @as(i96, if (offset.hours < 0) -1 else 1) * 15 * time.ns_per_min);
         }
     };
 
@@ -557,7 +623,16 @@ test "max i96 buf" {
 }
 test parse {
     const date_str = "2026-05-22T21:48:47.036Z";
-    const timestamp: Io.Timestamp = try DateTimeFormat.parse(date_str, &.{ .year, .month, .day, .hour, .minute, .second, .subsecond });
+    const timestamp: Io.Timestamp = try DateTimeFormat.parse(date_str, &.{
+        .year,
+        .month,
+        .day,
+        .hour,
+        .minute,
+        .second,
+        .subsecond,
+        .utc_offset,
+    });
 
     try testing.expectEqual(1779486527036000000, timestamp.nanoseconds);
 }
