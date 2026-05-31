@@ -68,13 +68,37 @@ pub const WeekDay = enum(u4) {
 
     /// Abbreviate to the first 3 letters
     pub fn abbreviate(self: WeekDay, buf: *[3]u8) []const u8 {
-        return std.fmt.bufPrint(buf, "{t}", .{self}) catch buf;
+        return if (std.fmt.bufPrint(buf, "{t}", .{self})) |_| unreachable else |_| buf;
     }
 
     test fromTimestamp {
-        const nanoseconds: i96 = 1779486527036758700; // Friday, May 22, 2026 at 9:48:47.036 PM (UTC)
+        const nanoseconds: i96 = 1779486527036758700; // Friday, May 22, 2026 at 9:48:47.0367587 PM (UTC)
         const day_of_week: WeekDay = .fromTimestamp(.fromNanoseconds(nanoseconds));
         try testing.expectEqual(WeekDay.Friday, day_of_week);
+    }
+    test abbreviate {
+        var buf: [3]u8 = undefined;
+
+        var day_of_week: WeekDay = .Sunday;
+        try testing.expectEqualStrings("Sun", day_of_week.abbreviate(&buf));
+
+        day_of_week = .Monday;
+        try testing.expectEqualStrings("Mon", day_of_week.abbreviate(&buf));
+
+        day_of_week = .Tuesday;
+        try testing.expectEqualStrings("Tue", day_of_week.abbreviate(&buf));
+
+        day_of_week = .Wednesday;
+        try testing.expectEqualStrings("Wed", day_of_week.abbreviate(&buf));
+
+        day_of_week = .Thursday;
+        try testing.expectEqualStrings("Thu", day_of_week.abbreviate(&buf));
+
+        day_of_week = .Friday;
+        try testing.expectEqualStrings("Fri", day_of_week.abbreviate(&buf));
+
+        day_of_week = .Saturday;
+        try testing.expectEqualStrings("Sat", day_of_week.abbreviate(&buf));
     }
 };
 
@@ -187,11 +211,11 @@ const separator_characters: []const u8 = &.{ ' ', '/', '-', '+', '_', '.', ',', 
 
 const log = if (@import("builtin").is_test) struct {
     fn err(comptime fmt_str: []const u8, args: anytype) void {
-        if (testing.log_level == .Debug) {
-            debug.print(fmt_str ++ &.{'\n'}, args);
+        if (testing.log_level == .debug) {
+            debug.print(fmt_str ++ @as([]const u8, &.{'\n'}), args);
         } else {
             var null_writer: Io.Writer.Discarding = .init(&.{});
-            null_writer.writer.print(fmt_str, args);
+            null_writer.writer.print(fmt_str, args) catch {};
         }
     }
 } else std.log.scoped(.DateTimeFormat);
@@ -397,6 +421,7 @@ pub fn parse(str: []const u8, expected_elements: []const DateTimeElement) ParseE
             if (map.fetchPut(expected_elements[element_idx], segment)) |_| {
                 debug.panic("Date-time element {t} was present more than once in the slice of expected elements.", .{expected_elements[element_idx]});
             }
+            debug.print("Segment {d}: '{s}'\n", .{ element_idx, segment });
         }
         // ignore empty strings
     }
@@ -422,6 +447,7 @@ pub fn parseExact(str: []const u8, expected_elements: []const DateTimeElement) (
             if (map.fetchPut(expected_elements[element_idx], segment)) |_| {
                 debug.panic("Date-time element {t} was present more than once in the slice of expected elements.", .{expected_elements[element_idx]});
             }
+            debug.print("Segment {d}: '{s}'\n", .{ element_idx, segment });
         }
         // ignore empty strings
     }
@@ -434,7 +460,7 @@ fn parseInner(map: *EnumMap(DateTimeElement, []const u8)) ParseError!Io.Timestam
     while (iter.next()) |kvp| switch (kvp.key) {
         .year => {
             const year: u16 = parseUnsigned(u16, kvp.value.*, 10) catch return error.InvalidYear;
-            nanoseconds += (time.epoch.getDaysInYear(year.?) * time.ns_per_day);
+            nanoseconds += (@as(i96, @intCast(time.epoch.getDaysInYear(year))) * time.ns_per_day);
         },
         .month => {
             const month: Month = try parseMonth(kvp.value.*);
@@ -442,34 +468,46 @@ fn parseInner(map: *EnumMap(DateTimeElement, []const u8)) ParseError!Io.Timestam
             const year: u16 = parseUnsigned(u16, year_slice, 10) catch return error.InvalidYear;
             // this loop intentionally stops before the present month since the "days" value informs us how far into the present month we are
             for (@intFromEnum(Month.jan)..@intFromEnum(month)) |m| {
-                nanoseconds += (time.epoch.getDaysInMonth(year, @enumFromInt(m)) * time.ns_per_day);
+                nanoseconds += (@as(i96, @intCast(time.epoch.getDaysInMonth(year, @enumFromInt(m)))) * time.ns_per_day);
             }
         },
         .day => {
             const day: u5 = parseUnsigned(u5, kvp.value.*, 10) catch return error.InvalidDay;
+            const year_slice: []const u8 = map.get(.year) orelse return error.MissingYear;
+            const year: u16 = parseUnsigned(u16, year_slice, 10) catch return error.InvalidYear;
             const month: Month = try parseMonth(map.get(.month) orelse return error.MissingMonth);
-            if (day < 1 or day > time.epoch.getDaysInMonth(month)) return error.InvalidDay;
-            nanoseconds += (day * time.ns_per_day);
+            if (day < 1 or day > time.epoch.getDaysInMonth(year, month)) return error.InvalidDay;
+            nanoseconds += (@as(i96, @intCast(day)) * time.ns_per_day);
+        },
+        .weekday => {
+            // this has no bearing on the actual timestamp
         },
         .hour => {
             const hour: u5 = parseUnsigned(u5, kvp.value.*, 10) catch return error.InvalidHour;
             if (hour > 23) return error.InvalidHour;
-            nanoseconds += (hour * time.ns_per_hour);
+            nanoseconds += (@as(i96, @intCast(hour)) * time.ns_per_hour);
         },
         .minute => {
             const minute: u6 = parseUnsigned(u6, kvp.value.*, 10) catch return error.InvalidMinute;
             if (minute > 59) return error.InvalidMinute;
-            nanoseconds += (minute * time.ns_per_min);
+            nanoseconds += (@as(i96, @intCast(minute)) * time.ns_per_min);
         },
         .second => {
             const second: u6 = parseUnsigned(u6, kvp.value.*, 10) catch return error.InvalidSecond;
             if (second > 59) return error.InvalidSecond;
-            nanoseconds += (second * time.ns_per_s);
+            nanoseconds += (@as(i96, @intCast(second)) * time.ns_per_s);
         },
         .subsecond => {
-            const subseconds: u32 = parseUnsigned(u32, kvp.value.*, 10) catch return error.InvalidSubsecond;
             // okay, we have to determine the length of the slice to how many places we're talking about
-            _ = subseconds;
+            const power: u64 = switch (kvp.value.len) {
+                1...9 => |x| 9 - x,
+                else => |invalid| {
+                    log.err("Length of subsecond segment must be at least 1 and up to 9. Found {d}.", .{invalid});
+                    return error.InvalidSubsecond;
+                }
+            };
+            const subseconds: u64 = std.math.pow(u64, 10, power) * (parseUnsigned(u64, kvp.value.*, 10) catch return error.InvalidSubsecond);
+            nanoseconds += subseconds;
         },
         .utc_offset => {
             // TODO :
@@ -486,7 +524,7 @@ fn parseMonth(slice: []const u8) error{InvalidMonth}!Month {
 }
 
 test iso {
-    const nanoseconds: i96 = 1779486527036758700; // Friday, May 22, 2026 at 9:48:47.036 PM (UTC)
+    const nanoseconds: i96 = 1779486527036758700; // Friday, May 22, 2026 at 9:48:47.0367587 PM (UTC)
 
     var stream: Io.Writer.Allocating = .init(testing.allocator);
     defer stream.deinit();
@@ -500,6 +538,16 @@ test "max i96 buf" {
     var writer: Io.Writer = .fixed(&buf);
     try writer.print("{d}", .{std.math.maxInt(i96)});
     try testing.expectEqual(29, writer.buffered().len);
+}
+test parse {
+    testing.log_level = .debug;
+    defer testing.log_level = .warn;
+
+    const date_str = "2026-05-22T21:48:47.036Z";
+    const timestamp: Io.Timestamp = try DateTimeFormat.parse(date_str, &.{ .year, .month, .day, .hour, .minute, .second, .subsecond });
+    errdefer debug.print("Expected: {d}, Actual: {d}, Diff: {d}\n", .{ 1779486527036000000, timestamp.nanoseconds, @abs(1779486527036000000 - timestamp.nanoseconds) });
+
+    try testing.expectEqual(1779486527036000000, timestamp.nanoseconds);
 }
 
 comptime {
