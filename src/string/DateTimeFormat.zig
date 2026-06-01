@@ -31,10 +31,18 @@ pub const UtcOffset = packed struct(u8) {
     }
 
     pub fn parse(str: []const u8) ?UtcOffset {
-        if (str.len == 1 and str[0] == 'Z') {
-            return .utc;
+        const trimmed: []const u8 = mem.trim(u8, str, &ascii.whitespace);
+        if (trimmed.len == 1) {
+            return switch (trimmed[0]) {
+                '0'...'9' => |n| .{ .hours = std.fmt.parseInt(i6, &.{n}, 10) catch unreachable, .quarter_hours = 0 },
+                'Z' => .utc,
+                else => null,
+            };
         }
-        // TODO : Parse more formats
+        if (trimmed.len > 1) {
+            // TODO :
+            _ = std.fmt.parseInt(i6, trimmed, 10) catch return null;
+        }
         return null;
     }
 };
@@ -269,12 +277,12 @@ const Tokenizer = struct {
                     var category: ?TokenCategory = null;
                     const start: usize = self.idx;
                     while (self.idx < str.len) : (self.idx += 1) {
-                        if (std.ascii.isAlphabetic(str[self.idx])) {
+                        if (ascii.isAlphabetic(str[self.idx])) {
                             if (category) |c| if (c != .alpha) {
                                 break :loop str[start..self.idx];
                             };
                             category = .alpha;
-                        } else if (std.ascii.isDigit(str[self.idx])) {
+                        } else if (ascii.isDigit(str[self.idx])) {
                             if (category) |c| if (c != .numeric) {
                                 break :loop str[start..self.idx];
                             };
@@ -448,7 +456,7 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
                 var buf: [3]u8 = undefined;
                 var formatter: Io.Writer = .fixed(&buf);
                 formatter.print("{t}", .{month_day.month}) catch unreachable;
-                buf[0] = std.ascii.toUpper(buf[0]);
+                buf[0] = ascii.toUpper(buf[0]);
                 try writer.print("{s}{s}", .{ formatter.buffered(), x.value.fill });
             },
             .full_name => try writer.print("{s}{s}", .{ switch (month_day.month) {
@@ -736,6 +744,7 @@ const std = @import("std");
 const testing = std.testing;
 const time = std.time;
 const mem = std.mem;
+const ascii = std.ascii;
 const comptimePrint = std.fmt.comptimePrint;
 const parseUnsigned = std.fmt.parseUnsigned;
 const assert = std.debug.assert;
