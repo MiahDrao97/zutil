@@ -4,7 +4,7 @@ pub const DateTimeFormat = @This();
 /// Timestamp itself
 timestamp: Io.Timestamp,
 /// Ordering of the fields and separator characters
-order: EnumMap(Element, FullFormat),
+order: ElementOrder,
 /// Time zone
 utc_offset: UtcOffset,
 
@@ -53,11 +53,6 @@ pub const ParseError = error{
     InvalidUtcOffset,
     MissingYear,
     MissingMonth,
-    MissingDay,
-    MissingHour,
-    MissingSecond,
-    MissingSubsecond,
-    MissingUtcOffset,
 };
 
 pub const WeekDay = enum(u4) {
@@ -214,6 +209,44 @@ const FullFormat = struct {
     fill: []const u8,
 };
 
+const ElementOrder = struct {
+    map: EnumMap(Element, FullFormat),
+    ordering: [@typeInfo(Element).@"enum".fields.len]?Element,
+
+    const init: ElementOrder = .{
+        .map = .init(.{}),
+        .ordering = @splat(null),
+    };
+
+    fn fetchPut(self: *ElementOrder, key: Element, value: FullFormat) ?[]const u8 {
+        if (self.map.fetchPut(key, value)) |old_value| {
+            return old_value;
+        }
+        const next_idx: usize = mem.indexOfScalar(?Element, &self.ordering, null).?;
+        self.ordering[next_idx] = key;
+        return null;
+    }
+
+    fn iterator(self: ElementOrder) Iterator {
+        return .{ .order = self, .idx = 0 };
+    }
+
+    const Iterator = struct {
+        order: ElementOrder,
+        idx: usize,
+
+        fn next(self: *Iterator) ?EnumMap(Element, FullFormat).Entry {
+            if (self.idx < self.order.ordering.len) {
+                if (self.order.ordering[self.idx]) |key| {
+                    defer self.idx += 1;
+                    return .{ .key = key, .value = self.order.map.getPtr(key).? };
+                }
+            }
+            return null;
+        }
+    };
+};
+
 const Tokenizer = struct {
     inner: mem.TokenIterator(u8, .any),
     current: ?[]const u8,
@@ -255,8 +288,8 @@ const Tokenizer = struct {
                             return error.UnexpectedCharacter;
                         }
                     }
+                    defer self.current = null;
                     if (self.idx != start) break :loop str[start..self.idx];
-                    self.current = null;
                 }
                 if (self.inner.next()) |n| {
                     self.idx = 0;
@@ -270,7 +303,6 @@ const Tokenizer = struct {
 };
 
 /// Expected/allowed separator characters between the various elements.
-/// 'Z' is not exactly a "separator", but it can usually be found to indicate that the date-time is UTC.
 const separator_characters: []const u8 = &.{ ' ', '/', '-', '+', '_', '.', ',', ':', 'T' };
 
 const log = if (@import("builtin").is_test) struct {
@@ -301,7 +333,7 @@ pub fn iso(timestamp: Io.Timestamp) DateTimeFormat {
 /// Assumes that the timestamp is already UTC.
 /// Then we'll apply the offset to the existing `timestamp`.
 pub fn fmt(comptime format_str: []const u8, timestamp: Io.Timestamp, utc_offset: UtcOffset) DateTimeFormat {
-    comptime var order: EnumMap(Element, FullFormat) = .init(.{});
+    comptime var order: ElementOrder = .init;
     comptime {
         var current_element: ?Element = null;
         var elem_len: usize = 0;
@@ -398,8 +430,7 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
     const year_day: YearAndDay = epoch_day.calculateYearDay();
     const month_day: MonthAndDay = year_day.calculateMonthDay();
 
-    var order_cpy: EnumMap(Element, FullFormat) = self.order;
-    var iter: EnumMap(Element, FullFormat).Iterator = order_cpy.iterator();
+    var iter: ElementOrder.Iterator = self.order.iterator();
     while (iter.next()) |x| switch (x.value.fmt) {
         .year => |y| switch (y) {
             0 => {}, // ignore
@@ -600,9 +631,49 @@ fn parseInner(map: *EnumMap(Element, []const u8)) ParseError!Io.Timestamp {
 }
 
 fn parseMonth(slice: []const u8) error{InvalidMonth}!Month {
-    // TODO : Parse as string
-    const month: u4 = parseUnsigned(u4, slice, 10) catch return error.InvalidMonth;
-    return std.enums.fromInt(Month, month) orelse return error.InvalidMonth;
+    if (parseUnsigned(u4, slice, 10)) |month| {
+        return std.enums.fromInt(Month, month) orelse return error.InvalidMonth;
+    } else |_| {
+        const FullMonth = enum(u4) {
+            January = 1,
+            February,
+            March,
+            April,
+            May,
+            June,
+            July,
+            August,
+            September,
+            October,
+            November,
+            December,
+        };
+        const AbbreviatedMonth = enum(u4) {
+            Jan = 1,
+            Feb,
+            Mar,
+            Apr,
+            May,
+            Jun,
+            Jul,
+            Aug,
+            Sep,
+            Oct,
+            Nov,
+            Dec,
+        };
+        if (std.meta.stringToEnum(FullMonth, slice)) |month| {
+            return @enumFromInt(@intFromEnum(month));
+        }
+        if (std.meta.stringToEnum(AbbreviatedMonth, slice)) |month| {
+            return @enumFromInt(@intFromEnum(month));
+        }
+        if (std.meta.stringToEnum(Month, slice)) |month| {
+            return month;
+        }
+        log.err("Invalid month '{s}'", .{slice});
+        return error.InvalidMonth;
+    }
 }
 
 test iso {
@@ -621,9 +692,9 @@ test "max i96 buf" {
     try writer.print("{d}", .{std.math.maxInt(i96)});
     try testing.expectEqual(29, writer.buffered().len);
 }
-test parse {
+test parseExact {
     const date_str = "2026-05-22T21:48:47.036Z";
-    const timestamp: Io.Timestamp = try DateTimeFormat.parse(date_str, &.{
+    const timestamp: Io.Timestamp = try DateTimeFormat.parseExact(date_str, &.{
         .year,
         .month,
         .day,
@@ -635,6 +706,26 @@ test parse {
     });
 
     try testing.expectEqual(1779486527036000000, timestamp.nanoseconds);
+}
+test parse {
+    // what if we only want the date?
+    const date_str = "2026-05-22T21:48:47.036Z";
+    const timestamp: Io.Timestamp = try DateTimeFormat.parse(date_str, &.{ .year, .month, .day });
+
+    try testing.expectEqual(1779408000000000000, timestamp.nanoseconds);
+
+    var stream: Io.Writer.Allocating = .init(testing.allocator);
+    defer stream.deinit();
+
+    try stream.writer.print("{f}", .{DateTimeFormat.fmt("MM/dd/yyyy", timestamp, .utc)});
+    try testing.expectEqualStrings("05/22/2026", stream.written());
+}
+test parseMonth {
+    try testing.expectEqual(Month.nov, try parseMonth("11"));
+    try testing.expectEqual(Month.nov, try parseMonth("nov"));
+    try testing.expectEqual(Month.nov, try parseMonth("Nov"));
+    try testing.expectEqual(Month.nov, try parseMonth("November"));
+    try testing.expectError(error.InvalidMonth, parseMonth("Nove"));
 }
 
 comptime {
