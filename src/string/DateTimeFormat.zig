@@ -34,7 +34,7 @@ pub const UtcOffset = packed struct(u8) {
         const trimmed: []const u8 = mem.trim(u8, str, &ascii.whitespace);
         if (trimmed.len == 1) {
             return switch (trimmed[0]) {
-                '0'...'9' => |n| .{ .hours = std.fmt.parseInt(i6, &.{n}, 10) catch unreachable, .quarter_hours = 0 },
+                '0'...'9' => |n| .{ .hours = n - '0', .quarter_hours = 0 },
                 'Z' => .utc,
                 else => null,
             };
@@ -79,8 +79,8 @@ pub const WeekDay = enum(u4) {
     }
 
     /// Abbreviate to the first 3 letters
-    pub fn abbreviate(self: WeekDay, buf: *[3]u8) []const u8 {
-        return if (std.fmt.bufPrint(buf, "{t}", .{self})) |_| unreachable else |_| buf;
+    pub fn abbreviate(self: WeekDay) []const u8 {
+        return @tagName(self)[0..3];
     }
 
     test fromTimestamp {
@@ -89,28 +89,11 @@ pub const WeekDay = enum(u4) {
         try testing.expectEqual(WeekDay.Friday, day_of_week);
     }
     test abbreviate {
-        var buf: [3]u8 = undefined;
-
-        var day_of_week: WeekDay = .Sunday;
-        try testing.expectEqualStrings("Sun", day_of_week.abbreviate(&buf));
-
-        day_of_week = .Monday;
-        try testing.expectEqualStrings("Mon", day_of_week.abbreviate(&buf));
-
-        day_of_week = .Tuesday;
-        try testing.expectEqualStrings("Tue", day_of_week.abbreviate(&buf));
-
-        day_of_week = .Wednesday;
-        try testing.expectEqualStrings("Wed", day_of_week.abbreviate(&buf));
-
-        day_of_week = .Thursday;
-        try testing.expectEqualStrings("Thu", day_of_week.abbreviate(&buf));
-
-        day_of_week = .Friday;
-        try testing.expectEqualStrings("Fri", day_of_week.abbreviate(&buf));
-
-        day_of_week = .Saturday;
-        try testing.expectEqualStrings("Sat", day_of_week.abbreviate(&buf));
+        var day_of_week: WeekDay = undefined;
+        inline for (@typeInfo(WeekDay).@"enum".fields) |field| {
+            day_of_week = @enumFromInt(field.value);
+            try testing.expectEqualStrings(field.name[0..3], day_of_week.abbreviate());
+        }
     }
 };
 
@@ -482,8 +465,7 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
         .weekday => |w| switch (w) {
             .abbreviation => {
                 const weekday: WeekDay = .fromTimestamp(self.timestamp);
-                var buf: [3]u8 = undefined;
-                try writer.print("{s}{s}", .{ weekday.abbreviate(&buf), x.value.fill });
+                try writer.print("{s}{s}", .{ weekday.abbreviate(), x.value.fill });
             },
             .full_name => {
                 const weekday: WeekDay = .fromTimestamp(self.timestamp);
