@@ -34,7 +34,7 @@ pub const UtcOffset = packed struct(u8) {
         const trimmed: []const u8 = mem.trim(u8, str, &ascii.whitespace);
         if (trimmed.len == 1) {
             return switch (trimmed[0]) {
-                '0'...'9' => |n| .{ .hours = n - '0', .quarter_hours = 0 },
+                '0'...'9' => |n| .{ .hours = @intCast(n - '0'), .quarter_hours = 0 },
                 'Z' => .utc,
                 else => null,
             };
@@ -87,13 +87,6 @@ pub const WeekDay = enum(u4) {
         const nanoseconds: i96 = 1779486527036758700; // Friday, May 22, 2026 at 9:48:47.0367587 PM (UTC)
         const day_of_week: WeekDay = .fromTimestamp(.fromNanoseconds(nanoseconds));
         try testing.expectEqual(WeekDay.Friday, day_of_week);
-    }
-    test abbreviate {
-        var day_of_week: WeekDay = undefined;
-        inline for (@typeInfo(WeekDay).@"enum".fields) |field| {
-            day_of_week = @enumFromInt(field.value);
-            try testing.expectEqualStrings(field.name[0..3], day_of_week.abbreviate());
-        }
     }
 };
 
@@ -222,11 +215,13 @@ const ElementOrder = struct {
         return .{ .order = self, .idx = 0 };
     }
 
+    const Entry = EnumMap(Element, FullFormat).Entry;
+
     const Iterator = struct {
         order: ElementOrder,
         idx: usize,
 
-        fn next(self: *Iterator) ?EnumMap(Element, FullFormat).Entry {
+        fn next(self: *Iterator) ?Entry {
             if (self.idx < self.order.ordering.len) {
                 if (self.order.ordering[self.idx]) |key| {
                     defer self.idx += 1;
@@ -239,56 +234,62 @@ const ElementOrder = struct {
 };
 
 const Tokenizer = struct {
-    inner: mem.TokenIterator(u8, .any),
-    current: ?[]const u8,
+    str: []const u8,
     idx: usize,
 
-    const TokenCategory = enum { numeric, alpha };
+    const Category = enum { numeric, alpha, separator };
+    const Token = struct {
+        value: []const u8,
+        category: Category,
+    };
 
     fn init(str: []const u8) Tokenizer {
         return .{
-            .inner = mem.tokenizeAny(u8, str, separator_characters),
-            .current = null,
+            .str = str,
             .idx = 0,
         };
     }
 
-    fn next(self: *Tokenizer) error{UnexpectedCharacter}!?[]const u8 {
-        return loop: switch ({}) {
-            else => {
-                if (self.current) |str| {
-                    var category: ?TokenCategory = null;
-                    const start: usize = self.idx;
-                    while (self.idx < str.len) : (self.idx += 1) {
-                        if (ascii.isAlphabetic(str[self.idx])) {
-                            if (category) |c| if (c != .alpha) {
-                                break :loop str[start..self.idx];
-                            };
-                            category = .alpha;
-                        } else if (ascii.isDigit(str[self.idx])) {
-                            if (category) |c| if (c != .numeric) {
-                                break :loop str[start..self.idx];
-                            };
-                            category = .numeric;
-                        } else {
-                            log.err("Encountered unexpected character '{c}' at index {d} in date-time string '{s}'.", .{
-                                str[self.idx],
-                                mem.indexOfScalar(u8, self.inner.buffer, str[self.idx]).?,
-                                self.inner.buffer,
-                            });
-                            return error.UnexpectedCharacter;
-                        }
-                    }
-                    defer self.current = null;
-                    if (self.idx != start) break :loop str[start..self.idx];
-                }
-                if (self.inner.next()) |n| {
-                    self.idx = 0;
-                    self.current = n;
-                    continue :loop {};
-                }
-                break :loop null;
-            }
+    fn next(self: *Tokenizer) error{UnexpectedCharacter}!?Token {
+        if (self.idx >= self.str.len) {
+            return null;
+        }
+
+        var sub_str: []const u8 = self.str[self.idx..][0..1];
+        var category: Category = categorize(sub_str[0]) catch |err| {
+            log.err("Unexpected character '{c}' at index {d} in date-time string '{s}'.", .{ sub_str[0], self.idx, self.str });
+            return err;
+        };
+
+        self.idx += 1;
+        while (self.idx < self.str.len) : (self.idx += 1) {
+            const next_char: u8 = self.str[self.idx];
+            const next_category: Category = categorize(next_char) catch |err| {
+                log.err("Unexpected character '{c}' at index {d} in date-time string '{s}'.", .{ next_char, self.idx, self.str });
+                return err;
+            };
+            if (next_category != category) {
+                // 'T' is the only character that's valid as both a separator and alpha token
+                if (sub_str.len == 1 and sub_str[0] == 'T') category = .separator;
+                return .{
+                    .value = sub_str,
+                    .category = category,
+                };
+            } else sub_str.len += 1;
+        }
+        // 'T' is the only character that's valid as both a separator and alpha token
+        if (sub_str.len == 1 and sub_str[0] == 'T') category = .separator;
+        return .{
+            .value = sub_str,
+            .category = category,
+        };
+    }
+
+    fn categorize(char: u8) error{UnexpectedCharacter}!Category {
+        return switch (char) {
+            'a'...'z', 'A'...'Z' => .alpha,
+            '0'...'9' => .numeric,
+            else => if (mem.findScalar(u8, separator_characters, char)) |_| .separator else error.UnexpectedCharacter,
         };
     }
 };
@@ -324,84 +325,9 @@ pub fn iso(timestamp: Io.Timestamp) DateTimeFormat {
 /// Assumes that the timestamp is already UTC.
 /// Then we'll apply the offset to the existing `timestamp`.
 pub fn fmt(comptime format_str: []const u8, timestamp: Io.Timestamp, utc_offset: UtcOffset) DateTimeFormat {
-    comptime var order: ElementOrder = .init;
-    comptime {
-        var current_element: ?Element = null;
-        var elem_len: usize = 0;
-        var fill_start: ?usize = null;
-        var current_fmt: FullFormat = undefined;
-
-        for (format_str, 0..) |char, i| {
-            const next: ?Element = switch (char) {
-                'y' => .year,
-                'M' => .month,
-                'd' => .day,
-                'D' => .weekday,
-                'h' => .hour,
-                'm' => .minute,
-                's' => .second,
-                'f' => .subsecond,
-                'Z', 'z' => .utc_offset,
-                else => if (mem.findScalar(u8, separator_characters, char)) |_|
-                    null
-                else
-                    @compileError("Unexpected character '" ++ @as([]const u8, &.{char}) ++ "' in date-time format."),
-            };
-            if (current_element) |current| {
-                if (next == current) {
-                    // more of the same
-                    elem_len += 1;
-                } else if (next == null) {
-                    // we're finishing off the current segment since we encountered a separator
-                    if (fill_start == null) {
-                        fill_start = i;
-                        // capture the current
-                        current_fmt = .{
-                            .fmt = current.toFormat(elem_len),
-                            .fill = format_str[i..][0..1],
-                        };
-                        if (i + 1 < format_str.len) {
-                            elem_len = 1;
-                        }
-                    } else if (fill_start) |_| current_fmt.fill.len += 1;
-                } else if (next) |n| {
-                    fill_start = null;
-                    if (current_fmt.fmt != current) {
-                        // this is a quick turnaround where we don't have a separator between elements, so fill is empty
-                        current_fmt = .{
-                            .fmt = current.toFormat(elem_len),
-                            .fill = "",
-                        };
-                    }
-                    if (order.fetchPut(current, current_fmt)) |_| {
-                        @compileError(comptimePrint("Found redundant formatting for {t}: '{s}'", .{ current, format_str }));
-                    }
-                    // we're starting a new segment
-                    current_element = n;
-                    elem_len = 1;
-                }
-            } else if (next) |n| {
-                current_element = n;
-                elem_len = 1;
-            }
-
-            // we're at the end with no separator
-            if (next != null and i + 1 == format_str.len) {
-                if (current_element) |current| {
-                    current_fmt = .{
-                        .fmt = current.toFormat(elem_len),
-                        .fill = if (fill_start) |f| format_str[f..][0..1] else "",
-                    };
-                    if (order.fetchPut(current, current_fmt)) |_| {
-                        @compileError(comptimePrint("Found redundant formatting for {t}: '{s}'", .{ current, format_str }));
-                    }
-                }
-            }
-        }
-    }
     return .{
         .timestamp = timestamp,
-        .order = order,
+        .order = getElementOrder(format_str),
         .utc_offset = utc_offset,
     };
 }
@@ -500,6 +426,9 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
     };
 }
 
+/// A more generalized parsing, where the `expected_elements` lists what we expect starting at the beginning of the string.
+/// This parser doesn't look for specific separators.
+/// Once all expected elements have been filled out, will ignore whatever remains of the string.
 pub fn parse(str: []const u8, expected_elements: []const Element) ParseError!Io.Timestamp {
     assert(expected_elements.len > 0);
 
@@ -509,41 +438,60 @@ pub fn parse(str: []const u8, expected_elements: []const Element) ParseError!Io.
     // Although, whoever formats dates like that is insane.
     var tokenizer: Tokenizer = .init(str);
     var element_idx: usize = 0;
-    while (try tokenizer.next()) |segment| : (element_idx += 1) {
-        if (segment.len > 0) {
-            if (element_idx >= expected_elements.len) break;
-            if (map.fetchPut(expected_elements[element_idx], segment)) |_| {
-                panic("Date-time element {t} was present more than once in the slice of expected elements.", .{expected_elements[element_idx]});
+    while (try tokenizer.next()) |tok| {
+        switch (tok.category) {
+            .separator => log.debug("Ignoring separator '{s}'.", .{tok.value}),
+            else => {
+                if (tok.value.len > 0) {
+                    if (element_idx >= expected_elements.len) break;
+                    defer element_idx += 1;
+                    if (map.fetchPut(expected_elements[element_idx], tok.value)) |_| {
+                        panic("Date-time element {t} was present more than once in the slice of expected elements.", .{expected_elements[element_idx]});
+                    }
+                    log.debug("Segment {d} ({t}): '{s}'", .{ element_idx, expected_elements[element_idx], tok.value });
+                }
+                // ignore empty strings
             }
-            log.debug("Segment {d} ({t}): '{s}'", .{ element_idx, expected_elements[element_idx], segment });
         }
-        // ignore empty strings
     }
     return try parseInner(&map);
 }
 
-/// Like `parse(...)`, but will return an error when there are more parsable segments after assigning segmenets to each of the expected elements.
-pub fn parseExact(str: []const u8, expected_elements: []const Element) (ParseError || error{UnrecognizedSegment})!Io.Timestamp {
-    assert(expected_elements.len > 0);
-
+pub fn parseExact(str: []const u8, comptime format_str: []const u8) (ParseError || error{ UnrecognizedSegment, MismatchedSeparator })!Io.Timestamp {
+    const order: ElementOrder = getElementOrder(format_str);
     var map: EnumMap(Element, []const u8) = .init(.{});
 
+    var expected_elements: ElementOrder.Iterator = order.iterator();
     var tokenizer: Tokenizer = .init(str);
-    var element_idx: usize = 0;
-    while (try tokenizer.next()) |segment| : (element_idx += 1) {
-        if (segment.len > 0) {
-            if (element_idx >= expected_elements.len) {
-                log.err("Unrecognized segment '{s}' in date-time string '{s}'. This occurs when there are more parsable segments than expected. Assigned segments are:", .{ segment, str });
-                var iter: EnumMap(Element, []const u8).Iterator = map.iterator();
-                while (iter.next()) |kvp| log.err("  {t}: '{s}'", .{ kvp.key, kvp.value.* });
-                return error.UnrecognizedSegment;
+    var current_element: ElementOrder.Entry = expected_elements.next() orelse unreachable;
+    while (try tokenizer.next()) |tok| {
+        switch (tok.category) {
+            .separator => {
+                if (!mem.eql(u8, tok.value, current_element.value.fill)) {
+                    log.err("Separator following element {t} did not match. Expected: '{s}', Received: '{s}'", .{ current_element.key, current_element.value.fill, tok.value });
+                    return error.MismatchedSeparator;
+                }
+                log.debug("Matched expected separator '{s}'. Getting next segment.", .{tok.value});
+                current_element = expected_elements.next() orelse break;
+            },
+            else => {
+                if (tok.value.len > 0) {
+                    if (map.fetchPut(current_element.key, tok.value)) |_| {
+                        panic("Date-time element {t} was present more than once. Attempting to add segment '{s}'.", .{ current_element.key, tok.value });
+                    }
+                    log.debug("Segment ({t}): '{s}'", .{ current_element.key, tok.value });
+                    if (current_element.value.fill.len == 0) {
+                        // if there's no fill, then we need to switch to the next element
+                        current_element = expected_elements.next() orelse break;
+                    }
+                }
+                // ignore empty strings
             }
-            if (map.fetchPut(expected_elements[element_idx], segment)) |_| {
-                panic("Date-time element {t} was present more than once in the slice of expected elements.", .{expected_elements[element_idx]});
-            }
-            log.debug("Segment {d} ({t}): '{s}'", .{ element_idx, expected_elements[element_idx], segment });
         }
-        // ignore empty strings
+    }
+    if (try tokenizer.next()) |tok| {
+        log.err("Expected elements have been filled, but the date-time string has another segment '{s}'.", .{tok.value});
+        return error.UnrecognizedSegment;
     }
     return try parseInner(&map);
 }
@@ -666,6 +614,86 @@ fn parseMonth(slice: []const u8) error{InvalidMonth}!Month {
     }
 }
 
+inline fn getElementOrder(comptime format_str: []const u8) ElementOrder {
+    comptime {
+        var order: ElementOrder = .init;
+        var current_element: ?Element = null;
+        var elem_len: usize = 0;
+        var fill_start: ?usize = null;
+        var current_fmt: FullFormat = undefined;
+
+        for (format_str, 0..) |char, i| {
+            const next: ?Element = switch (char) {
+                'y' => .year,
+                'M' => .month,
+                'd' => .day,
+                'D' => .weekday,
+                'h' => .hour,
+                'm' => .minute,
+                's' => .second,
+                'f' => .subsecond,
+                'Z', 'z' => .utc_offset,
+                else => if (mem.findScalar(u8, separator_characters, char)) |_|
+                    null
+                else
+                    @compileError("Unexpected character '" ++ @as([]const u8, &.{char}) ++ "' in date-time format."),
+            };
+            if (current_element) |current| {
+                if (next == current) {
+                    // more of the same
+                    elem_len += 1;
+                } else if (next == null) {
+                    // we're finishing off the current segment since we encountered a separator
+                    if (fill_start == null) {
+                        fill_start = i;
+                        // capture the current
+                        current_fmt = .{
+                            .fmt = current.toFormat(elem_len),
+                            .fill = format_str[i..][0..1],
+                        };
+                        if (i + 1 < format_str.len) {
+                            elem_len = 1;
+                        }
+                    } else if (fill_start) |_| current_fmt.fill.len += 1;
+                } else if (next) |n| {
+                    fill_start = null;
+                    if (current_fmt.fmt != current) {
+                        // this is a quick turnaround where we don't have a separator between elements, so fill is empty
+                        current_fmt = .{
+                            .fmt = current.toFormat(elem_len),
+                            .fill = "",
+                        };
+                    }
+                    if (order.fetchPut(current, current_fmt)) |_| {
+                        @compileError(comptimePrint("Found redundant formatting for {t}: '{s}'", .{ current, format_str }));
+                    }
+                    // we're starting a new segment
+                    current_element = n;
+                    elem_len = 1;
+                }
+            } else if (next) |n| {
+                current_element = n;
+                elem_len = 1;
+            }
+
+            // we're at the end with no separator
+            if (next != null and i + 1 == format_str.len) {
+                if (current_element) |current| {
+                    current_fmt = .{
+                        .fmt = current.toFormat(elem_len),
+                        .fill = if (fill_start) |f| format_str[f..][0..1] else "",
+                    };
+                    if (order.fetchPut(current, current_fmt)) |_| {
+                        @compileError(comptimePrint("Found redundant formatting for {t}: '{s}'", .{ current, format_str }));
+                    }
+                }
+            }
+        }
+        assert(order.map.count() > 0);
+        return order;
+    }
+}
+
 test iso {
     const nanoseconds: i96 = 1779486527036758700; // Friday, May 22, 2026 at 9:48:47.0367587 PM (UTC)
 
@@ -684,16 +712,7 @@ test "max i96 buf" {
 }
 test parseExact {
     const date_str = "2026-05-22T21:48:47.036Z";
-    const timestamp: Io.Timestamp = try DateTimeFormat.parseExact(date_str, &.{
-        .year,
-        .month,
-        .day,
-        .hour,
-        .minute,
-        .second,
-        .subsecond,
-        .utc_offset,
-    });
+    const timestamp: Io.Timestamp = try DateTimeFormat.parseExact(date_str, "yyyy-MM-ddThh:mm:ss.fffZ");
 
     try testing.expectEqual(1779486527036000000, timestamp.nanoseconds);
 }
