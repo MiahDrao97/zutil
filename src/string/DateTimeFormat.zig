@@ -336,7 +336,7 @@ const Tokenizer = struct {
         }
 
         var sub_str: []const u8 = self.str[self.idx..][0..1];
-        var category: Category = categorize(sub_str[0]) catch |err| {
+        var categories: EnumSet(Category) = categorize(sub_str[0]) catch |err| {
             log.err("Unexpected character '{c}' at index {d} in date-time string '{s}'.", .{ sub_str[0], self.idx, self.str });
             return err;
         };
@@ -344,32 +344,38 @@ const Tokenizer = struct {
         self.idx += 1;
         while (self.idx < self.str.len) : (self.idx += 1) {
             const next_char: u8 = self.str[self.idx];
-            const next_category: Category = categorize(next_char) catch |err| {
+            const next_category_set: EnumSet(Category) = categorize(next_char) catch |err| {
                 log.err("Unexpected character '{c}' at index {d} in date-time string '{s}'.", .{ next_char, self.idx, self.str });
                 return err;
             };
-            if (next_category != category) {
-                // 'T' is the only character that's valid as both a separator and alpha token
-                if (sub_str.len == 1 and sub_str[0] == 'T') category = .separator;
+            if (categories.intersectWith(next_category_set).count() == 0) {
                 return .{
                     .value = sub_str,
-                    .category = category,
+                    .category = if (categories.count() == 1) category: {
+                        var iter: EnumSet(Category).Iterator = categories.iterator();
+                        break :category iter.next().?;
+                    } else .separator,
                 };
-            } else sub_str.len += 1;
+            } else {
+                sub_str.len += 1;
+                categories = categories.intersectWith(next_category_set);
+            }
         }
-        // 'T' is the only character that's valid as both a separator and alpha token
-        if (sub_str.len == 1 and sub_str[0] == 'T') category = .separator;
         return .{
             .value = sub_str,
-            .category = category,
+            .category = if (categories.count() == 1) category: {
+                var iter: EnumSet(Category).Iterator = categories.iterator();
+                break :category iter.next().?;
+            } else .separator,
         };
     }
 
-    fn categorize(char: u8) error{UnexpectedCharacter}!Category {
+    fn categorize(char: u8) error{UnexpectedCharacter}!EnumSet(Category) {
         return switch (char) {
-            'a'...'z', 'A'...'Z' => .alpha,
-            '0'...'9' => .numeric,
-            else => if (mem.findScalar(u8, separator_characters, char)) |_| .separator else error.UnexpectedCharacter,
+            'a'...'z', 'A'...'S', 'U'...'Z' => .initOne(.alpha),
+            'T' => .initMany(&.{ .alpha, .separator }), // 'T' is the only character valid as both a separator and an alpha token
+            '0'...'9' => .initOne(.numeric),
+            else => if (mem.findScalar(u8, separator_characters, char)) |_| .initOne(.separator) else error.UnexpectedCharacter,
         };
     }
 };
@@ -430,7 +436,6 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
     var iter: Formatting.Iterator = self.formatting.iterator();
     while (iter.next()) |x| switch (x.value.fmt) {
         .year => |y| switch (y) {
-            0 => {}, // ignore
             1 => try writer.print("{d}{s}", .{ year_day.year, x.value.fill }),
             2 => try writer.print("{d:0>2}{s}", .{ year_day.year, x.value.fill }),
             3 => try writer.print("{d:0>3}{s}", .{ year_day.year, x.value.fill }),
@@ -479,17 +484,14 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
             },
         },
         .hour => |h| switch (h) {
-            // day index starts at 0
             .natural => try writer.print("{d}{s}", .{ @abs(hour), x.value.fill }),
             .zero_filled => try writer.print("{d:0>2}{s}", .{ @abs(hour), x.value.fill }),
         },
         .minute => |m| switch (m) {
-            // day index starts at 0
             .natural => try writer.print("{d}{s}", .{ @abs(min), x.value.fill }),
             .zero_filled => try writer.print("{d:0>2}{s}", .{ @abs(min), x.value.fill }),
         },
         .second => |s| switch (s) {
-            // day index starts at 0
             .natural => try writer.print("{d}{s}", .{ @abs(sec), x.value.fill }),
             .zero_filled => try writer.print("{d:0>2}{s}", .{ @abs(sec), x.value.fill }),
         },
@@ -781,3 +783,4 @@ const YearAndDay = time.epoch.YearAndDay;
 const MonthAndDay = time.epoch.MonthAndDay;
 const Month = time.epoch.Month;
 const EnumMap = std.EnumMap;
+const EnumSet = std.EnumSet;
