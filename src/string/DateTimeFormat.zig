@@ -354,7 +354,10 @@ const Tokenizer = struct {
                     .category = if (categories.count() == 1) category: {
                         var iter: EnumSet(Category).Iterator = categories.iterator();
                         break :category iter.next().?;
-                    } else .separator,
+                    } else if (categories.contains(.separator))
+                        .separator
+                    else
+                        unreachable,
                 };
             } else {
                 sub_str.len += 1;
@@ -366,7 +369,10 @@ const Tokenizer = struct {
             .category = if (categories.count() == 1) category: {
                 var iter: EnumSet(Category).Iterator = categories.iterator();
                 break :category iter.next().?;
-            } else .separator,
+            } else if (categories.contains(.separator))
+                .separator
+            else
+                unreachable,
         };
     }
 
