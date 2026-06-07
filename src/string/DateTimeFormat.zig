@@ -30,20 +30,80 @@ pub const UtcOffset = packed struct(u8) {
         try writer.print("{d:0>2}:{d:0>2}", .{ self.hours, @as(u16, self.quarter_hours) * 15 });
     }
 
-    pub fn parse(str: []const u8) ?UtcOffset {
-        const trimmed: []const u8 = mem.trim(u8, str, &ascii.whitespace);
-        if (trimmed.len == 1) {
-            return switch (trimmed[0]) {
-                '0'...'9' => |n| .{ .hours = @intCast(n - '0'), .quarter_hours = 0 },
-                'Z' => .utc,
-                else => null,
+    pub fn asDuration(self: UtcOffset) Io.Duration {
+        var ns: i96 = 0;
+        ns += self.hours * time.ns_per_hour;
+        ns += self.quarter_hours * if (self.hours < 0) -1 else 1 * 15 * time.ns_per_min;
+        return .fromNanoseconds(ns);
+    }
+
+    fn parse(tokenizer: *Tokenizer) error{InvalidUtcOffset}!UtcOffset {
+        var offset: UtcOffset = .utc;
+        var next: Tokenizer.Token = tokenizer.expectOneOf(&.{
+            .{ .exactly = "Z" },
+            .{ .exactly = "-" },
+            .{ .exactly = "+" },
+            .{ .category = .numeric },
+        }) catch return error.InvalidUtcOffset;
+
+        var substring: []const u8 = "";
+        switch (next.category) {
+            .alpha => return offset,
+            .numeric => offset.hours = std.fmt.parseInt(i6, next.value, 10) catch return error.InvalidUtcOffset,
+            .separator => substring = next.value,
+        }
+
+        if (substring.len > 0) {
+            next = tokenizer.expectOneOf(&.{.{ .category = .numeric }}) catch return error.InvalidUtcOffset;
+            substring.len += next.value.len;
+            offset.hours = std.fmt.parseInt(i6, substring, 10) catch |err| switch (err) {
+                error.InvalidCharacter => return error.InvalidUtcOffset,
+                error.Overflow => {
+                    // this could be the situation where we're parsing 0000 format (with or without leading sign)
+                    if ((substring[0] == '+' or substring[0] == '-') and substring.len == 5) {
+                        offset.hours = std.fmt.parseInt(i6, substring[0..3], 10) catch return error.InvalidUtcOffset;
+                        const minutes: []const u8 = substring[3..];
+                        assert(minutes.len == 2);
+                        if (parseMinutes(minutes)) |m| {
+                            offset.quarter_hours = m;
+                            return offset;
+                        }
+                    } else if (substring.len == 4) {
+                        offset.hours = std.fmt.parseInt(i6, substring[0..2], 10) catch return error.InvalidUtcOffset;
+                        const minutes: []const u8 = substring[2..];
+                        assert(minutes.len == 2);
+                        if (parseMinutes(minutes)) |m| {
+                            offset.quarter_hours = m;
+                            return offset;
+                        }
+                    }
+                    return error.InvalidUtcOffset;
+                }
             };
         }
-        if (trimmed.len > 1) {
-            // TODO :
-            _ = std.fmt.parseInt(i6, trimmed, 10) catch return null;
-        }
-        return null;
+
+        // now we have hours, so whatever we can't parse must simply be the end of this date-time element
+        if (tokenizer.expectOneOf(&.{.{ .exactly = ":" }})) |colon| {
+            if (tokenizer.expectOneOf(&.{.{ .category = .numeric }})) |minutes| {
+                if (parseMinutes(minutes.value)) |m| {
+                    offset.quarter_hours = m;
+                } else {
+                    tokenizer.rollback(minutes);
+                    tokenizer.rollback(colon);
+                }
+            } else |_| tokenizer.rollback(colon);
+        } else |_| {}
+        return offset;
+    }
+
+    fn parseMinutes(slice: []const u8) ?u2 {
+        const MinuteSlice = enum(u2) {
+            @"00" = 0,
+            @"15" = 1,
+            @"30" = 2,
+            @"45" = 3,
+        };
+        return if (std.meta.stringToEnum(MinuteSlice, slice)) |m| @intFromEnum(m) else null;
     }
 };
 
@@ -376,6 +436,27 @@ const Tokenizer = struct {
         };
     }
 
+    /// Expect a token in a category or a specific string.
+    /// If not matched, then the tokenizer will roll back.
+    fn expectOneOf(
+        self: *Tokenizer,
+        possible: []const union(enum) { category: Category, exactly: []const u8 },
+    ) error{ NoMatch, UnexpectedCharacter, EndOfIteration }!Token {
+        if (try self.next()) |n| {
+            errdefer self.idx -= n.value.len;
+            for (possible) |p| switch (p) {
+                .category => |c| if (c == n.category) return n,
+                .exactly => |e| if (mem.eql(u8, e, mem.trim(u8, n.value, &ascii.whitespace))) return n,
+            };
+            return error.NoMatch;
+        }
+        return error.EndOfIteration;
+    }
+
+    fn rollback(self: *Tokenizer, tok: Token) void {
+        self.idx -= tok.value.len;
+    }
+
     fn categorize(char: u8) error{UnexpectedCharacter}!EnumSet(Category) {
         return switch (char) {
             'a'...'z', 'A'...'S', 'U'...'Z' => .initOne(.alpha),
@@ -392,7 +473,7 @@ const separator_characters: []const u8 = &.{ ' ', '/', '-', '+', '_', '.', ',', 
 const log = if (@import("builtin").is_test) struct {
     fn debug(comptime fmt_str: []const u8, args: anytype) void {
         if (testing.log_level == .debug) {
-            std.debug.print(fmt_str ++ @as([]const u8, &.{'\n'}), args);
+            std.debug.print(fmt_str ++ "\n", args);
         } else {
             var null_writer: Io.Writer.Discarding = .init(&.{});
             null_writer.writer.print(fmt_str, args) catch {};
@@ -521,6 +602,7 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
 pub fn parse(str: []const u8, expected_elements: []const Element) ParseError!DateTimeFormat {
     assert(expected_elements.len > 0);
 
+    var utc_offset: UtcOffset = .utc;
     var map: EnumMap(Element, []const u8) = .init(.{});
     var tokenizer: Tokenizer = .init(mem.trim(u8, str, &ascii.whitespace));
     var element_idx: usize = 0;
@@ -531,7 +613,10 @@ pub fn parse(str: []const u8, expected_elements: []const Element) ParseError!Dat
                 if (tok.value.len > 0) {
                     if (element_idx >= expected_elements.len) break;
                     defer element_idx += 1;
-                    if (map.fetchPut(expected_elements[element_idx], tok.value)) |_| {
+                    if (expected_elements[element_idx] == .utc_offset) {
+                        tokenizer.rollback(tok); // roll back this token
+                        utc_offset = try .parse(&tokenizer);
+                    } else if (map.fetchPut(expected_elements[element_idx], tok.value)) |_| {
                         panic("Date-time element {t} was present more than once in the slice of expected elements.", .{expected_elements[element_idx]});
                     }
                     log.debug("Segment {d} ({t}): '{s}'", .{ element_idx, expected_elements[element_idx], tok.value });
@@ -540,7 +625,7 @@ pub fn parse(str: []const u8, expected_elements: []const Element) ParseError!Dat
             }
         }
     }
-    const timestamp: Io.Timestamp, const utc_offset: UtcOffset = try parseInner(&map);
+    const timestamp: Io.Timestamp = try parseInner(&map);
     return .{
         .timestamp = timestamp,
         .formatting = .init,
@@ -554,6 +639,7 @@ pub fn parseExact(str: []const u8, comptime format_str: []const u8) (ParseError 
     const formatting: Formatting = .fromFormatString(format_str);
     var map: EnumMap(Element, []const u8) = .init(.{});
 
+    var utc_offset: UtcOffset = .utc;
     var expected_elements: Formatting.Iterator = formatting.iterator();
     var tokenizer: Tokenizer = .init(mem.trim(u8, str, &ascii.whitespace));
     var current_element: Formatting.Entry = expected_elements.next() orelse unreachable;
@@ -569,13 +655,18 @@ pub fn parseExact(str: []const u8, comptime format_str: []const u8) (ParseError 
             },
             else => {
                 if (tok.value.len > 0) {
-                    if (map.fetchPut(current_element.key, tok.value)) |_| {
-                        panic("Date-time element {t} was present more than once. Attempting to add segment '{s}'.", .{ current_element.key, tok.value });
-                    }
-                    log.debug("Segment ({t}): '{s}'", .{ current_element.key, tok.value });
-                    if (current_element.value.fill.len == 0) {
-                        // if there's no fill, then we need to switch to the next element
-                        current_element = expected_elements.next() orelse break;
+                    if (current_element.key == .utc_offset) {
+                        tokenizer.rollback(tok);
+                        utc_offset = try .parse(&tokenizer);
+                    } else {
+                        if (map.fetchPut(current_element.key, tok.value)) |_| {
+                            panic("Date-time element {t} was present more than once. Attempting to add segment '{s}'.", .{ current_element.key, tok.value });
+                        }
+                        log.debug("Segment ({t}): '{s}'", .{ current_element.key, tok.value });
+                        if (current_element.value.fill.len == 0) {
+                            // if there's no fill, then we need to switch to the next element
+                            current_element = expected_elements.next() orelse break;
+                        }
                     }
                 }
                 // ignore empty strings
@@ -586,7 +677,7 @@ pub fn parseExact(str: []const u8, comptime format_str: []const u8) (ParseError 
         log.err("Expected elements have been filled, but the date-time string has another segment '{s}'.", .{tok.value});
         return error.UnrecognizedSegment;
     }
-    const timestamp: Io.Timestamp, const utc_offset: UtcOffset = try parseInner(&map);
+    const timestamp: Io.Timestamp = try parseInner(&map);
     return .{
         .timestamp = timestamp,
         .formatting = formatting,
@@ -594,10 +685,9 @@ pub fn parseExact(str: []const u8, comptime format_str: []const u8) (ParseError 
     };
 }
 
-fn parseInner(map: *EnumMap(Element, []const u8)) ParseError!@Tuple(&.{ Io.Timestamp, UtcOffset }) {
+fn parseInner(map: *EnumMap(Element, []const u8)) ParseError!Io.Timestamp {
     var nanoseconds: i96 = 0;
     var iter: EnumMap(Element, []const u8).Iterator = map.iterator();
-    var utc_offset: UtcOffset = .utc;
     while (iter.next()) |kvp| switch (kvp.key) {
         .year => {
             const year: u16 = parseUnsigned(u16, kvp.value.*, 10) catch return error.InvalidYear;
@@ -657,14 +747,10 @@ fn parseInner(map: *EnumMap(Element, []const u8)) ParseError!@Tuple(&.{ Io.Times
             const subseconds: u64 = std.math.pow(u64, 10, power) * (parseUnsigned(u64, kvp.value.*, 10) catch return error.InvalidSubsecond);
             nanoseconds += subseconds;
         },
-        .utc_offset => {
-            utc_offset = UtcOffset.parse(kvp.value.*) orelse return error.InvalidUtcOffset;
-            nanoseconds += (@as(i96, utc_offset.hours) * time.ns_per_hour);
-            nanoseconds += (@as(i96, @intCast(utc_offset.quarter_hours)) * @as(i96, if (utc_offset.hours < 0) -1 else 1) * 15 * time.ns_per_min);
-        }
+        .utc_offset => unreachable,
     };
 
-    return .{ .fromNanoseconds(nanoseconds), utc_offset };
+    return .fromNanoseconds(nanoseconds);
 }
 
 fn parseMonth(slice: []const u8) error{InvalidMonth}!Month {
