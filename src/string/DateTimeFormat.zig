@@ -262,7 +262,7 @@ pub const Formatting = struct {
         .ordering = @splat(null),
     };
 
-    pub inline fn fromFormatString(comptime format_str: []const u8) Formatting {
+    pub inline fn fmtStr(comptime format_str: []const u8) Formatting {
         comptime {
             var formatting: Formatting = .init;
             var current_element: ?Element = null;
@@ -443,7 +443,7 @@ const Tokenizer = struct {
         possible: []const union(enum) { category: Category, exactly: []const u8 },
     ) error{ NoMatch, UnexpectedCharacter, EndOfIteration }!Token {
         if (try self.next()) |n| {
-            errdefer self.idx -= n.value.len;
+            errdefer self.rollback(n);
             for (possible) |p| switch (p) {
                 .category => |c| if (c == n.category) return n,
                 .exactly => |e| if (mem.eql(u8, e, mem.trim(u8, n.value, &ascii.whitespace))) return n,
@@ -500,12 +500,14 @@ pub fn iso(timestamp: Io.Timestamp) DateTimeFormat {
 pub fn fmt(comptime format_str: []const u8, timestamp: Io.Timestamp, utc_offset: UtcOffset) DateTimeFormat {
     return .{
         .timestamp = timestamp,
-        .formatting = .fromFormatString(format_str),
+        .formatting = .fmtStr(format_str),
         .utc_offset = utc_offset,
     };
 }
 
 pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
+    assert(self.formatting.map.count() > 0); // flag this: this is a dev mistake
+
     const ms_now: i64 = self.timestamp.toMilliseconds();
     const sec_now: i64 = @divTrunc(ms_now, 1000);
     const minutes_now: i64 = @divTrunc(sec_now, 60);
@@ -636,7 +638,7 @@ pub fn parse(str: []const u8, expected_elements: []const Element) ParseError!Dat
 /// Parse an exactly-formatted date-time string.
 /// NOTE: Assumes UTC by default
 pub fn parseExact(str: []const u8, comptime format_str: []const u8) (ParseError || error{ UnrecognizedSegment, MismatchedSeparator })!DateTimeFormat {
-    const formatting: Formatting = .fromFormatString(format_str);
+    const formatting: Formatting = .fmtStr(format_str);
     var map: EnumMap(Element, []const u8) = .init(.{});
 
     var utc_offset: UtcOffset = .utc;
@@ -820,6 +822,7 @@ test parseExact {
     const date_time: DateTimeFormat = try .parseExact(date_str, "yyyy-MM-ddThh:mm:ss.fffZ");
 
     try testing.expectEqual(1779486527036000000, date_time.timestamp.nanoseconds);
+    try testing.expect(date_time.formatting.map.contains(.utc_offset));
 }
 test parse {
     const date_str = "2026-05-22T21:48:47.036Z";
@@ -833,7 +836,7 @@ test parse {
     var stream: Io.Writer.Allocating = .init(testing.allocator);
     defer stream.deinit();
 
-    date_time.formatting = .fromFormatString("MM/dd/yyyy");
+    date_time.formatting = .fmtStr("MM/dd/yyyy");
     try stream.writer.print("{f}", .{date_time});
     try testing.expectEqualStrings("05/22/2026", stream.written());
 
@@ -843,7 +846,7 @@ test parse {
     date_time = try .parse("21:48:47.036", &.{ .hour, .minute, .second, .subsecond });
     try testing.expectEqual(78527036000000, date_time.timestamp.nanoseconds);
 
-    date_time.formatting = .fromFormatString("hh:mm:ss.fff");
+    date_time.formatting = .fmtStr("hh:mm:ss.fff");
     try stream.writer.print("{f}", .{date_time});
     try testing.expectEqualStrings("21:48:47.036", stream.written());
 }
