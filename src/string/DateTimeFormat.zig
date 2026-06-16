@@ -18,18 +18,6 @@ pub const UtcOffset = packed struct(u8) {
     /// Zero-offset (aka UTC time)
     pub const utc: UtcOffset = .{ .hours = 0, .quarter_hours = 0 };
 
-    pub fn format(self: UtcOffset, writer: *Io.Writer) Io.Writer.Error!void {
-        // TODO : This was the easy way, but I think we should allow more formats such as:
-        // +00:00
-        // +0
-        // 0200
-        if (self == utc) {
-            try writer.writeByte('Z');
-            return;
-        }
-        try writer.print("{d:0>2}:{d:0>2}", .{ self.hours, @as(u16, self.quarter_hours) * 15 });
-    }
-
     pub fn asDuration(self: UtcOffset) Io.Duration {
         var ns: i96 = 0;
         ns += self.hours * time.ns_per_hour;
@@ -121,6 +109,12 @@ pub const ParseError = error{
     InvalidUtcOffset,
     MissingYear,
     MissingMonth,
+};
+
+/// Various parse errors that could be returned from `parseExact(...)`
+pub const ParseExactError = ParseError || error{
+    UnrecognizedSegment,
+    MismatchedSeparator,
 };
 
 pub const WeekDay = enum(u4) {
@@ -351,6 +345,10 @@ pub const Formatting = struct {
         return null;
     }
 
+    pub fn count(self: Formatting) usize {
+        return self.map.count();
+    }
+
     pub fn iterator(self: Formatting) Iterator {
         return .{ .order = self, .idx = 0 };
     }
@@ -442,11 +440,11 @@ const Tokenizer = struct {
         self: *Tokenizer,
         possible: []const union(enum) { category: Category, exactly: []const u8 },
     ) error{ NoMatch, UnexpectedCharacter, EndOfIteration }!Token {
-        if (try self.next()) |n| {
-            errdefer self.rollback(n);
+        if (try self.next()) |tok| {
+            errdefer self.rollback(tok);
             for (possible) |p| switch (p) {
-                .category => |c| if (c == n.category) return n,
-                .exactly => |e| if (mem.eql(u8, e, mem.trim(u8, n.value, &ascii.whitespace))) return n,
+                .category => |c| if (c == tok.category) return tok,
+                .exactly => |e| if (mem.eql(u8, e, mem.trim(u8, tok.value, &ascii.whitespace))) return tok,
             };
             return error.NoMatch;
         }
@@ -470,6 +468,8 @@ const Tokenizer = struct {
 /// Expected/allowed separator characters between the various elements.
 const separator_characters: []const u8 = &.{ ' ', '/', '-', '+', '_', '.', ',', ':', 'T' };
 
+pub const iso_format: []const u8 = "yyyy-MM-ddThh:mm:ss.fffZ";
+
 const log = if (@import("builtin").is_test) struct {
     fn debug(comptime fmt_str: []const u8, args: anytype) void {
         if (testing.log_level == .debug) {
@@ -492,7 +492,7 @@ const log = if (@import("builtin").is_test) struct {
 
 /// Format like `yyyy-MM-ddThh:mm:ss.fffZ`
 pub fn iso(timestamp: Io.Timestamp) DateTimeFormat {
-    return .fmt("yyyy-MM-ddThh:mm:ss.fffZ", timestamp, .utc);
+    return .fmt(iso_format, timestamp, .utc);
 }
 
 /// Assumes that the timestamp is already UTC.
@@ -522,7 +522,11 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
     const year_day: YearAndDay = epoch_day.calculateYearDay();
     const month_day: MonthAndDay = year_day.calculateMonthDay();
 
-    var iter: Formatting.Iterator = self.formatting.iterator();
+    var formatting: Formatting = self.formatting;
+    if (formatting.count() == 0) {
+        formatting = .fmtStr(iso_format);
+    }
+    var iter: Formatting.Iterator = formatting.iterator();
     while (iter.next()) |x| switch (x.value.fmt) {
         .year => |y| switch (y) {
             1 => try writer.print("{d}{s}", .{ year_day.year, x.value.fill }),
@@ -593,7 +597,14 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
 
             try writer.print("{s}{s}", .{ subseconds[0..places], x.value.fill });
         },
-        .utc_offset => try writer.print("{f}", .{self.utc_offset}),
+        .utc_offset => {
+            // TODO : more formats
+            if (self.utc_offset == UtcOffset.utc) {
+                try writer.writeByte('Z');
+            } else {
+                try writer.print("{d:0>2}:{d:0>2}", .{ self.utc_offset.hours, @as(u16, self.utc_offset.quarter_hours) * 15 });
+            }
+        },
     };
 }
 
@@ -637,7 +648,7 @@ pub fn parse(str: []const u8, expected_elements: []const Element) ParseError!Dat
 
 /// Parse an exactly-formatted date-time string.
 /// NOTE: Assumes UTC by default
-pub fn parseExact(str: []const u8, comptime format_str: []const u8) (ParseError || error{ UnrecognizedSegment, MismatchedSeparator })!DateTimeFormat {
+pub fn parseExact(str: []const u8, comptime format_str: []const u8) ParseExactError!DateTimeFormat {
     const formatting: Formatting = .fmtStr(format_str);
     var map: EnumMap(Element, []const u8) = .init(.{});
 
@@ -819,7 +830,7 @@ test "max i96 buf" {
 }
 test parseExact {
     const date_str = "2026-05-22T21:48:47.036Z";
-    const date_time: DateTimeFormat = try .parseExact(date_str, "yyyy-MM-ddThh:mm:ss.fffZ");
+    const date_time: DateTimeFormat = try .parseExact(date_str, iso_format);
 
     try testing.expectEqual(1779486527036000000, date_time.timestamp.nanoseconds);
     try testing.expect(date_time.formatting.map.contains(.utc_offset));
