@@ -93,78 +93,85 @@ pub fn Managed(comptime T: type) type {
 
 /// Intern segments of `[]const u8` for better memory storage.
 /// Note that this structure is expected only to grow.
-pub const InternedByteArray = struct {
-    inner: ArrayList(u8),
-    segment_count: u32,
+pub const InternedByteArray = InternedByteArrayAligned(null);
 
-    pub const Index = enum(u32) { _ };
+/// Align the bytes, if desired
+pub fn InternedByteArrayAligned(comptime alignment: ?std.mem.Alignment) type {
+    return struct {
+        inner: ArrayListAligned(u8, alignment),
+        segment_count: u32,
 
-    pub const empty: InternedByteArray = .{ .inner = .empty, .segment_count = 0 };
+        const Self = @This();
 
-    pub fn deinit(self: *InternedByteArray, gpa: Allocator) void {
-        self.inner.deinit(gpa);
-        self.* = undefined;
-    }
+        pub const Index = enum(u32) { _ };
 
-    /// Intern a segment at the end of the byte array
-    pub fn append(self: *InternedByteArray, gpa: Allocator, str: []const u8) Allocator.Error!Index {
-        const offset: Index = @enumFromInt(self.inner.items.len);
-        try self.inner.appendSlice(gpa, str);
-        try self.inner.append(gpa, 0);
-        self.segment_count += 1;
-        return offset;
-    }
+        pub const empty: Self = .{ .inner = .empty, .segment_count = 0 };
 
-    /// Get a segment. Note that if more segments are appended, that may invalid the returned pointer.
-    pub fn get(self: *const InternedByteArray, index: Index) []const u8 {
-        return mem.sliceTo(self.inner.items[@intFromEnum(index)..], 0);
-    }
-
-    pub fn iterator(self: *const InternedByteArray) Iterator {
-        return .{ .offset = 0, .byte_array = self };
-    }
-
-    pub const Iterator = struct {
-        offset: u32,
-        byte_array: *const InternedByteArray,
-
-        pub fn next(self: *Iterator) ?[]const u8 {
-            var result: ?[]const u8 = null;
-            if (self.offset < self.byte_array.inner.items.len) {
-                result = mem.sliceTo(self.byte_array.inner.items[self.offset..], 0);
-                self.offset += @intCast(result.?.len + 1); // add 1 to include the sentinel value
-            }
-            return result;
+        pub fn deinit(self: *Self, gpa: Allocator) void {
+            self.inner.deinit(gpa);
+            self.* = undefined;
         }
+
+        /// Intern a segment at the end of the byte array
+        pub fn append(self: *Self, gpa: Allocator, str: []const u8) Allocator.Error!Index {
+            const offset: Index = @enumFromInt(self.inner.items.len);
+            try self.inner.appendSlice(gpa, str);
+            try self.inner.append(gpa, 0);
+            self.segment_count += 1;
+            return offset;
+        }
+
+        /// Get a segment. Note that if more segments are appended, that may invalid the returned pointer.
+        pub fn get(self: *const Self, index: Index) []const u8 {
+            return mem.sliceTo(self.inner.items[@intFromEnum(index)..], 0);
+        }
+
+        pub fn iterator(self: *const Self) Iterator {
+            return .{ .offset = 0, .byte_array = self };
+        }
+
+        pub const Iterator = struct {
+            offset: u32,
+            byte_array: *const Self,
+
+            pub fn next(self: *Iterator) ?[]const u8 {
+                var result: ?[]const u8 = null;
+                if (self.offset < self.byte_array.inner.items.len) {
+                    result = mem.sliceTo(self.byte_array.inner.items[self.offset..], 0);
+                    self.offset += @intCast(result.?.len + 1); // add 1 to include the sentinel value
+                }
+                return result;
+            }
+        };
     };
+}
 
-    test InternedByteArray {
-        var byte_array: InternedByteArray = .empty;
-        defer byte_array.deinit(testing.allocator);
+test InternedByteArrayAligned {
+    var byte_array: InternedByteArray = .empty;
+    defer byte_array.deinit(testing.allocator);
 
-        errdefer std.debug.print("Bytes: {s}\n    {x}\n", .{ byte_array.inner.items, byte_array.inner.items });
+    errdefer std.debug.print("Bytes: {s}\n    {x}\n", .{ byte_array.inner.items, byte_array.inner.items });
 
-        var idx: Index = try byte_array.append(testing.allocator, "hi");
-        try testing.expectEqual(0, @intFromEnum(idx));
-        idx = try byte_array.append(testing.allocator, "hello");
-        try testing.expectEqual(3, @intFromEnum(idx));
+    var idx: InternedByteArray.Index = try byte_array.append(testing.allocator, "hi");
+    try testing.expectEqual(0, @intFromEnum(idx));
+    idx = try byte_array.append(testing.allocator, "hello");
+    try testing.expectEqual(3, @intFromEnum(idx));
 
-        try testing.expectEqual(2, byte_array.segment_count);
+    try testing.expectEqual(2, byte_array.segment_count);
 
-        const hello: []const u8 = byte_array.get(idx);
-        try testing.expectEqualStrings("hello", hello);
+    const hello: []const u8 = byte_array.get(idx);
+    try testing.expectEqualStrings("hello", hello);
 
-        idx = try byte_array.append(testing.allocator, "");
-        try testing.expectEqual(9, @intFromEnum(idx));
-        try testing.expectEqual(3, byte_array.segment_count);
+    idx = try byte_array.append(testing.allocator, "");
+    try testing.expectEqual(9, @intFromEnum(idx));
+    try testing.expectEqual(3, byte_array.segment_count);
 
-        var iter: Iterator = byte_array.iterator();
-        try testing.expectEqualStrings("hi", iter.next().?);
-        try testing.expectEqualStrings("hello", iter.next().?);
-        try testing.expectEqualStrings("", iter.next().?);
-        try testing.expectEqual(null, iter.next());
-    }
-};
+    var iter: InternedByteArray.Iterator = byte_array.iterator();
+    try testing.expectEqualStrings("hi", iter.next().?);
+    try testing.expectEqualStrings("hello", iter.next().?);
+    try testing.expectEqualStrings("", iter.next().?);
+    try testing.expectEqual(null, iter.next());
+}
 
 comptime {
     _ = string.Casing;
@@ -184,3 +191,4 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const ArrayList = std.ArrayList;
+const ArrayListAligned = std.array_list.Aligned;
