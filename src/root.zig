@@ -93,10 +93,10 @@ pub fn Managed(comptime T: type) type {
 
 /// Intern segments of `[]const u8` for better memory storage.
 /// Note that this structure is expected only to grow.
-pub const InternedByteArray = InternedByteArrayAligned(null);
+pub const InternedByteArray = InternedByteArrayAligned(.@"1");
 
 /// Align the bytes, if desired
-pub fn InternedByteArrayAligned(comptime alignment: ?std.mem.Alignment) type {
+pub fn InternedByteArrayAligned(comptime alignment: std.mem.Alignment) type {
     return struct {
         inner: ArrayListAligned(u8, alignment),
         segment_count: u32,
