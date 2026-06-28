@@ -114,7 +114,7 @@ pub fn InternedByteArrayAligned(comptime alignment: std.mem.Alignment) type {
         }
 
         /// Intern a segment at the end of the byte array.
-        /// If the alignment of this byte array is greater than 1, then this interned string will start at the next aligned offset.
+        /// Each segment is aligned, and padding will prepend any segment if needed.
         pub fn append(self: *Self, gpa: Allocator, str: []const u8) Allocator.Error!Index {
             const next: usize = self.inner.items.len;
             const offset: Index = if (alignment.check(next))
@@ -154,8 +154,7 @@ pub fn InternedByteArrayAligned(comptime alignment: std.mem.Alignment) type {
                     self.offset += @intCast(result.?.len + 1); // add 1 to include the sentinel value
                     // alignment check...
                     if (!alignment.check(self.offset)) {
-                        const diff: usize = alignment.forward(self.offset) - self.offset;
-                        self.offset += @intCast(diff);
+                        self.offset = @intCast(alignment.forward(self.offset));
                     }
                 }
                 return result;
