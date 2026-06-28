@@ -114,7 +114,15 @@ pub fn InternedByteArrayAligned(comptime alignment: std.mem.Alignment) type {
 
         /// Intern a segment at the end of the byte array
         pub fn append(self: *Self, gpa: Allocator, str: []const u8) Allocator.Error!Index {
-            const offset: Index = @enumFromInt(self.inner.items.len);
+            const next: usize = self.inner.items.len;
+            const offset: Index = if (alignment.check(next))
+                @enumFromInt(next)
+            else unaligned: {
+                const diff: usize = alignment.forward(next) - next;
+                try self.inner.appendNTimes(gpa, 0, diff);
+                break :unaligned @enumFromInt(self.inner.items.len);
+            };
+            std.debug.assert(alignment.check(@intFromEnum(offset)));
             try self.inner.appendSlice(gpa, str);
             try self.inner.append(gpa, 0);
             self.segment_count += 1;
@@ -122,8 +130,8 @@ pub fn InternedByteArrayAligned(comptime alignment: std.mem.Alignment) type {
         }
 
         /// Get a segment. Note that if more segments are appended, that may invalid the returned pointer.
-        pub fn get(self: *const Self, index: Index) []const u8 {
-            return mem.sliceTo(self.inner.items[@intFromEnum(index)..], 0);
+        pub fn get(self: *const Self, index: Index) []align(alignment.toByteUnits()) const u8 {
+            return @alignCast(mem.sliceTo(self.inner.items[@intFromEnum(index)..], 0));
         }
 
         pub fn iterator(self: *const Self) Iterator {
@@ -134,11 +142,22 @@ pub fn InternedByteArrayAligned(comptime alignment: std.mem.Alignment) type {
             offset: u32,
             byte_array: *const Self,
 
-            pub fn next(self: *Iterator) ?[]const u8 {
-                var result: ?[]const u8 = null;
+            pub fn next(self: *Iterator) ?[]align(alignment.toByteUnits()) const u8 {
+                var result: ?[]align(alignment.toByteUnits()) const u8 = null;
                 if (self.offset < self.byte_array.inner.items.len) {
-                    result = mem.sliceTo(self.byte_array.inner.items[self.offset..], 0);
+                    result = @alignCast(mem.sliceTo(self.byte_array.inner.items[self.offset..], 0));
                     self.offset += @intCast(result.?.len + 1); // add 1 to include the sentinel value
+                    // alignment check...
+                    if (self.offset < self.byte_array.inner.items.len) {
+                        const next_addr: usize = @intFromPtr(&self.byte_array.inner.items[self.offset]);
+                        if (!alignment.check(next_addr)) {
+                            const diff: usize = alignment.forward(next_addr) - next_addr;
+                            self.offset += @intCast(diff);
+                            if (self.offset < self.byte_array.inner.items.len) {
+                                std.debug.assert(alignment.check(self.offset));
+                            }
+                        }
+                    }
                 }
                 return result;
             }
@@ -146,7 +165,7 @@ pub fn InternedByteArrayAligned(comptime alignment: std.mem.Alignment) type {
     };
 }
 
-test InternedByteArrayAligned {
+test InternedByteArray {
     var byte_array: InternedByteArray = .empty;
     defer byte_array.deinit(testing.allocator);
 
@@ -169,6 +188,26 @@ test InternedByteArrayAligned {
     var iter: InternedByteArray.Iterator = byte_array.iterator();
     try testing.expectEqualStrings("hi", iter.next().?);
     try testing.expectEqualStrings("hello", iter.next().?);
+    try testing.expectEqualStrings("", iter.next().?);
+    try testing.expectEqual(null, iter.next());
+}
+test InternedByteArrayAligned {
+    const Aligned = InternedByteArrayAligned(.@"4");
+    var byte_array: Aligned = .empty;
+    defer byte_array.deinit(testing.allocator);
+
+    errdefer std.debug.print("Bytes: {s}\n    {x}\n", .{ byte_array.inner.items, byte_array.inner.items });
+
+    var idx: Aligned.Index = try byte_array.append(testing.allocator, "hello");
+    try testing.expectEqual(0, @intFromEnum(idx));
+    idx = try byte_array.append(testing.allocator, "hi");
+    try testing.expectEqual(8, @intFromEnum(idx));
+    idx = try byte_array.append(testing.allocator, "");
+    try testing.expectEqual(12, @intFromEnum(idx));
+
+    var iter: Aligned.Iterator = byte_array.iterator();
+    try testing.expectEqualStrings("hello", iter.next().?);
+    try testing.expectEqualStrings("hi", iter.next().?);
     try testing.expectEqualStrings("", iter.next().?);
     try testing.expectEqual(null, iter.next());
 }
