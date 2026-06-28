@@ -95,7 +95,8 @@ pub fn Managed(comptime T: type) type {
 /// Note that this structure is expected only to grow.
 pub const InternedByteArray = InternedByteArrayAligned(.@"1");
 
-/// Align the bytes, if desired
+/// Align the bytes, if desired.
+/// Each segment will be aligned, according to whichever alignment you specify.
 pub fn InternedByteArrayAligned(comptime alignment: std.mem.Alignment) type {
     return struct {
         inner: ArrayListAligned(u8, alignment),
@@ -112,7 +113,8 @@ pub fn InternedByteArrayAligned(comptime alignment: std.mem.Alignment) type {
             self.* = undefined;
         }
 
-        /// Intern a segment at the end of the byte array
+        /// Intern a segment at the end of the byte array.
+        /// If the alignment of this byte array is greater than 1, then this interned string will start at the next aligned offset.
         pub fn append(self: *Self, gpa: Allocator, str: []const u8) Allocator.Error!Index {
             const next: usize = self.inner.items.len;
             const offset: Index = if (alignment.check(next))
@@ -129,7 +131,9 @@ pub fn InternedByteArrayAligned(comptime alignment: std.mem.Alignment) type {
             return offset;
         }
 
-        /// Get a segment. Note that if more segments are appended, that may invalid the returned pointer.
+        /// Get a segment.
+        /// Each segment is aligned.
+        /// Note that if more segments are appended, that may invalidate the returned pointer.
         pub fn get(self: *const Self, index: Index) []align(alignment.toByteUnits()) const u8 {
             return @alignCast(mem.sliceTo(self.inner.items[@intFromEnum(index)..], 0));
         }
@@ -145,18 +149,13 @@ pub fn InternedByteArrayAligned(comptime alignment: std.mem.Alignment) type {
             pub fn next(self: *Iterator) ?[]align(alignment.toByteUnits()) const u8 {
                 var result: ?[]align(alignment.toByteUnits()) const u8 = null;
                 if (self.offset < self.byte_array.inner.items.len) {
+                    std.debug.assert(alignment.check(self.offset));
                     result = @alignCast(mem.sliceTo(self.byte_array.inner.items[self.offset..], 0));
                     self.offset += @intCast(result.?.len + 1); // add 1 to include the sentinel value
                     // alignment check...
-                    if (self.offset < self.byte_array.inner.items.len) {
-                        const next_addr: usize = @intFromPtr(&self.byte_array.inner.items[self.offset]);
-                        if (!alignment.check(next_addr)) {
-                            const diff: usize = alignment.forward(next_addr) - next_addr;
-                            self.offset += @intCast(diff);
-                            if (self.offset < self.byte_array.inner.items.len) {
-                                std.debug.assert(alignment.check(self.offset));
-                            }
-                        }
+                    if (!alignment.check(self.offset)) {
+                        const diff: usize = alignment.forward(self.offset) - self.offset;
+                        self.offset += @intCast(diff);
                     }
                 }
                 return result;
