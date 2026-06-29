@@ -495,7 +495,7 @@ const log = if (@import("builtin").is_test) struct {
 
     fn err(comptime fmt_str: []const u8, args: anytype) void {
         if (testing.log_level == .debug) {
-            std.debug.print(fmt_str ++ @as([]const u8, &.{'\n'}), args);
+            std.debug.print(fmt_str ++ "\n", args);
         } else {
             var null_writer: Io.Writer.Discarding = .init(&.{});
             null_writer.writer.print(fmt_str, args) catch {};
