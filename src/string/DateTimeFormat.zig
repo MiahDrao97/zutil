@@ -165,7 +165,11 @@ pub const Element = enum {
     /// UTC offset
     utc_offset,
 
-    fn toFormat(self: Element, elem_len: comptime_int) ElementFormat {
+    fn toFormat(self: Element, char: u8, elem_len: comptime_int) ElementFormat {
+        // cap Z is shorthand for ISO-formatted UTC offset
+        if (char == 'Z') {
+            return .{ .utc_offset = .iso };
+        }
         return switch (self) {
             .year => if (elem_len <= 5)
                 .{ .year = elem_len }
@@ -216,7 +220,16 @@ pub const Element = enum {
                 },
             },
             .subsecond => .{ .subsecond = elem_len },
-            .utc_offset => .utc_offset,
+            .utc_offset => .{
+                .utc_offset = switch (elem_len) {
+                    0 => .iso,
+                    1 => .hours_only,
+                    2 => .hours_only_zero_filled,
+                    3 => .hours_and_minutes,
+                    4 => .iso,
+                    else => @compileError(comptimePrint("Invalid utc offset format '{s}'", .{&@as([elem_len]u8, @splat('z'))})),
+                },
+            },
         };
     }
 };
@@ -239,7 +252,7 @@ pub const ElementFormat = union(Element) {
     /// Number of places to show
     subsecond: u3,
     /// UTC offset format, whether or not to include
-    utc_offset,
+    utc_offset: enum { hours_only, hours_only_zero_filled, hours_and_minutes, iso },
 };
 
 pub const FullFormat = struct {
@@ -290,7 +303,7 @@ pub const Formatting = struct {
                             fill_start = i;
                             // capture the current
                             current_fmt = .{
-                                .fmt = current.toFormat(elem_len),
+                                .fmt = current.toFormat(format_str[i -| 1], elem_len),
                                 .fill = format_str[i..][0..1],
                             };
                             if (i + 1 < format_str.len) {
@@ -302,7 +315,7 @@ pub const Formatting = struct {
                         if (current_fmt.fmt != current) {
                             // this is a quick turnaround where we don't have a separator between elements, so fill is empty
                             current_fmt = .{
-                                .fmt = current.toFormat(elem_len),
+                                .fmt = current.toFormat(format_str[i -| 1], elem_len),
                                 .fill = "",
                             };
                         }
@@ -322,7 +335,7 @@ pub const Formatting = struct {
                 if (next != null and i + 1 == format_str.len) {
                     if (current_element) |current| {
                         current_fmt = .{
-                            .fmt = current.toFormat(elem_len),
+                            .fmt = current.toFormat(char, elem_len),
                             .fill = if (fill_start) |f| format_str[f..][0..1] else "",
                         };
                         if (formatting.fetchPut(current, current_fmt)) |_| {
@@ -597,12 +610,13 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
 
             try writer.print("{s}{s}", .{ subseconds[0..places], x.value.fill });
         },
-        .utc_offset => {
-            // TODO : more formats
-            if (self.utc_offset == UtcOffset.utc) {
+        .utc_offset => |offset_fmt| {
+            if (self.utc_offset == UtcOffset.utc and offset_fmt == .iso) {
                 try writer.writeByte('Z');
-            } else {
-                try writer.print("{d:0>2}:{d:0>2}", .{ self.utc_offset.hours, @as(u16, self.utc_offset.quarter_hours) * 15 });
+            } else switch (offset_fmt) {
+                .hours_only => try writer.print("{d}", .{self.utc_offset.hours}),
+                .hours_only_zero_filled => try writer.print("{d:0>2}", .{self.utc_offset.hours}),
+                .hours_and_minutes, .iso => try writer.print("{d:0>2}:{d:0>2}", .{ self.utc_offset.hours, @as(u16, self.utc_offset.quarter_hours) * 15 }),
             }
         },
     };
