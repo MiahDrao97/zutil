@@ -160,7 +160,7 @@ pub const Element = enum {
     minute,
     /// Seconds
     second,
-    /// Subseconds, represented in up to 7 places
+    /// Subseconds, represented in up to 9 places
     subsecond,
     /// UTC offset
     utc_offset,
@@ -219,7 +219,9 @@ pub const Element = enum {
                     else => @compileError(comptimePrint("Invalid second format '{s}'", .{&@as([elem_len]u8, @splat('s'))})),
                 },
             },
-            .subsecond => .{ .subsecond = elem_len },
+            .subsecond => if (elem_len <= 9) .{ .subsecond = elem_len } else @compileError(
+                comptimePrint("Up to 9 places are allowed for subseconds. Found '{s}'.", .{&@as([elem_len]u8, @splat('f'))}),
+            ),
             .utc_offset => .{
                 .utc_offset = switch (elem_len) {
                     0 => .iso,
@@ -250,7 +252,7 @@ pub const ElementFormat = union(Element) {
     /// Second display strategy
     second: enum { natural, zero_filled },
     /// Number of places to show
-    subsecond: u3,
+    subsecond: u4,
     /// UTC offset format, whether or not to include
     utc_offset: enum { hours_only, hours_only_zero_filled, hours_and_minutes, iso },
 };
@@ -269,6 +271,52 @@ pub const Formatting = struct {
         .ordering = @splat(null),
     };
 
+    /// Format guide:
+    /// Year (represented with either 'y' or 'Y')
+    /// y - Get the current year without leading zero
+    /// yy - Display the last 2 digits of the year
+    /// yyy - Display the last 3 digits of the year
+    /// yyyy - Display the last 4 digits of the year
+    /// yyyyy - Include 5 digits for the year (adds leading zero)
+    ///
+    /// Month
+    /// M - Represent the month without leading zero
+    /// MM - Adds leading zero
+    /// MMM - Abreviated name of the month (e.g. "Jan", "Feb", etc.)
+    /// MMMM - Full name of the month (e.g. "January", "February", etc.)
+    ///
+    /// Day
+    /// d - Represent ehday of the month without leading zero
+    /// dd - Adds leading zero
+    ///
+    /// Weekday
+    /// D - abbreviated weekday (e.g. "Mon", "Tue", etc)
+    /// DD - full week day name (e.g. "Monday", "Tuesday", etc)
+    ///
+    /// Hour
+    /// h - Represent hours without leading zero
+    /// hh - Adds leading zero
+    ///
+    /// Minute
+    /// m - Represent minutes without leading zero
+    /// mm - Adds leading zero
+    ///
+    /// Second
+    /// s - Represent seconds without leading zero
+    /// ss - Adds leading zero
+    ///
+    /// Sub-second (f)
+    /// Represent up to 9 places:
+    /// fff => for milliseconds
+    /// ffffff => for microseconds
+    /// fffffffff => for nanoseconds
+    ///
+    /// UTC Offset
+    /// z - Represent +/- hours from UTC
+    /// zz - Adds leading zero to +/- hours from UTC
+    /// zzz - Includes quarter hours (not colon-separated) (e.g. -0715 for -7 hours and 15 minutes from UTC time)
+    /// zzzz - ISO 8601 format, which includes quarter hours that are colon-separated (.e.g "-07:15" for -7 hours and 15 minutes from UTC time)
+    /// Z - ISO 8601 format (shorthand for zzzz)
     pub inline fn fmtStr(comptime format_str: []const u8) Formatting {
         comptime {
             var formatting: Formatting = .init;
@@ -279,7 +327,7 @@ pub const Formatting = struct {
 
             for (format_str, 0..) |char, i| {
                 const next: ?Element = switch (char) {
-                    'y' => .year,
+                    'Y', 'y' => .year,
                     'M' => .month,
                     'd' => .day,
                     'D' => .weekday,
@@ -348,6 +396,9 @@ pub const Formatting = struct {
             return formatting;
         }
     }
+
+    /// Format like `yyyy-MM-ddThh:mm:ss.fffZ`
+    pub const iso: Formatting = .fmtStr(iso_format_str);
 
     pub fn fetchPut(self: *Formatting, key: Element, value: FullFormat) ?[]const u8 {
         if (self.map.fetchPut(key, value)) |old_value| {
@@ -481,7 +532,7 @@ const Tokenizer = struct {
 /// Expected/allowed separator characters between the various elements.
 const separator_characters: []const u8 = &.{ ' ', '/', '-', '+', '_', '.', ',', ':', 'T' };
 
-pub const iso_format: []const u8 = "yyyy-MM-ddThh:mm:ss.fffZ";
+pub const iso_format_str: []const u8 = "yyyy-MM-ddThh:mm:ss.fffZ";
 
 const log = if (@import("builtin").is_test) struct {
     fn debug(comptime fmt_str: []const u8, args: anytype) void {
@@ -503,19 +554,19 @@ const log = if (@import("builtin").is_test) struct {
     }
 } else std.log.scoped(.DateTimeFormat);
 
-/// Format like `yyyy-MM-ddThh:mm:ss.fffZ`
-pub fn iso(timestamp: Io.Timestamp) DateTimeFormat {
-    return .fmt(iso_format, timestamp, .utc);
-}
-
 /// Assumes that the timestamp is already UTC.
 /// Then we'll apply the offset to the existing `timestamp`.
-pub fn fmt(comptime format_str: []const u8, timestamp: Io.Timestamp, utc_offset: UtcOffset) DateTimeFormat {
+pub fn fmt(formatting: Formatting, timestamp: Io.Timestamp, utc_offset: UtcOffset) DateTimeFormat {
     return .{
         .timestamp = timestamp,
-        .formatting = .fmtStr(format_str),
+        .formatting = formatting,
         .utc_offset = utc_offset,
     };
+}
+
+/// Format like `yyyy-MM-ddThh:mm:ss.fffZ`
+pub fn iso(timestamp: Io.Timestamp) DateTimeFormat {
+    return .fmt(.iso, timestamp, .utc);
 }
 
 pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
@@ -537,7 +588,7 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
 
     var formatting: Formatting = self.formatting;
     if (formatting.count() == 0) {
-        formatting = .fmtStr(iso_format);
+        formatting = .fmtStr(iso_format_str);
     }
     var iter: Formatting.Iterator = formatting.iterator();
     while (iter.next()) |x| switch (x.value.fmt) {
@@ -616,7 +667,8 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
             } else switch (offset_fmt) {
                 .hours_only => try writer.print("{d}", .{self.utc_offset.hours}),
                 .hours_only_zero_filled => try writer.print("{d:0>2}", .{self.utc_offset.hours}),
-                .hours_and_minutes, .iso => try writer.print("{d:0>2}:{d:0>2}", .{ self.utc_offset.hours, @as(u16, self.utc_offset.quarter_hours) * 15 }),
+                .hours_and_minutes => try writer.print("{d:0>2}{d:0>2}", .{ self.utc_offset.hours, @as(u16, self.utc_offset.quarter_hours) * 15 }),
+                .iso => try writer.print("{d:0>2}:{d:0>2}", .{ self.utc_offset.hours, @as(u16, self.utc_offset.quarter_hours) * 15 }),
             }
         },
     };
@@ -662,8 +714,7 @@ pub fn parse(str: []const u8, expected_elements: []const Element) ParseError!Dat
 
 /// Parse an exactly-formatted date-time string.
 /// NOTE: Assumes UTC by default
-pub fn parseExact(str: []const u8, comptime format_str: []const u8) ParseExactError!DateTimeFormat {
-    const formatting: Formatting = .fmtStr(format_str);
+pub fn parseExact(str: []const u8, formatting: Formatting) ParseExactError!DateTimeFormat {
     var map: EnumMap(Element, []const u8) = .init(.{});
 
     var utc_offset: UtcOffset = .utc;
@@ -844,7 +895,7 @@ test "max i96 buf" {
 }
 test parseExact {
     const date_str = "2026-05-22T21:48:47.036Z";
-    const date_time: DateTimeFormat = try .parseExact(date_str, iso_format);
+    const date_time: DateTimeFormat = try .parseExact(date_str, .iso);
 
     try testing.expectEqual(1779486527036000000, date_time.timestamp.nanoseconds);
     try testing.expect(date_time.formatting.map.contains(.utc_offset));
