@@ -1,4 +1,4 @@
-/// Universally unique identifier
+/// Universally unique identifier - Note that this is a work in progress.
 /// Currently supports v3, v4, v5, and v7
 pub const Uuid = extern struct {
     /// Any 16 bytes are assumed to be a valid UUID.
@@ -18,6 +18,53 @@ pub const Uuid = extern struct {
             return a.lessThan(b);
         }
     } = .{};
+
+    /// Formatter
+    pub const Formatter = struct {
+        opts: FormatOptions,
+        uuid: Uuid,
+
+        /// Format the UUID to a writer
+        pub fn format(
+            self: Formatter,
+            writer: *Io.Writer,
+        ) Io.Writer.Error!void {
+            switch (self.opts.seperator) {
+                .none => switch (self.opts.casing) {
+                    .lower => try writer.print("{x}", .{self.uuid.bytes}),
+                    .upper => try writer.print("{X}", .{self.uuid.bytes}),
+                },
+                // 8-4-4-4-12 format, or whichever separator
+                else => |x| {
+                    const char: u8 = x.char().?;
+                    switch (self.opts.casing) {
+                        .lower => try writer.print("{x}{c}{x}{c}{x}{c}{x}{c}{x}", .{
+                            self.uuid.bytes[0..4],
+                            char,
+                            self.uuid.bytes[4..][0..2],
+                            char,
+                            self.uuid.bytes[6..][0..2],
+                            char,
+                            self.uuid.bytes[8..][0..2],
+                            char,
+                            self.uuid.bytes[10..],
+                        }),
+                        .upper => try writer.print("{X}{c}{X}{c}{X}{c}{X}{c}{X}", .{
+                            self.uuid.bytes[0..4],
+                            char,
+                            self.uuid.bytes[4..][0..2],
+                            char,
+                            self.uuid.bytes[6..][0..2],
+                            char,
+                            self.uuid.bytes[8..][0..2],
+                            char,
+                            self.uuid.bytes[10..],
+                        }),
+                    }
+                },
+            }
+        }
+    };
 
     /// Format options when printing
     pub const FormatOptions = struct {
@@ -183,9 +230,7 @@ pub const Uuid = extern struct {
                     uuid.bytes[j] = try std.fmt.parseUnsigned(u8, str[i..][0..2], 16);
                     i += 2;
                     const current: @Vector(4, usize) = @splat(i);
-                    if (@reduce(.Or, current == separator_indices)) {
-                        i += 1;
-                    }
+                    i += @intFromBool(@reduce(.Or, current == separator_indices));
                 }
                 break :hex_digits_with_separators uuid;
             },
@@ -197,74 +242,15 @@ pub const Uuid = extern struct {
     /// Writes the default lower-case format with dashes for separators.
     /// If you want to write this UUID in a different format, use `writeTo()`.
     pub fn format(self: Uuid, writer: *Io.Writer) Io.Writer.Error!void {
-        try self.writeTo(writer, .{});
+        try writer.print("{f}", .{self.asFormat(.{})});
     }
 
-    /// Writes to a buffer.
-    /// This function is infallible due to enforcing the buffer's size in the function signature (will not write more than 36 bytes).
-    pub fn toStringBuf(
-        self: Uuid,
-        buf: *[36]u8,
-        fmt_opts: FormatOptions,
-    ) []const u8 {
-        var writer: Io.Writer = .fixed(buf);
-        self.writeTo(&writer, fmt_opts) catch unreachable;
-        return writer.buffered();
-    }
-
-    /// Format the UUID, allocating the resulting string
-    pub fn toStringAlloc(
-        self: Uuid,
-        gpa: Allocator,
-        fmt_opts: FormatOptions,
-    ) Allocator.Error![]const u8 {
-        var stream: Io.Writer.Allocating = .init(gpa);
-        defer stream.deinit();
-
-        self.writeTo(&stream.writer, fmt_opts) catch return Allocator.Error.OutOfMemory;
-        return try stream.toOwnedSlice();
-    }
-
-    /// Format the UUID to a writer
-    pub fn writeTo(
-        self: Uuid,
-        writer: *Io.Writer,
-        fmt_opts: FormatOptions,
-    ) Io.Writer.Error!void {
-        switch (fmt_opts.seperator) {
-            .none => switch (fmt_opts.casing) {
-                .lower => try writer.print("{x}", .{self.bytes}),
-                .upper => try writer.print("{X}", .{self.bytes}),
-            },
-            // 8-4-4-4-12 format, or whichever separator
-            inline else => |x| {
-                const char: u8 = x.char().?;
-                switch (fmt_opts.casing) {
-                    .lower => try writer.print("{x}{c}{x}{c}{x}{c}{x}{c}{x}", .{
-                        self.bytes[0..4],
-                        char,
-                        self.bytes[4..][0..2],
-                        char,
-                        self.bytes[6..][0..2],
-                        char,
-                        self.bytes[8..][0..2],
-                        char,
-                        self.bytes[10..],
-                    }),
-                    .upper => try writer.print("{X}{c}{X}{c}{X}{c}{X}{c}{X}", .{
-                        self.bytes[0..4],
-                        char,
-                        self.bytes[4..][0..2],
-                        char,
-                        self.bytes[6..][0..2],
-                        char,
-                        self.bytes[8..][0..2],
-                        char,
-                        self.bytes[10..],
-                    }),
-                }
-            },
-        }
+    /// Specify a particular format if you don't wish to use the default format
+    pub fn asFormat(self: Uuid, options: FormatOptions) Formatter {
+        return .{
+            .opts = options,
+            .uuid = self,
+        };
     }
 
     /// Test if two UUID's are equal
@@ -321,15 +307,22 @@ pub const Uuid = extern struct {
     test from {
         const uuid: Uuid = .v4(testing.io);
         var buf: [36]u8 = undefined;
+        var writer: Io.Writer = .fixed(&buf);
         // dashes
         {
-            const uuid_str: []const u8 = uuid.toStringBuf(&buf, .{});
+            defer _ = writer.consumeAll();
+            try writer.print("{f}", .{uuid});
+
+            const uuid_str: []const u8 = writer.buffered();
             const parsed: Uuid = try .from(uuid_str);
             try testing.expect(uuid.eql(parsed));
         }
         // no dashes
         {
-            const uuid_str: []const u8 = uuid.toStringBuf(&buf, .{ .seperator = .none });
+            defer _ = writer.consumeAll();
+            try writer.print("{f}", .{uuid.asFormat(.{ .seperator = .none })});
+
+            const uuid_str: []const u8 = writer.buffered();
             const parsed: Uuid = try .from(uuid_str);
             try testing.expect(uuid.eql(parsed));
         }
@@ -346,11 +339,14 @@ pub const Uuid = extern struct {
             }
         }
     }
-    test toStringAlloc {
+    test format {
         const uuid: Uuid = .v4(testing.io);
-        const uuid_str: []const u8 = try uuid.toStringAlloc(testing.allocator, .{});
-        defer testing.allocator.free(uuid_str);
+        var stream: Io.Writer.Allocating = .init(testing.allocator);
+        defer stream.deinit();
 
+        try stream.writer.print("{f}", .{uuid});
+
+        const uuid_str: []const u8 = stream.written();
         const parsed: Uuid = try .from(uuid_str);
         try testing.expect(uuid.eql(parsed));
     }

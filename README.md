@@ -160,7 +160,11 @@ try testing.expect(!c.value);
 ```
 
 ## `string` Namespace
-Currently only have casing utilies (convert a string to camel case, title case, kebab, snake, and screaming snake).
+Currently have casing utilies (convert a string to camel case, title case, kebab, snake, and screaming snake) and
+date-time formatting/parsing utilies.
+
+### Casing
+
 ```zig
 const std = @import("std");
 const zutil = @import("zutil");
@@ -174,6 +178,10 @@ test {
     try std.testing.expectEqualStrings("SomethingToCase", stream.written());
 }
 ```
+
+### DateTimeFormat
+Format and parse date-time from strings.
+This is a work in progress as I'm certain there is still more work to be done here.
 
 ## `MemCache` and `MemCacheAligned`
 Used to memoize data of any type, presumably for the purpose of avoiding additional I/O calls.
