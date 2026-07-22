@@ -25,6 +25,9 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         /// Possible errors returned when adding a new entry
         pub const Error = Allocator.Error || Io.Cancelable || Io.ConcurrentError;
 
+        /// Possible errors while attempting to open a reader to an entry
+        pub const OpenReaderError = error{TooManyOpenReaders} || Io.Cancelable;
+
         /// Simple reader
         pub const EntryReader = struct {
             /// Raw cache entry as bytes
@@ -53,7 +56,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
 
             /// After this call, the entry is no longer safe to read
             pub fn release(self: SafeReader) void {
-                const count_as_int: *Atomic(i16) = @ptrCast(self.ref_count);
+                const count_as_int: *Atomic(u16) = @ptrCast(self.ref_count);
                 const prev_count: RefCount = @enumFromInt(count_as_int.fetchSub(1, .release));
                 // The previous ref count must be some value between 1 and 32767.
                 // Otherwise, something's broken...
@@ -166,7 +169,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             expiration: Expiration,
             create_entry_ctx: anytype,
             createEntryFn: fn (@TypeOf(create_entry_ctx), Expiration.CleanupContextOut) TReturn,
-        ) (ErrorType(TReturn) || Error || error{TooManyOpenReaders})!SafeReader {
+        ) (ErrorType(TReturn) || Error || OpenReaderError)!SafeReader {
             comptime checkAlignment(ReturnType(TReturn));
 
             if (try self.lockReader(io, key)) |reader| {
@@ -187,7 +190,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
 
             self.putEntry(io, gpa, key, v, expiration_cpy, .no_clobber) catch |err| switch (err) {
                 // shouldn't be possible, but if it's better to crash and investigate than pretend everything's fine
-                error.CacheClobber => unreachable,
+                error.CacheClobber => debug.panic("Encountered cache clobber with key '{s}', even though this entry should be completely new.", .{key}),
                 else => |e| return e,
             };
 
@@ -251,7 +254,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             expiration: Expiration,
             create_entry_ctx: anytype,
             createEntryFn: fn (@TypeOf(create_entry_ctx), Expiration.CleanupContextOut) TReturn,
-        ) (ErrorType(TReturn) || Error || error{TooManyOpenReaders})!SafeReader {
+        ) (ErrorType(TReturn) || Error || OpenReaderError)!SafeReader {
             const SliceType = switch (@typeInfo(ReturnType(TReturn))) {
                 .pointer => |p| switch (p.size) {
                     .slice => p.child,
@@ -277,7 +280,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
 
             self.putEntry(io, gpa, key, v, expiration_cpy, .no_clobber) catch |err| switch (err) {
                 // shouldn't be possible, but if it's better to crash and investigate than pretend everything's fine
-                error.CacheClobber => unreachable,
+                error.CacheClobber => debug.panic("Encountered cache clobber with key '{s}', even though this entry should be completely new.", .{key}),
                 else => |e| return e,
             };
 
@@ -388,7 +391,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         /// Returns `error.TooManyOpenReaders` if the ref count would exceed 32767.
         ///
         /// WARN : If the caller fails to call `release()` on the reader, it may produce a deadlock or segmentation fault later in the program.
-        pub fn lockReader(self: *Self, io: Io, key: []const u8) (error{TooManyOpenReaders} || Io.Cancelable)!?SafeReader {
+        pub fn lockReader(self: *Self, io: Io, key: []const u8) OpenReaderError!?SafeReader {
             const k: StringHash = .hashStr(key);
 
             var metadata: ?*Metadata = null;
@@ -445,7 +448,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             defer self.mutex.unlock(io);
 
             if (self.metadata_cache.getPtr(k)) |m| {
-                while (!try m.safeDestroy(io)) {
+                while (!m.safeDestroy()) : (try io.checkCancel()) {
                     // spin until ref count reaches 0...
                 }
 
@@ -475,7 +478,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             while (iter.next()) |entry| {
                 const metadata: *Metadata = self.metadata_cache.getPtr(entry.key_ptr.*) orelse
                     debug.panic("No metadata entry found for hash 0x{x}, even though a value entry exists.", .{entry.key_ptr.*});
-                while (!metadata.safeDestroyUncancelable()) {
+                while (!metadata.safeDestroy()) {
                     // spin until ref count reaches 0...
                 }
                 const raw: []align(max_alignment.toByteUnits()) const u8 = entry.value_ptr.*[0..metadata.len];
@@ -555,8 +558,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                 return safe;
             }
 
-            fn safeDestroy(self: *Metadata, io: Io) Io.Cancelable!bool {
-                try io.checkCancel();
+            fn safeDestroy(self: *Metadata) bool {
                 var safe: bool = true;
                 if (self.ref_count.cmpxchgWeak(.zero, .destroying, .acq_rel, .monotonic)) |count| {
                     log.debug("{*} is {d}. Not yet safe to destroy value.", .{ &self.ref_count, count });
@@ -565,16 +567,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                 return safe;
             }
 
-            fn safeDestroyUncancelable(self: *Metadata) bool {
-                var safe: bool = true;
-                if (self.ref_count.cmpxchgWeak(.zero, .destroying, .acq_rel, .monotonic)) |count| {
-                    log.debug("{*} is {d}. Not yet safe to destroy value.", .{ &self.ref_count, count });
-                    safe = false;
-                }
-                return safe;
-            }
-
-            fn safeRead(self: *Metadata, io: Io) (error{TooManyOpenReaders} || Io.Cancelable)!enum { safe, swapping, destroying } {
+            fn safeRead(self: *Metadata, io: Io) OpenReaderError!enum { safe, swapping, destroying } {
                 var refs: RefCount = self.ref_count.load(.monotonic);
                 switch (refs) {
                     .destroying => return .destroying,
@@ -633,17 +626,17 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         };
 
         /// Used to count references on an entry
-        const RefCount = enum(i16) {
-            destroying = -2,
-            swapping = -1,
+        const RefCount = enum(u16) {
             zero = 0,
             one = 1,
-            max = std.math.maxInt(i16),
+            max = std.math.maxInt(u16) - 2,
+            swapping = std.math.maxInt(u16) - 1,
+            destroying = std.math.maxInt(u16),
             _,
 
             fn compare(lh: RefCount, op: std.math.CompareOperator, rh: RefCount) bool {
-                const lh_int: i16 = @intFromEnum(lh);
-                const rh_int: i16 = @intFromEnum(rh);
+                const lh_int: u16 = @intFromEnum(lh);
+                const rh_int: u16 = @intFromEnum(rh);
 
                 return switch (op) {
                     .lt => lh_int < rh_int,
@@ -1050,7 +1043,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             const slice: []const u8 = "asdf";
             try mem_cache.overwriteSliceEntry(u8, testing.io, testing.allocator, "my_slice", slice, .none);
 
-            // deliberately interfere with the data cuz I don't wanna make 32K references just for a unit test
+            // deliberately interfere with the data cuz I don't wanna make 65K references just for a unit test
             mem_cache.metadata_cache.getPtr(StringHash.hashStr("my_slice")).?.ref_count.store(.max, .release);
 
             try testing.expectError(error.TooManyOpenReaders, mem_cache.lockReader(testing.io, "my_slice"));

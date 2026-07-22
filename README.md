@@ -183,6 +183,67 @@ test {
 Format and parse date-time from strings.
 This is a work in progress as I'm certain there is still more work to be done here.
 
+A `DateTimeFormat` consists of a `Io.Timestamp`, a `Formatting`, and a `UtcOffset`.
+The `Formatting` struct contains the complex formatting details.
+Initialize with a comptime format string using the `fmtStr()` function (e.g. "yyyy-MM-dd hh:mm:ss.fffZ").
+The `Formatting` struct can parse a date-time string with the exact format or write a string with that format.
+
+#### Format guide:
+Year (represented with either 'y' or 'Y')
+y - Get the current year without leading zero
+yy - Display the last 2 digits of the year
+yyy - Display the last 3 digits of the year
+yyyy - Display the last 4 digits of the year
+yyyyy - Include 5 digits for the year (adds leading zero)
+
+Month
+M - Represent the month without leading zero
+MM - Adds leading zero
+MMM - Abreviated name of the month (e.g. "Jan", "Feb", etc.)
+MMMM - Full name of the month (e.g. "January", "February", etc.)
+
+Day
+d - Represent ehday of the month without leading zero
+dd - Adds leading zero
+
+Weekday
+D - abbreviated weekday (e.g. "Mon", "Tue", etc)
+DD - full week day name (e.g. "Monday", "Tuesday", etc)
+
+Hour
+h - Represent hours without leading zero
+hh - Adds leading zero
+
+Minute
+m - Represent minutes without leading zero
+mm - Adds leading zero
+
+Second
+s - Represent seconds without leading zero
+ss - Adds leading zero
+
+Sub-second (f)
+Represent up to 9 places:
+fff => for milliseconds
+ffffff => for microseconds
+fffffffff => for nanoseconds
+
+UTC Offset
+z - Represent +/- hours from UTC
+zz - Adds leading zero to +/- hours from UTC
+zzz - Includes quarter hours (not colon-separated) (e.g. -0715 for -7 hours and 15 minutes from UTC time)
+zzzz - ISO 8601 format, which includes quarter hours that are colon-separated (.e.g "-07:15" for -7 hours and 15 minutes from UTC time)
+Z - ISO 8601 format (shorthand for zzzz)
+
+#### Io.Timestamp Best Practice
+Keep in mind that an `Io.Timestamp` is really just a count of nanoseconds.
+It is up to the developer to understand if that timestamp includes any UTC offsets.
+If you parse a string as a `DateTimeFormat` and apply a UTC offset to it, it will *add or subtract* from the timestamp's value when formatted.
+Generally, keep instances of `Io.Timestamp` with a UTC offset of 0.
+Only apply locality in reporting/user interactions.
+
+NOTE - Pre-Unix Epoch date-times are not yet supported. If that ever comes up, I have a lovely error log you'll encounter. Send patches!
+
 ## `MemCache` and `MemCacheAligned`
 Used to memoize data of any type, presumably for the purpose of avoiding additional I/O calls.
 Essentially functions as a dictionary with a string key type.

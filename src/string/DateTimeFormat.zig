@@ -10,13 +10,15 @@ utc_offset: UtcOffset,
 
 /// Offset from UTC time
 pub const UtcOffset = packed struct(u8) {
-    /// Positive or negative offset in hours
-    hours: i6,
+    /// Offset is positive or negative
+    sign: enum(u1) { positive, negative },
+    /// Offset hours
+    hours: u5,
     /// Possible quarter hours (0, 1, 2, or 3 for xx:00, xx:15, xx:30, and xx:45 respectively)
     quarter_hours: u2,
 
     /// Zero-offset (aka UTC time)
-    pub const utc: UtcOffset = .{ .hours = 0, .quarter_hours = 0 };
+    pub const utc: UtcOffset = .{ .sign = .positive, .hours = 0, .quarter_hours = 0 };
 
     pub fn asDuration(self: UtcOffset) Io.Duration {
         var ns: i96 = 0;
@@ -37,27 +39,27 @@ pub const UtcOffset = packed struct(u8) {
         var substring: []const u8 = "";
         switch (next.category) {
             .alpha => return offset,
-            .numeric => offset.hours = std.fmt.parseInt(i6, next.value, 10) catch return error.InvalidUtcOffset,
+            .numeric => offset.hours = std.fmt.parseInt(u5, next.value, 10) catch return error.InvalidUtcOffset,
             .separator => substring = next.value,
         }
 
         if (substring.len > 0) {
             next = tokenizer.expectOneOf(&.{.{ .category = .numeric }}) catch return error.InvalidUtcOffset;
             substring.len += next.value.len;
-            offset.hours = std.fmt.parseInt(i6, substring, 10) catch |err| switch (err) {
+            if (substring[0] == '+' or substring[0] == '-') {
+                switch (substring[0]) {
+                    '-' => offset.sign = .negative,
+                    '+' => {}, // already positive in .utc
+                    else => unreachable,
+                }
+                substring = substring[1..];
+            }
+            offset.hours = std.fmt.parseInt(u5, substring, 10) catch |err| switch (err) {
                 error.InvalidCharacter => return error.InvalidUtcOffset,
                 error.Overflow => {
                     // this could be the situation where we're parsing 0000 format (with or without leading sign)
-                    if ((substring[0] == '+' or substring[0] == '-') and substring.len == 5) {
-                        offset.hours = std.fmt.parseInt(i6, substring[0..3], 10) catch return error.InvalidUtcOffset;
-                        const minutes: []const u8 = substring[3..];
-                        assert(minutes.len == 2);
-                        if (parseMinutes(minutes)) |m| {
-                            offset.quarter_hours = m;
-                            return offset;
-                        }
-                    } else if (substring.len == 4) {
-                        offset.hours = std.fmt.parseInt(i6, substring[0..2], 10) catch return error.InvalidUtcOffset;
+                    if (substring.len == 4) {
+                        offset.hours = std.fmt.parseInt(u5, substring[0..2], 10) catch return error.InvalidUtcOffset;
                         const minutes: []const u8 = substring[2..];
                         assert(minutes.len == 2);
                         if (parseMinutes(minutes)) |m| {
@@ -81,6 +83,11 @@ pub const UtcOffset = packed struct(u8) {
                 }
             } else |_| tokenizer.rollback(colon);
         } else |_| {}
+
+        // check for "negative" 0:
+        if (offset.hours + offset.quarter_hours == 0 and offset.sign == .negative) {
+            offset.sign = .positive; // just to ensure that we're consistent here
+        }
         return offset;
     }
 
@@ -92,6 +99,44 @@ pub const UtcOffset = packed struct(u8) {
             @"45" = 3,
         };
         return if (std.meta.stringToEnum(MinuteSlice, slice)) |m| @intFromEnum(m) else null;
+    }
+
+    test "UtcOffset.parse" {
+        var tokenizer: Tokenizer = undefined;
+        {
+            tokenizer = .init("");
+            // empty string
+            try testing.expectError(error.InvalidUtcOffset, UtcOffset.parse(&tokenizer));
+
+            // invalid string
+            tokenizer = .init("asdf");
+            try testing.expectError(error.InvalidUtcOffset, UtcOffset.parse(&tokenizer));
+
+            // invalid quarter hours
+            tokenizer = .init("+0110");
+            try testing.expectError(error.InvalidUtcOffset, UtcOffset.parse(&tokenizer));
+        }
+        // zero-formats
+        {
+            const zero_formats: []const []const u8 = &.{ "0000", "+0000", "+00:00", "-00:00", "Z" };
+            for (zero_formats) |zf| {
+                tokenizer = .init(zf);
+                try testing.expectEqual(UtcOffset.utc, try UtcOffset.parse(&tokenizer));
+            }
+        }
+        // nonzero formats
+        {
+            const formats: []const struct { fmt: []const u8, expected: UtcOffset } = &.{
+                .{ .fmt = "00:15", .expected = .{ .sign = .positive, .hours = 0, .quarter_hours = 1 } }, // FIXME : <-- couldn't handle "0015" with the same outcome
+                .{ .fmt = "-00:15", .expected = .{ .sign = .negative, .hours = 0, .quarter_hours = 1 } }, // FIXME : <-- similar as above; couldn't handle "-0015"
+                .{ .fmt = "-07:30", .expected = .{ .sign = .negative, .hours = 7, .quarter_hours = 2 } },
+                .{ .fmt = "+07:45", .expected = .{ .sign = .positive, .hours = 7, .quarter_hours = 3 } },
+            };
+            for (formats) |f| {
+                tokenizer = .init(f.fmt);
+                try testing.expectEqual(f.expected, try UtcOffset.parse(&tokenizer));
+            }
+        }
     }
 };
 
@@ -262,8 +307,12 @@ pub const FullFormat = struct {
     fill: []const u8,
 };
 
+/// This defines how a date-time string is formatted:
+/// Which elements are represented, which separator character(s) sit between elements, and which order elements appear.
 pub const Formatting = struct {
+    /// Which elements are present and separator character(s) come after them
     map: EnumMap(Element, FullFormat),
+    /// Since `EnumMap` does not give you the order elements appear, we need this additional array
     ordering: [@typeInfo(Element).@"enum".fields.len]?Element,
 
     pub const init: Formatting = .{
@@ -664,11 +713,17 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
         .utc_offset => |offset_fmt| {
             if (self.utc_offset == UtcOffset.utc and offset_fmt == .iso) {
                 try writer.writeByte('Z');
-            } else switch (offset_fmt) {
-                .hours_only => try writer.print("{d}", .{self.utc_offset.hours}),
-                .hours_only_zero_filled => try writer.print("{d:0>2}", .{self.utc_offset.hours}),
-                .hours_and_minutes => try writer.print("{d:0>2}{d:0>2}", .{ self.utc_offset.hours, @as(u16, self.utc_offset.quarter_hours) * 15 }),
-                .iso => try writer.print("{d:0>2}:{d:0>2}", .{ self.utc_offset.hours, @as(u16, self.utc_offset.quarter_hours) * 15 }),
+            } else {
+                const sign_char: u8 = switch (self.utc_offset.sign) {
+                    .positive => '+',
+                    .negative => '-',
+                };
+                switch (offset_fmt) {
+                    .hours_only => try writer.print("{c}{d}", .{ sign_char, self.utc_offset.hours }),
+                    .hours_only_zero_filled => try writer.print("{c}{d:0>2}", .{ sign_char, self.utc_offset.hours }),
+                    .hours_and_minutes => try writer.print("{c}{d:0>2}{d:0>2}", .{ sign_char, self.utc_offset.hours, @as(u16, self.utc_offset.quarter_hours) * 15 }),
+                    .iso => try writer.print("{c}{d:0>2}:{d:0>2}", .{ sign_char, self.utc_offset.hours, @as(u16, self.utc_offset.quarter_hours) * 15 }),
+                }
             }
         },
     };
@@ -935,6 +990,7 @@ test parseMonth {
 }
 
 comptime {
+    _ = UtcOffset;
     _ = WeekDay;
 }
 
