@@ -39,7 +39,20 @@ pub const UtcOffset = packed struct(u8) {
         var substring: []const u8 = "";
         switch (next.category) {
             .alpha => return offset,
-            .numeric => offset.hours = std.fmt.parseInt(u5, next.value, 10) catch return error.InvalidUtcOffset,
+            .numeric => {
+                if (next.value.len == 4) {
+                    // 4 characters: assuming first 2 are hours and second 2 are quarter hours
+                    offset.hours = std.fmt.parseInt(u5, next.value[0..2], 10) catch return error.InvalidUtcOffset;
+                    const minutes: []const u8 = next.value[2..];
+                    assert(minutes.len == 2);
+                    if (parseMinutes(minutes)) |m| {
+                        offset.quarter_hours = m;
+                        return offset;
+                    } else return error.InvalidUtcOffset;
+                } else {
+                    offset.hours = std.fmt.parseInt(u5, next.value, 10) catch return error.InvalidUtcOffset;
+                }
+            },
             .separator => substring = next.value,
         }
 
@@ -54,22 +67,19 @@ pub const UtcOffset = packed struct(u8) {
                 }
                 substring = substring[1..];
             }
-            offset.hours = std.fmt.parseInt(u5, substring, 10) catch |err| switch (err) {
-                error.InvalidCharacter => return error.InvalidUtcOffset,
-                error.Overflow => {
-                    // this could be the situation where we're parsing 0000 format (with or without leading sign)
-                    if (substring.len == 4) {
-                        offset.hours = std.fmt.parseInt(u5, substring[0..2], 10) catch return error.InvalidUtcOffset;
-                        const minutes: []const u8 = substring[2..];
-                        assert(minutes.len == 2);
-                        if (parseMinutes(minutes)) |m| {
-                            offset.quarter_hours = m;
-                            return offset;
-                        }
-                    }
-                    return error.InvalidUtcOffset;
-                }
-            };
+            if (substring.len == 4) {
+                // 4 characters: assuming first 2 are hours and second 2 are quarter hours
+                offset.hours = std.fmt.parseInt(u5, substring[0..2], 10) catch return error.InvalidUtcOffset;
+                const minutes: []const u8 = substring[2..];
+                assert(minutes.len == 2);
+                if (parseMinutes(minutes)) |m| {
+                    offset.quarter_hours = m;
+                    return offset;
+                } else return error.InvalidUtcOffset;
+            } else {
+                // we're assuming that quarter hours are not a thing here
+                offset.hours = std.fmt.parseInt(u5, substring, 10) catch return error.InvalidUtcOffset;
+            }
         }
 
         // now we have hours, so whatever we can't parse must simply be the end of this date-time element
@@ -127,8 +137,10 @@ pub const UtcOffset = packed struct(u8) {
         // nonzero formats
         {
             const formats: []const struct { fmt: []const u8, expected: UtcOffset } = &.{
-                .{ .fmt = "00:15", .expected = .{ .sign = .positive, .hours = 0, .quarter_hours = 1 } }, // FIXME : <-- couldn't handle "0015" with the same outcome
-                .{ .fmt = "-00:15", .expected = .{ .sign = .negative, .hours = 0, .quarter_hours = 1 } }, // FIXME : <-- similar as above; couldn't handle "-0015"
+                .{ .fmt = "00:15", .expected = .{ .sign = .positive, .hours = 0, .quarter_hours = 1 } },
+                .{ .fmt = "0015", .expected = .{ .sign = .positive, .hours = 0, .quarter_hours = 1 } },
+                .{ .fmt = "-0015", .expected = .{ .sign = .negative, .hours = 0, .quarter_hours = 1 } },
+                .{ .fmt = "-00:15", .expected = .{ .sign = .negative, .hours = 0, .quarter_hours = 1 } },
                 .{ .fmt = "-07:30", .expected = .{ .sign = .negative, .hours = 7, .quarter_hours = 2 } },
                 .{ .fmt = "+07:45", .expected = .{ .sign = .positive, .hours = 7, .quarter_hours = 3 } },
             };
@@ -366,6 +378,7 @@ pub const Formatting = struct {
     /// zzz - Includes quarter hours (not colon-separated) (e.g. -0715 for -7 hours and 15 minutes from UTC time)
     /// zzzz - ISO 8601 format, which includes quarter hours that are colon-separated (.e.g "-07:15" for -7 hours and 15 minutes from UTC time)
     /// Z - ISO 8601 format (shorthand for zzzz)
+    /// TODO : How do I want to represent positive offsets by omitting the sign? I've seen a simple space that indicates positive offset.
     pub inline fn fmtStr(comptime format_str: []const u8) Formatting {
         comptime {
             var formatting: Formatting = .init;
