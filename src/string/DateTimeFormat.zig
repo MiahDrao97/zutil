@@ -47,7 +47,6 @@ pub const UtcOffset = packed struct(u8) {
                     assert(minutes.len == 2);
                     if (parseMinutes(minutes)) |m| {
                         offset.quarter_hours = m;
-                        return offset;
                     } else return error.InvalidUtcOffset;
                 } else {
                     offset.hours = std.fmt.parseInt(u5, next.value, 10) catch return error.InvalidUtcOffset;
@@ -74,7 +73,6 @@ pub const UtcOffset = packed struct(u8) {
                 assert(minutes.len == 2);
                 if (parseMinutes(minutes)) |m| {
                     offset.quarter_hours = m;
-                    return offset;
                 } else return error.InvalidUtcOffset;
             } else {
                 // we're assuming that quarter hours are not a thing here
@@ -128,7 +126,7 @@ pub const UtcOffset = packed struct(u8) {
         }
         // zero-formats
         {
-            const zero_formats: []const []const u8 = &.{ "0000", "+0000", "+00:00", "-00:00", "Z" };
+            const zero_formats: []const []const u8 = &.{ "0000", "+0000", "-0000", "+00:00", "-00:00", "Z", "0" };
             for (zero_formats) |zf| {
                 tokenizer = .init(zf);
                 try testing.expectEqual(UtcOffset.utc, try UtcOffset.parse(&tokenizer));
