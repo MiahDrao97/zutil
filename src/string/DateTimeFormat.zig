@@ -34,7 +34,14 @@ pub const UtcOffset = packed struct(u8) {
             .{ .exactly = "-" },
             .{ .exactly = "+" },
             .{ .category = .numeric },
-        }) catch return error.InvalidUtcOffset;
+        }) catch |err| {
+            switch (err) {
+                error.NoMatch => log.err("Expected 'Z', '-', '+', or numeric token. Instead found: '{f}'", .{tokenizer.peek().?}),
+                error.EndOfIteration => log.err("No more tokens. UTC offset is incomplete.", .{}),
+                error.UnexpectedCharacter => {},
+            }
+            return error.InvalidUtcOffset;
+        };
 
         var substring: []const u8 = "";
         switch (next.category) {
@@ -42,41 +49,64 @@ pub const UtcOffset = packed struct(u8) {
             .numeric => {
                 if (next.value.len == 4) {
                     // 4 characters: assuming first 2 are hours and second 2 are quarter hours
-                    offset.hours = std.fmt.parseInt(u5, next.value[0..2], 10) catch return error.InvalidUtcOffset;
+                    offset.hours = std.fmt.parseInt(u5, next.value[0..2], 10) catch |err| {
+                        log.err("Could not parse u5 for hours offset from string '{s}': {t}", .{ next.value[0..2], err });
+                        return error.InvalidUtcOffset;
+                    };
                     const minutes: []const u8 = next.value[2..];
                     assert(minutes.len == 2);
                     if (parseMinutes(minutes)) |m| {
                         offset.quarter_hours = m;
-                    } else return error.InvalidUtcOffset;
+                    } else {
+                        log.err("Could not parse quarter hours from string '{s}'", .{minutes});
+                        return error.InvalidUtcOffset;
+                    }
                 } else {
-                    offset.hours = std.fmt.parseInt(u5, next.value, 10) catch return error.InvalidUtcOffset;
+                    offset.hours = std.fmt.parseInt(u5, next.value, 10) catch |err| {
+                        log.err("Could not parse u5 for hours offset from string '{s}': {t}", .{ next.value[0..2], err });
+                        return error.InvalidUtcOffset;
+                    };
                 }
             },
             .separator => substring = next.value,
         }
 
         if (substring.len > 0) {
-            next = tokenizer.expectOneOf(&.{.{ .category = .numeric }}) catch return error.InvalidUtcOffset;
-            substring.len += next.value.len;
-            if (substring[0] == '+' or substring[0] == '-') {
-                switch (substring[0]) {
-                    '-' => offset.sign = .negative,
-                    '+' => {}, // already positive in .utc
-                    else => unreachable,
+            next = tokenizer.expectOneOf(&.{.{ .category = .numeric }}) catch |err| {
+                switch (err) {
+                    error.NoMatch => log.err("Expected numeric token but instead found: '{f}'", .{tokenizer.peek().?}),
+                    error.EndOfIteration => log.err("No more tokens. UTC offset is incomplete.", .{}),
+                    error.UnexpectedCharacter => {},
                 }
-                substring = substring[1..];
+                return error.InvalidUtcOffset;
+            };
+            substring.len += next.value.len;
+            switch (substring[0]) {
+                '-' => offset.sign = .negative,
+                '+' => {}, // already positive in .utc
+                else => unreachable,
             }
+            substring = substring[1..];
             if (substring.len == 4) {
                 // 4 characters: assuming first 2 are hours and second 2 are quarter hours
-                offset.hours = std.fmt.parseInt(u5, substring[0..2], 10) catch return error.InvalidUtcOffset;
+                offset.hours = std.fmt.parseInt(u5, substring[0..2], 10) catch |err| {
+                    log.err("Could not parse u5 for hours offset from string '{s}': {t}", .{ substring[0..2], err });
+                    return error.InvalidUtcOffset;
+                };
                 const minutes: []const u8 = substring[2..];
                 assert(minutes.len == 2);
                 if (parseMinutes(minutes)) |m| {
                     offset.quarter_hours = m;
-                } else return error.InvalidUtcOffset;
+                } else {
+                    log.err("Could not parse quarter hours from string '{s}'", .{minutes});
+                    return error.InvalidUtcOffset;
+                }
             } else {
                 // we're assuming that quarter hours are not a thing here
-                offset.hours = std.fmt.parseInt(u5, substring, 10) catch return error.InvalidUtcOffset;
+                offset.hours = std.fmt.parseInt(u5, substring, 10) catch |err| {
+                    log.err("Could not parse u5 for hours offset from string '{s}': {t}", .{ substring[0..2], err });
+                    return error.InvalidUtcOffset;
+                };
             }
         }
 
@@ -503,6 +533,10 @@ const Tokenizer = struct {
     const Token = struct {
         value: []const u8,
         category: Category,
+
+        pub fn format(self: Token, writer: *Io.Writer) Io.Writer.Error!void {
+            try writer.writeAll(self.value);
+        }
     };
 
     fn init(str: []const u8) Tokenizer {
@@ -556,6 +590,14 @@ const Tokenizer = struct {
             else
                 unreachable,
         };
+    }
+
+    fn peek(self: *Tokenizer) ?Token {
+        if (self.next() catch return null) |tok| {
+            defer self.rollback(tok);
+            return tok;
+        }
+        return null;
     }
 
     /// Expect a token in a category or a specific string.
