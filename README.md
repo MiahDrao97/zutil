@@ -188,6 +188,22 @@ The `Formatting` struct contains the complex formatting details.
 Initialize with a comptime format string using the `fmtStr()` function (e.g. "yyyy-MM-dd hh:mm:ss.fffZ").
 The `Formatting` struct can parse a date-time string with the exact format or write a string with that format.
 
+```zig
+const std = @import("std");
+const zutil = @import("zutil");
+const testing = std.testing;
+const Io = std.Io;
+const DateTimeFormat = zutil.string.DateTimeFormat;
+
+const nanoseconds: i96 = 1779486527036758700; // Friday, May 22, 2026 at 9:48:47.0367587 PM (UTC)
+
+var stream: Io.Writer.Allocating = .init(testing.allocator);
+defer stream.deinit();
+// this is the ISO format, which you can simply use `DateTimeFormat.iso()` as shorthand for this
+try stream.writer.print("{f}", .{DateTimeFormat.fmt(.fmtStr("yyyy-MM-ddThh:mm:ss.fffZ"), .fromNanoseconds(nanoseconds), .utc)});
+try testing.expectEqualStrings("2026-05-22T21:48:47.036Z", stream.written());
+```
+
 #### Format guide:
 Year (represented with either 'y' or 'Y')
 y - Get the current year without leading zero
