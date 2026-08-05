@@ -205,51 +205,54 @@ try testing.expectEqualStrings("2026-05-22T21:48:47.036Z", stream.written());
 ```
 
 #### Format guide:
-Year (represented with either 'y' or 'Y')
+Year (y or Y)
 y - Get the current year without leading zero
 yy - Display the last 2 digits of the year
 yyy - Display the last 3 digits of the year
 yyyy - Display the last 4 digits of the year
 yyyyy - Include 5 digits for the year (adds leading zero)
 
-Month
+Month (M)
 M - Represent the month without leading zero
 MM - Adds leading zero
 MMM - Abreviated name of the month (e.g. "Jan", "Feb", etc.)
 MMMM - Full name of the month (e.g. "January", "February", etc.)
 
-Day
-d - Represent ehday of the month without leading zero
+Day (d)
+d - Represent the day of the month without leading zero
 dd - Adds leading zero
 
-Weekday
+Weekday (D)
 D - abbreviated weekday (e.g. "Mon", "Tue", etc)
 DD - full week day name (e.g. "Monday", "Tuesday", etc)
 
-Hour
+Hour (h)
 h - Represent hours without leading zero
 hh - Adds leading zero
 
-Minute
+Minute (m)
 m - Represent minutes without leading zero
 mm - Adds leading zero
 
-Second
+Second (s)
 s - Represent seconds without leading zero
 ss - Adds leading zero
 
 Sub-second (f)
-Represent up to 9 places:
+Represent up to 9 places (note that numbers are truncated, not rounded):
 fff => for milliseconds
 ffffff => for microseconds
 fffffffff => for nanoseconds
 
-UTC Offset
+UTC Offset (z)
 z - Represent +/- hours from UTC
 zz - Adds leading zero to +/- hours from UTC
 zzz - Includes quarter hours (not colon-separated) (e.g. -0715 for -7 hours and 15 minutes from UTC time)
 zzzz - ISO 8601 format, which includes quarter hours that are colon-separated (.e.g "-07:15" for -7 hours and 15 minutes from UTC time)
 Z - ISO 8601 format (shorthand for zzzz)
+
+The accepted separator characters are: ' ', '/', '-', '+', '_', '.', ',', ':', 'T'
+If there are any trailing separator characters, those will be trimmed.
 
 #### Io.Timestamp Best Practice
 Keep in mind that an `Io.Timestamp` is really just a count of nanoseconds.

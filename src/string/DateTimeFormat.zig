@@ -345,6 +345,15 @@ pub const ElementFormat = union(Element) {
 pub const FullFormat = struct {
     fmt: ElementFormat,
     fill: []const u8,
+
+    pub fn format(self: FullFormat, writer: *Io.Writer) Io.Writer.Error!void {
+        try writer.print("fill: '{s}' ", .{self.fill});
+        switch (self.fmt) {
+            .year => |y| try writer.print("year places: {d}", .{y}),
+            .subsecond => |s| try writer.print("subsecond places: {d}", .{s}),
+            inline else => |x| try writer.print("{t}: {t}", .{ self.fmt, x }),
+        }
+    }
 };
 
 /// This defines how a date-time string is formatted:
@@ -361,125 +370,134 @@ pub const Formatting = struct {
     };
 
     /// Format guide:
-    /// Year (represented with either 'y' or 'Y')
+    /// Year (y or Y)
     /// y - Get the current year without leading zero
     /// yy - Display the last 2 digits of the year
     /// yyy - Display the last 3 digits of the year
     /// yyyy - Display the last 4 digits of the year
     /// yyyyy - Include 5 digits for the year (adds leading zero)
     ///
-    /// Month
+    /// Month (M)
     /// M - Represent the month without leading zero
     /// MM - Adds leading zero
     /// MMM - Abreviated name of the month (e.g. "Jan", "Feb", etc.)
     /// MMMM - Full name of the month (e.g. "January", "February", etc.)
     ///
-    /// Day
-    /// d - Represent ehday of the month without leading zero
+    /// Day (d)
+    /// d - Represent the day of the month without leading zero
     /// dd - Adds leading zero
     ///
-    /// Weekday
+    /// Weekday (D)
     /// D - abbreviated weekday (e.g. "Mon", "Tue", etc)
     /// DD - full week day name (e.g. "Monday", "Tuesday", etc)
     ///
-    /// Hour
+    /// Hour (h)
     /// h - Represent hours without leading zero
     /// hh - Adds leading zero
     ///
-    /// Minute
+    /// Minute (m)
     /// m - Represent minutes without leading zero
     /// mm - Adds leading zero
     ///
-    /// Second
+    /// Second (s)
     /// s - Represent seconds without leading zero
     /// ss - Adds leading zero
     ///
     /// Sub-second (f)
-    /// Represent up to 9 places:
+    /// Represent up to 9 places (note that these numbers are truncated, not rounded):
     /// fff => for milliseconds
     /// ffffff => for microseconds
     /// fffffffff => for nanoseconds
     ///
-    /// UTC Offset
+    /// UTC Offset (z)
     /// z - Represent +/- hours from UTC
     /// zz - Adds leading zero to +/- hours from UTC
     /// zzz - Includes quarter hours (not colon-separated) (e.g. -0715 for -7 hours and 15 minutes from UTC time)
     /// zzzz - ISO 8601 format, which includes quarter hours that are colon-separated (.e.g "-07:15" for -7 hours and 15 minutes from UTC time)
     /// Z - ISO 8601 format (shorthand for zzzz)
-    /// TODO : How do I want to represent positive offsets by omitting the sign? I've seen a simple space that indicates positive offset.
+    ///
+    /// The accepted separator characters are: ' ', '/', '-', '+', '_', '.', ',', ':', 'T'
+    /// If there are any trailing separator characters, those will be trimmed.
     pub inline fn fmtStr(comptime format_str: []const u8) Formatting {
         comptime {
-            var formatting: Formatting = .init;
-            var current_element: ?Element = null;
-            var elem_len: usize = 0;
-            var fill_start: ?usize = null;
-            var current_fmt: FullFormat = undefined;
+            const ElementOrFill = union(enum) {
+                element: Element,
+                fill: []const u8,
 
+                const empty: @This() = .{ .fill = "" };
+            };
+
+            var formatting: Formatting = .init;
+            var current_fmt: FullFormat = undefined;
+            var elem_len: usize = 0;
+            var current: ElementOrFill = .empty;
             for (format_str, 0..) |char, i| {
-                const next: ?Element = switch (char) {
-                    'Y', 'y' => .year,
-                    'M' => .month,
-                    'd' => .day,
-                    'D' => .weekday,
-                    'h' => .hour,
-                    'm' => .minute,
-                    's' => .second,
-                    'f' => .subsecond,
-                    'Z', 'z' => .utc_offset,
+                const next: ElementOrFill = switch (char) {
+                    'Y', 'y' => .{ .element = .year },
+                    'M' => .{ .element = .month },
+                    'd' => .{ .element = .day },
+                    'D' => .{ .element = .weekday },
+                    'h' => .{ .element = .hour },
+                    'm' => .{ .element = .minute },
+                    's' => .{ .element = .second },
+                    'f' => .{ .element = .subsecond },
+                    'Z', 'z' => .{ .element = .utc_offset },
                     else => if (mem.findScalar(u8, separator_characters, char)) |_|
-                        null
+                        .{ .fill = format_str[i..][0..1] }
                     else
                         @compileError("Unexpected character '" ++ @as([]const u8, &.{char}) ++ "' in date-time format."),
                 };
-                if (current_element) |current| {
-                    if (next == current) {
-                        // more of the same
-                        elem_len += 1;
-                    } else if (next == null) {
-                        // we're finishing off the current segment since we encountered a separator
-                        if (fill_start == null) {
-                            fill_start = i;
-                            // capture the current
-                            current_fmt = .{
-                                .fmt = current.toFormat(format_str[i -| 1], elem_len),
-                                .fill = format_str[i..][0..1],
-                            };
-                            if (i + 1 < format_str.len) {
-                                elem_len = 1;
+                switch (next) {
+                    .fill => |new_fill| switch (current) {
+                        .fill => |*f| f.len += 1,
+                        .element => |e| {
+                            // We're on an element, and we just encountered fill; finish off this element and save it.
+                            current_fmt.fmt = e.toFormat(format_str[i -| 1], elem_len);
+                            if (formatting.fetchPut(e, current_fmt)) |_| {
+                                @compileError(comptimePrint("Found redundant formatting for {t}: '{s}'", .{ e, format_str }));
                             }
-                        } else if (fill_start) |_| current_fmt.fill.len += 1;
-                    } else if (next) |n| {
-                        fill_start = null;
-                        if (current_fmt.fmt != current) {
-                            // this is a quick turnaround where we don't have a separator between elements, so fill is empty
-                            current_fmt = .{
-                                .fmt = current.toFormat(format_str[i -| 1], elem_len),
-                                .fill = "",
-                            };
+                            current = .{ .fill = new_fill };
+                        },
+                    },
+                    .element => |new_element| {
+                        switch (current) {
+                            .fill => |f| {
+                                // We're on fill, and we just encountered the beginning of an element;
+                                current_fmt.fill = f;
+                                elem_len = 1;
+                                current = .{ .element = new_element };
+                            },
+                            .element => |e| {
+                                if (e == new_element) {
+                                    elem_len += 1;
+                                } else {
+                                    // No fill; this is simply a new element.
+                                    current_fmt.fmt = e.toFormat(format_str[i -| 1], elem_len);
+                                    if (formatting.fetchPut(e, current_fmt)) |_| {
+                                        @compileError(comptimePrint("Found redundant formatting for {t}: '{s}'", .{ e, format_str }));
+                                    }
+                                    elem_len = 1;
+                                    current = .{ .element = new_element };
+                                }
+                            }
                         }
-                        if (formatting.fetchPut(current, current_fmt)) |_| {
-                            @compileError(comptimePrint("Found redundant formatting for {t}: '{s}'", .{ current, format_str }));
-                        }
-                        // we're starting a new segment
-                        current_element = n;
-                        elem_len = 1;
-                    }
-                } else if (next) |n| {
-                    current_element = n;
-                    elem_len = 1;
-                }
 
-                // we're at the end with no separator
-                if (next != null and i + 1 == format_str.len) {
-                    if (current_element) |current| {
-                        current_fmt = .{
-                            .fmt = current.toFormat(char, elem_len),
-                            .fill = if (fill_start) |f| format_str[f..][0..1] else "",
-                        };
-                        if (formatting.fetchPut(current, current_fmt)) |_| {
-                            @compileError(comptimePrint("Found redundant formatting for {t}: '{s}'", .{ current, format_str }));
+                        // if we're at the end, we need to check if we currently have an element and put it into our formatting
+                        if (i == format_str.len - 1) {
+                            switch (current) {
+                                .element => |e| {
+                                    current_fmt.fmt = e.toFormat(format_str[i], elem_len);
+                                    if (formatting.fetchPut(e, current_fmt)) |_| {
+                                        @compileError(comptimePrint("Found redundant formatting for {t}: '{s}'", .{ e, format_str }));
+                                    }
+                                },
+                                .fill => {
+                                    // WARN : This has the side effect of trimming fill at the end of the format.
+                                    // This has implications for `parseExact(...)`, so this should be documented.
+                                },
+                            }
                         }
-                    }
+                    },
                 }
             }
             assert(formatting.map.count() > 0);
@@ -490,7 +508,7 @@ pub const Formatting = struct {
     /// Format like `yyyy-MM-ddThh:mm:ss.fffZ`
     pub const iso: Formatting = .fmtStr(iso_format_str);
 
-    pub fn fetchPut(self: *Formatting, key: Element, value: FullFormat) ?[]const u8 {
+    pub fn fetchPut(self: *Formatting, key: Element, value: FullFormat) ?FullFormat {
         if (self.map.fetchPut(key, value)) |old_value| {
             return old_value;
         }
@@ -693,93 +711,96 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
         formatting = .fmtStr(iso_format_str);
     }
     var iter: Formatting.Iterator = formatting.iterator();
-    while (iter.next()) |x| switch (x.value.fmt) {
-        .year => |y| switch (y) {
-            1 => try writer.print("{d}{s}", .{ year_day.year, x.value.fill }),
-            2 => try writer.print("{d:0>2}{s}", .{ year_day.year, x.value.fill }),
-            3 => try writer.print("{d:0>3}{s}", .{ year_day.year, x.value.fill }),
-            4 => try writer.print("{d:0>4}{s}", .{ year_day.year, x.value.fill }),
-            5 => try writer.print("{d:0>5}{s}", .{ year_day.year, x.value.fill }),
-            else => unreachable,
-        },
-        .month => |m| switch (m) {
-            .natural => try writer.print("{d}{s}", .{ month_day.month, x.value.fill }),
-            .zero_filled => try writer.print("{d:0>2}{s}", .{ month_day.month, x.value.fill }),
-            .abbreviation => {
-                var buf: [3]u8 = undefined;
-                var formatter: Io.Writer = .fixed(&buf);
-                formatter.print("{t}", .{month_day.month}) catch unreachable;
-                buf[0] = ascii.toUpper(buf[0]);
-                try writer.print("{s}{s}", .{ formatter.buffered(), x.value.fill });
+    while (iter.next()) |x| {
+        const fill: []const u8 = x.value.fill;
+        switch (x.value.fmt) {
+            .year => |y| switch (y) {
+                1 => try writer.print("{s}{d}", .{ fill, year_day.year }),
+                2 => try writer.print("{s}{d:0>2}", .{ fill, year_day.year }),
+                3 => try writer.print("{s}{d:0>3}", .{ fill, year_day.year }),
+                4 => try writer.print("{s}{d:0>4}", .{ fill, year_day.year }),
+                5 => try writer.print("{s}{d:0>5}", .{ fill, year_day.year }),
+                else => unreachable,
             },
-            .full_name => try writer.print("{s}{s}", .{ switch (month_day.month) {
-                .jan => "January",
-                .feb => "February",
-                .mar => "March",
-                .apr => "April",
-                .may => "May",
-                .jun => "June",
-                .jul => "July",
-                .aug => "August",
-                .sep => "September",
-                .oct => "October",
-                .nov => "November",
-                .dec => "December",
-            }, x.value.fill }),
-        },
-        .day => |d| switch (d) {
-            // day index starts at 0
-            .natural => try writer.print("{d}{s}", .{ month_day.day_index + 1, x.value.fill }),
-            .zero_filled => try writer.print("{d:0>2}{s}", .{ month_day.day_index + 1, x.value.fill }),
-        },
-        .weekday => |w| switch (w) {
-            .abbreviation => {
-                const weekday: WeekDay = .fromTimestamp(self.timestamp);
-                try writer.print("{s}{s}", .{ weekday.abbreviate(), x.value.fill });
+            .month => |m| switch (m) {
+                .natural => try writer.print("{s}{d}", .{ fill, month_day.month }),
+                .zero_filled => try writer.print("{s}{d:0>2}", .{ fill, month_day.month }),
+                .abbreviation => {
+                    var buf: [3]u8 = undefined;
+                    var formatter: Io.Writer = .fixed(&buf);
+                    formatter.print("{t}", .{month_day.month}) catch unreachable;
+                    buf[0] = ascii.toUpper(buf[0]);
+                    try writer.print("{s}{s}", .{ fill, formatter.buffered() });
+                },
+                .full_name => try writer.print("{s}{s}", .{ fill, switch (month_day.month) {
+                    .jan => "January",
+                    .feb => "February",
+                    .mar => "March",
+                    .apr => "April",
+                    .may => "May",
+                    .jun => "June",
+                    .jul => "July",
+                    .aug => "August",
+                    .sep => "September",
+                    .oct => "October",
+                    .nov => "November",
+                    .dec => "December",
+                } }),
             },
-            .full_name => {
-                const weekday: WeekDay = .fromTimestamp(self.timestamp);
-                try writer.print("{t}{s}", .{ weekday, x.value.fill });
+            .day => |d| switch (d) {
+                // day index starts at 0
+                .natural => try writer.print("{s}{d}", .{ fill, month_day.day_index + 1 }),
+                .zero_filled => try writer.print("{s}{d:0>2}", .{ fill, month_day.day_index + 1 }),
             },
-        },
-        .hour => |h| switch (h) {
-            .natural => try writer.print("{d}{s}", .{ @abs(hour), x.value.fill }),
-            .zero_filled => try writer.print("{d:0>2}{s}", .{ @abs(hour), x.value.fill }),
-        },
-        .minute => |m| switch (m) {
-            .natural => try writer.print("{d}{s}", .{ @abs(min), x.value.fill }),
-            .zero_filled => try writer.print("{d:0>2}{s}", .{ @abs(min), x.value.fill }),
-        },
-        .second => |s| switch (s) {
-            .natural => try writer.print("{d}{s}", .{ @abs(sec), x.value.fill }),
-            .zero_filled => try writer.print("{d:0>2}{s}", .{ @abs(sec), x.value.fill }),
-        },
-        .subsecond => |places| if (places > 0) {
-            // write all nanoseconds to a buffer and strategically truncate
-            var buf: [32]u8 = undefined;
-            const full_ns: []const u8 = std.fmt.bufPrint(&buf, "{d}", .{self.timestamp.nanoseconds}) catch unreachable;
-            // get the last 9 characters
-            const subseconds: []const u8 = full_ns[full_ns.len - 9 ..];
+            .weekday => |w| switch (w) {
+                .abbreviation => {
+                    const weekday: WeekDay = .fromTimestamp(self.timestamp);
+                    try writer.print("{s}{s}", .{ fill, weekday.abbreviate() });
+                },
+                .full_name => {
+                    const weekday: WeekDay = .fromTimestamp(self.timestamp);
+                    try writer.print("{s}{t}", .{ fill, weekday });
+                },
+            },
+            .hour => |h| switch (h) {
+                .natural => try writer.print("{s}{d}", .{ fill, @abs(hour) }),
+                .zero_filled => try writer.print("{s}{d:0>2}", .{ fill, @abs(hour) }),
+            },
+            .minute => |m| switch (m) {
+                .natural => try writer.print("{s}{d}", .{ fill, @abs(min) }),
+                .zero_filled => try writer.print("{s}{d:0>2}", .{ fill, @abs(min) }),
+            },
+            .second => |s| switch (s) {
+                .natural => try writer.print("{s}{d}", .{ fill, @abs(sec) }),
+                .zero_filled => try writer.print("{s}{d:0>2}", .{ fill, @abs(sec) }),
+            },
+            .subsecond => |places| if (places > 0) {
+                // write all nanoseconds to a buffer and strategically truncate
+                var buf: [32]u8 = undefined;
+                const full_ns: []const u8 = std.fmt.bufPrint(&buf, "{d}", .{self.timestamp.nanoseconds}) catch unreachable;
+                // get the last 9 characters
+                const subseconds: []const u8 = full_ns[full_ns.len - 9 ..];
 
-            try writer.print("{s}{s}", .{ subseconds[0..places], x.value.fill });
-        },
-        .utc_offset => |offset_fmt| {
-            if (self.utc_offset == UtcOffset.utc and offset_fmt == .iso) {
-                try writer.writeByte('Z');
-            } else {
-                const sign_char: u8 = switch (self.utc_offset.sign) {
-                    .positive => '+',
-                    .negative => '-',
-                };
-                switch (offset_fmt) {
-                    .hours_only => try writer.print("{c}{d}", .{ sign_char, self.utc_offset.hours }),
-                    .hours_only_zero_filled => try writer.print("{c}{d:0>2}", .{ sign_char, self.utc_offset.hours }),
-                    .hours_and_minutes => try writer.print("{c}{d:0>2}{d:0>2}", .{ sign_char, self.utc_offset.hours, @as(u16, self.utc_offset.quarter_hours) * 15 }),
-                    .iso => try writer.print("{c}{d:0>2}:{d:0>2}", .{ sign_char, self.utc_offset.hours, @as(u16, self.utc_offset.quarter_hours) * 15 }),
+                try writer.print("{s}{s}", .{ fill, subseconds[0..places] });
+            },
+            .utc_offset => |offset_fmt| {
+                if (self.utc_offset == UtcOffset.utc and offset_fmt == .iso) {
+                    try writer.writeByte('Z');
+                } else {
+                    const sign_char: u8 = switch (self.utc_offset.sign) {
+                        .positive => '+', // TODO : evaluate fill as well
+                        .negative => '-',
+                    };
+                    switch (offset_fmt) {
+                        .hours_only => try writer.print("{c}{d}", .{ sign_char, self.utc_offset.hours }),
+                        .hours_only_zero_filled => try writer.print("{c}{d:0>2}", .{ sign_char, self.utc_offset.hours }),
+                        .hours_and_minutes => try writer.print("{c}{d:0>2}{d:0>2}", .{ sign_char, self.utc_offset.hours, @as(u16, self.utc_offset.quarter_hours) * 15 }),
+                        .iso => try writer.print("{c}{d:0>2}:{d:0>2}", .{ sign_char, self.utc_offset.hours, @as(u16, self.utc_offset.quarter_hours) * 15 }),
+                    }
                 }
-            }
-        },
-    };
+            },
+        }
+    }
 }
 
 /// A more flexible parsing strategy, where `expected_elements` lists the elements we expect and which order we expect them.
@@ -833,11 +854,10 @@ pub fn parseExact(str: []const u8, formatting: Formatting) ParseExactError!DateT
         switch (tok.category) {
             .separator => {
                 if (!mem.eql(u8, tok.value, current_element.value.fill)) {
-                    log.err("Separator following element {t} did not match. Expected: '{s}', Received: '{s}'", .{ current_element.key, current_element.value.fill, tok.value });
+                    log.err("Separator preceeding element {t} did not match. Expected: '{s}', Received: '{s}'", .{ current_element.key, current_element.value.fill, tok.value });
                     return error.MismatchedSeparator;
                 }
                 log.debug("Matched expected separator '{s}'. Getting next segment.", .{tok.value});
-                current_element = expected_elements.next() orelse break;
             },
             else => {
                 if (tok.value.len > 0) {
@@ -849,11 +869,8 @@ pub fn parseExact(str: []const u8, formatting: Formatting) ParseExactError!DateT
                             panic("Date-time element {t} was present more than once. Attempting to add segment '{s}'.", .{ current_element.key, tok.value });
                         }
                         log.debug("Segment ({t}): '{s}'", .{ current_element.key, tok.value });
-                        if (current_element.value.fill.len == 0) {
-                            // if there's no fill, then we need to switch to the next element
-                            current_element = expected_elements.next() orelse break;
-                        }
                     }
+                    current_element = expected_elements.next() orelse break;
                 }
                 // ignore empty strings
             }
@@ -990,7 +1007,15 @@ test iso {
 
     var stream: Io.Writer.Allocating = .init(testing.allocator);
     defer stream.deinit();
-    try stream.writer.print("{f}", .{DateTimeFormat.iso(.fromNanoseconds(nanoseconds))});
+    const datetime_fmt: DateTimeFormat = .iso(.fromNanoseconds(nanoseconds));
+    try stream.writer.print("{f}", .{datetime_fmt});
+
+    errdefer {
+        var iter: Formatting.Iterator = datetime_fmt.formatting.iterator();
+        while (iter.next()) |entry| {
+            std.debug.print("  Formatting {f}\n", .{entry.value.*});
+        }
+    }
 
     // this is a good test case because the milliseconds start with a leading zero
     try testing.expectEqualStrings("2026-05-22T21:48:47.036Z", stream.written());
@@ -1005,6 +1030,13 @@ test parseExact {
     const date_str = "2026-05-22T21:48:47.036Z";
     const date_time: DateTimeFormat = try .parseExact(date_str, .iso);
 
+    errdefer {
+        var iter: Formatting.Iterator = date_time.formatting.iterator();
+        while (iter.next()) |entry| {
+            std.debug.print("  Formatting {f}\n", .{entry.value.*});
+        }
+    }
+
     try testing.expectEqual(1779486527036000000, date_time.timestamp.nanoseconds);
     try testing.expect(date_time.formatting.map.contains(.utc_offset));
 }
@@ -1012,6 +1044,13 @@ test parse {
     const date_str = "2026-05-22T21:48:47.036Z";
     var date_time: DateTimeFormat = try .parse(date_str, &.{ .year, .month, .day, .hour, .minute, .second, .subsecond, .utc_offset });
     try testing.expectEqual(1779486527036000000, date_time.timestamp.nanoseconds);
+
+    errdefer {
+        var iter: Formatting.Iterator = date_time.formatting.iterator();
+        while (iter.next()) |entry| {
+            std.debug.print("  Formatting {f}\n", .{entry.value.*});
+        }
+    }
 
     // what if we only want the date?
     date_time = try .parse(date_str, &.{ .year, .month, .day });
