@@ -23,7 +23,10 @@ pub const UtcOffset = packed struct(u8) {
     pub fn asDuration(self: UtcOffset) Io.Duration {
         var ns: i96 = 0;
         ns += self.hours * time.ns_per_hour;
-        ns += self.quarter_hours * if (self.hours < 0) -1 else 1 * 15 * time.ns_per_min;
+        ns += self.quarter_hours * 15 * time.ns_per_min;
+        if (self.sign == .negative) {
+            ns *= -1;
+        }
         return .fromNanoseconds(ns);
     }
 
@@ -252,7 +255,7 @@ pub const Element = enum {
 
     fn toFormat(self: Element, char: u8, elem_len: comptime_int) ElementFormat {
         // cap Z is shorthand for ISO-formatted UTC offset
-        if (char == 'Z') {
+        if (char == 'Z' and elem_len == 1) {
             return .{ .utc_offset = .iso };
         }
         return switch (self) {
