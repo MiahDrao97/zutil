@@ -30,6 +30,13 @@ pub const UtcOffset = packed struct(u8) {
         return .fromNanoseconds(ns);
     }
 
+    pub fn isZero(self: UtcOffset) bool {
+        return switch (self) {
+            .utc, .{ .sign = .negative, .hours = 0, .quarter_hours = 0 } => true,
+            else => false,
+        };
+    }
+
     fn parse(tokenizer: *Tokenizer) error{InvalidUtcOffset}!UtcOffset {
         var offset: UtcOffset = .utc;
         var next: Tokenizer.Token = tokenizer.expectOneOf(&.{
@@ -394,7 +401,7 @@ pub const Formatting = struct {
     /// D - abbreviated weekday (e.g. "Mon", "Tue", etc)
     /// DD - full week day name (e.g. "Monday", "Tuesday", etc)
     ///
-    /// Hour (h)
+    /// Hour (h or H)
     /// h - Represent hours without leading zero
     /// hh - Adds leading zero
     ///
@@ -421,6 +428,8 @@ pub const Formatting = struct {
     ///
     /// The accepted separator characters are: ' ', '/', '-', '+', '_', '.', ',', ':', 'T'
     /// If there are any trailing separator characters, those will be trimmed.
+    /// If a UTC offset is directly preceeded by a '+' or a '-', it will include a '+' in positive offsets, replacing the fill with the correct sign.
+    /// If a UTC offset is not directly preceed by a '+' or a '-', positive offsets will simply start with a space.
     pub inline fn fmtStr(comptime format_str: []const u8) Formatting {
         comptime {
             const ElementOrFill = union(enum) {
@@ -440,7 +449,7 @@ pub const Formatting = struct {
                     'M' => .{ .element = .month },
                     'd' => .{ .element = .day },
                     'D' => .{ .element = .weekday },
-                    'h' => .{ .element = .hour },
+                    'H', 'h' => .{ .element = .hour },
                     'm' => .{ .element = .minute },
                     's' => .{ .element = .second },
                     'f' => .{ .element = .subsecond },
@@ -459,6 +468,8 @@ pub const Formatting = struct {
                             if (formatting.fetchPut(e, current_fmt)) |_| {
                                 @compileError(comptimePrint("Found redundant formatting for {t}: '{s}'", .{ e, format_str }));
                             }
+                            // start fresh
+                            current_fmt.fill = "";
                             current = .{ .fill = new_fill };
                         },
                     },
@@ -479,6 +490,8 @@ pub const Formatting = struct {
                                     if (formatting.fetchPut(e, current_fmt)) |_| {
                                         @compileError(comptimePrint("Found redundant formatting for {t}: '{s}'", .{ e, format_str }));
                                     }
+                                    // start fresh
+                                    current_fmt.fill = "";
                                     elem_len = 1;
                                     current = .{ .element = new_element };
                                 }
@@ -715,7 +728,7 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
     }
     var iter: Formatting.Iterator = formatting.iterator();
     while (iter.next()) |x| {
-        const fill: []const u8 = x.value.fill;
+        var fill: []const u8 = x.value.fill;
         switch (x.value.fmt) {
             .year => |y| switch (y) {
                 1 => try writer.print("{s}{d}", .{ fill, year_day.year }),
@@ -787,18 +800,25 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
                 try writer.print("{s}{s}", .{ fill, subseconds[0..places] });
             },
             .utc_offset => |offset_fmt| {
-                if (self.utc_offset == UtcOffset.utc and offset_fmt == .iso) {
-                    try writer.writeByte('Z');
+                if (self.utc_offset.isZero() and offset_fmt == .iso) {
+                    try writer.print("{s}Z", .{fill});
                 } else {
+                    const last_fill_char: u8 = fill[fill.len - 1];
                     const sign_char: u8 = switch (self.utc_offset.sign) {
-                        .positive => '+', // TODO : evaluate fill as well
+                        .positive => switch (last_fill_char) {
+                            '-', '+' => '+',
+                            else => ' ',
+                        },
                         .negative => '-',
                     };
+                    if (last_fill_char == sign_char) {
+                        fill = fill[0 .. fill.len - 1];
+                    }
                     switch (offset_fmt) {
-                        .hours_only => try writer.print("{c}{d}", .{ sign_char, self.utc_offset.hours }),
-                        .hours_only_zero_filled => try writer.print("{c}{d:0>2}", .{ sign_char, self.utc_offset.hours }),
-                        .hours_and_minutes => try writer.print("{c}{d:0>2}{d:0>2}", .{ sign_char, self.utc_offset.hours, @as(u16, self.utc_offset.quarter_hours) * 15 }),
-                        .iso => try writer.print("{c}{d:0>2}:{d:0>2}", .{ sign_char, self.utc_offset.hours, @as(u16, self.utc_offset.quarter_hours) * 15 }),
+                        .hours_only => try writer.print("{s}{c}{d}", .{ fill, sign_char, self.utc_offset.hours }),
+                        .hours_only_zero_filled => try writer.print("{s}{c}{d:0>2}", .{ fill, sign_char, self.utc_offset.hours }),
+                        .hours_and_minutes => try writer.print("{s}{c}{d:0>2}{d:0>2}", .{ fill, sign_char, self.utc_offset.hours, @as(u16, self.utc_offset.quarter_hours) * 15 }),
+                        .iso => try writer.print("{s}{c}{d:0>2}:{d:0>2}", .{ fill, sign_char, self.utc_offset.hours, @as(u16, self.utc_offset.quarter_hours) * 15 }),
                     }
                 }
             },

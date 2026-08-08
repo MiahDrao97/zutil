@@ -226,7 +226,7 @@ Weekday (D)
 D - abbreviated weekday (e.g. "Mon", "Tue", etc)
 DD - full week day name (e.g. "Monday", "Tuesday", etc)
 
-Hour (h)
+Hour (h or H)
 h - Represent hours without leading zero
 hh - Adds leading zero
 
@@ -253,6 +253,8 @@ Z - ISO 8601 format (shorthand for zzzz)
 
 The accepted separator characters are: ' ', '/', '-', '+', '_', '.', ',', ':', 'T'
 If there are any trailing separator characters, those will be trimmed.
+If a UTC offset is directly preceeded by a '+' or a '-', it will include a '+' in positive offsets, replacing the fill with the correct sign.
+If a UTC offset is not directly preceed by a '+' or a '-', positive offsets will simply start with a space.
 
 #### Io.Timestamp Best Practice
 Keep in mind that an `Io.Timestamp` is really just a count of nanoseconds.
