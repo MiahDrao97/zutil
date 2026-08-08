@@ -58,7 +58,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             pub fn release(self: SafeReader) void {
                 const count_as_int: *Atomic(u16) = @ptrCast(self.ref_count);
                 const prev_count: RefCount = @enumFromInt(count_as_int.fetchSub(1, .release));
-                // The previous ref count must be some value between 1 and 32767.
+                // The previous ref count must be some value between 1 and the max.
                 // Otherwise, something's broken...
                 debug.assert(prev_count.compare(.gt, .zero));
                 debug.assert(prev_count.compare(.lte, .max));

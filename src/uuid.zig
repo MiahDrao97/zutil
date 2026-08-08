@@ -242,11 +242,11 @@ pub const Uuid = extern struct {
     /// Writes the default lower-case format with dashes for separators.
     /// If you want to write this UUID in a different format, use `writeTo()`.
     pub fn format(self: Uuid, writer: *Io.Writer) Io.Writer.Error!void {
-        try writer.print("{f}", .{self.asFormat(.{})});
+        try writer.print("{f}", .{self.fmt(.{})});
     }
 
     /// Specify a particular format if you don't wish to use the default format
-    pub fn asFormat(self: Uuid, options: FormatOptions) Formatter {
+    pub fn fmt(self: Uuid, options: FormatOptions) Formatter {
         return .{
             .opts = options,
             .uuid = self,
@@ -320,7 +320,7 @@ pub const Uuid = extern struct {
         // no dashes
         {
             defer _ = writer.consumeAll();
-            try writer.print("{f}", .{uuid.asFormat(.{ .seperator = .none })});
+            try writer.print("{f}", .{uuid.fmt(.{ .seperator = .none })});
 
             const uuid_str: []const u8 = writer.buffered();
             const parsed: Uuid = try .from(uuid_str);

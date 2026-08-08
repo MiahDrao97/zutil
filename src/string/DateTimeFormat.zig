@@ -20,6 +20,16 @@ pub const UtcOffset = packed struct(u8) {
     /// Zero-offset (aka UTC time)
     pub const utc: UtcOffset = .{ .sign = .positive, .hours = 0, .quarter_hours = 0 };
 
+    /// Uses a signed 6-bit integer to determine hours offset and if it's positive/negative.
+    /// Omits quarter hours.
+    pub fn fromHours(hours: i6) UtcOffset {
+        return .{
+            .sign = if (hours < 0) .negative else .positive,
+            .hours = @abs(@as(i5, @truncate(hours))),
+            .quarter_hours = 0,
+        };
+    }
+
     pub fn asDuration(self: UtcOffset) Io.Duration {
         var ns: i96 = 0;
         ns += self.hours * time.ns_per_hour;
@@ -353,8 +363,10 @@ pub const ElementFormat = union(Element) {
 };
 
 pub const FullFormat = struct {
-    fmt: ElementFormat,
+    /// The fill preceding the element
     fill: []const u8,
+    /// The element and its format
+    fmt: ElementFormat,
 
     pub fn format(self: FullFormat, writer: *Io.Writer) Io.Writer.Error!void {
         try writer.print("fill: '{s}' ", .{self.fill});
@@ -804,14 +816,17 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
                     try writer.print("{s}Z", .{fill});
                 } else {
                     const last_fill_char: u8 = fill[fill.len - 1];
-                    const sign_char: u8 = switch (self.utc_offset.sign) {
+                    const sign_char: u8, const is_plus_or_minus: bool = switch (self.utc_offset.sign) {
                         .positive => switch (last_fill_char) {
-                            '-', '+' => '+',
-                            else => ' ',
+                            '-', '+' => .{ '+', true },
+                            else => .{ ' ', false },
                         },
-                        .negative => '-',
+                        .negative => .{ '-', true },
                     };
-                    if (last_fill_char == sign_char) {
+                    if (last_fill_char == sign_char or (is_plus_or_minus and switch (last_fill_char) {
+                        '+', '-' => true,
+                        else => false,
+                    })) {
                         fill = fill[0 .. fill.len - 1];
                     }
                     switch (offset_fmt) {
@@ -1102,6 +1117,54 @@ test parseMonth {
     try testing.expectEqual(Month.nov, try parseMonth("Nov"));
     try testing.expectEqual(Month.nov, try parseMonth("November"));
     try testing.expectError(error.InvalidMonth, parseMonth("Nove"));
+}
+test format {
+    const nanoseconds: i96 = 1779486527036758700; // Friday, May 22, 2026 at 9:48:47.0367587 PM (UTC)
+
+    var stream: Io.Writer.Allocating = .init(testing.allocator);
+    defer stream.deinit();
+    var datetime_fmt: DateTimeFormat = .{
+        .formatting = .fmtStr("D, MMMM d, yyyy h:mm:ss.ffffff zzz"),
+        .timestamp = .fromNanoseconds(nanoseconds),
+        .utc_offset = .fromHours(2),
+    };
+
+    errdefer {
+        var iter: Formatting.Iterator = datetime_fmt.formatting.iterator();
+        while (iter.next()) |entry| {
+            std.debug.print("  Formatting {f}\n", .{entry.value.*});
+        }
+    }
+
+    {
+        defer stream.clearRetainingCapacity();
+        try stream.writer.print("{f}", .{datetime_fmt});
+        try testing.expectEqualStrings("Fri, May 22, 2026 21:48:47.036758 0200", stream.written());
+    }
+    {
+        defer stream.clearRetainingCapacity();
+        datetime_fmt.utc_offset.sign = .negative;
+        try stream.writer.print("{f}", .{datetime_fmt});
+        try testing.expectEqualStrings("Fri, May 22, 2026 21:48:47.036758 -0200", stream.written());
+    }
+    {
+        defer stream.clearRetainingCapacity();
+        datetime_fmt.formatting = .fmtStr("D, MMMM d, yyyy h:mm:ss.ffffff +zzz");
+        try stream.writer.print("{f}", .{datetime_fmt});
+        try testing.expectEqualStrings("Fri, May 22, 2026 21:48:47.036758 -0200", stream.written());
+    }
+    {
+        defer stream.clearRetainingCapacity();
+        datetime_fmt.utc_offset.sign = .positive;
+        try stream.writer.print("{f}", .{datetime_fmt});
+        try testing.expectEqualStrings("Fri, May 22, 2026 21:48:47.036758 +0200", stream.written());
+    }
+    {
+        defer stream.clearRetainingCapacity();
+        datetime_fmt.formatting = .fmtStr("D, MMMM d, yyyy h:mm:ss.ffffff -zzz");
+        try stream.writer.print("{f}", .{datetime_fmt});
+        try testing.expectEqualStrings("Fri, May 22, 2026 21:48:47.036758 +0200", stream.written());
+    }
 }
 
 comptime {
