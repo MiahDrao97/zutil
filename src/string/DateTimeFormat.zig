@@ -269,6 +269,9 @@ pub const Element = enum {
     subsecond,
     /// UTC offset
     utc_offset,
+    /// Ante meridiem or post merdiem
+    /// The presence of this element puts the time in a twelve-hour clock
+    am_pm,
 
     fn toFormat(self: Element, char: u8, elem_len: comptime_int) ElementFormat {
         // cap Z is shorthand for ISO-formatted UTC offset
@@ -337,6 +340,20 @@ pub const Element = enum {
                     else => @compileError(comptimePrint("Invalid utc offset format '{s}'", .{&@as([elem_len]u8, @splat('z'))})),
                 },
             },
+            .am_pm => .{
+                .am_pm = .{
+                    .upper = switch (char) {
+                        'n' => false,
+                        'N' => true,
+                        else => unreachable,
+                    },
+                    .both_letters = switch (elem_len) {
+                        1 => false,
+                        2 => true,
+                        else => @compileError(comptimePrint("Invalid AM/PM format '{s}'", .{&@as([elem_len]u8, @splat(char))})),
+                    },
+                },
+            },
         };
     }
 };
@@ -360,6 +377,8 @@ pub const ElementFormat = union(Element) {
     subsecond: u4,
     /// UTC offset format, whether or not to include
     utc_offset: enum { hours_only, hours_only_zero_filled, hours_and_minutes, iso },
+    /// Represent AM or PM in 4 different combinations
+    am_pm: packed struct(u2) { upper: bool, both_letters: bool },
 };
 
 pub const FullFormat = struct {
@@ -438,6 +457,12 @@ pub const Formatting = struct {
     /// zzzz - ISO 8601 format, which includes quarter hours that are colon-separated (.e.g "-07:15" for -7 hours and 15 minutes from UTC time)
     /// Z - ISO 8601 format (shorthand for zzzz)
     ///
+    /// AM/PM (n or N, for "noon")
+    /// n - first letter, lower case
+    /// N - first letter, upper case
+    /// nn - both letters, lower case
+    /// NN - both letters, upper case
+    ///
     /// The accepted separator characters are: ' ', '/', '-', '+', '_', '.', ',', ':', 'T'
     /// If there are any trailing separator characters, those will be trimmed.
     /// If a UTC offset is directly preceeded by a '+' or a '-', it will include a '+' in positive offsets, replacing the fill with the correct sign.
@@ -465,6 +490,7 @@ pub const Formatting = struct {
                     'm' => .{ .element = .minute },
                     's' => .{ .element = .second },
                     'f' => .{ .element = .subsecond },
+                    'N', 'n' => .{ .element = .am_pm },
                     'Z', 'z' => .{ .element = .utc_offset },
                     else => if (mem.findScalar(u8, separator_characters, char)) |_|
                         .{ .fill = format_str[i..][0..1] }
@@ -790,9 +816,20 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
                     try writer.print("{s}{t}", .{ fill, weekday });
                 },
             },
-            .hour => |h| switch (h) {
-                .natural => try writer.print("{s}{d}", .{ fill, @abs(hour) }),
-                .zero_filled => try writer.print("{s}{d:0>2}", .{ fill, @abs(hour) }),
+            .hour => |h| {
+                assert(hour >= 0 and hour < 24);
+                var hour_inner: i64 = hour;
+                if (self.formatting.map.contains(.am_pm)) {
+                    switch (hour) {
+                        0 => hour_inner = 12, // midnight is 12 am
+                        13...23 => hour_inner -= 12, // past noon, we start over at 1
+                    }
+                    assert(hour_inner >= 1 and hour_inner <= 12);
+                }
+                switch (h) {
+                    .natural => try writer.print("{s}{d}", .{ fill, hour_inner }),
+                    .zero_filled => try writer.print("{s}{d:0>2}", .{ fill, hour_inner }),
+                }
             },
             .minute => |m| switch (m) {
                 .natural => try writer.print("{s}{d}", .{ fill, @abs(min) }),
@@ -836,6 +873,18 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
                         .iso => try writer.print("{s}{c}{d:0>2}:{d:0>2}", .{ fill, sign_char, self.utc_offset.hours, @as(u16, self.utc_offset.quarter_hours) * 15 }),
                     }
                 }
+            },
+            .am_pm => |meridiem| {
+                var am_pm_str: [2]u8 = switch (hour) {
+                    0...11 => "am".*,
+                    12...23 => "pm".*,
+                    else => unreachable,
+                };
+                if (meridiem.upper) {
+                    am_pm_str[0] = ascii.toUpper(am_pm_str[0]);
+                    am_pm_str[1] = ascii.toUpper(am_pm_str[1]);
+                }
+                try writer.print("{s}{s}", .{ fill, am_pm_str[0..if (meridiem.both_letters) 2 else 1] });
             },
         }
     }
@@ -1164,6 +1213,12 @@ test format {
         datetime_fmt.formatting = .fmtStr("D, MMMM d, yyyy h:mm:ss.ffffff -zzz");
         try stream.writer.print("{f}", .{datetime_fmt});
         try testing.expectEqualStrings("Fri, May 22, 2026 21:48:47.036758 +0200", stream.written());
+    }
+    {
+        defer stream.clearRetainingCapacity();
+        datetime_fmt.formatting = .fmtStr("D, MMMM d, yyyy h:mm:ss.ffffff nn -zzz");
+        try stream.writer.print("{f}", .{datetime_fmt});
+        try testing.expectEqualStrings("Fri, May 22, 2026 9:48:47.036758 pm +0200", stream.written());
     }
 }
 
