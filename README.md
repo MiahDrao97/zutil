@@ -251,6 +251,12 @@ zzz - Includes quarter hours (not colon-separated) (e.g. -0715 for -7 hours and 
 zzzz - ISO 8601 format, which includes quarter hours that are colon-separated (.e.g "-07:15" for -7 hours and 15 minutes from UTC time)
 Z - ISO 8601 format (shorthand for zzzz)
 
+AM/PM (n or N, for "noon")
+n - first letter, lower case
+N - first letter, upper case
+nn - both letters, lower case
+NN - both letters, upper case
+
 The accepted separator characters are: ' ', '/', '-', '+', '_', '.', ',', ':', 'T'
 If there are any trailing separator characters, those will be trimmed.
 If a UTC offset is directly preceeded by a '+' or a '-', it will include a '+' in positive offsets, replacing the fill with the correct sign.

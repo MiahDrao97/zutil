@@ -215,6 +215,7 @@ pub const ParseError = error{
     InvalidAmPm,
     MissingYear,
     MissingMonth,
+    MissingHour,
 };
 
 /// Various parse errors that could be returned from `parseExact(...)`
@@ -401,6 +402,7 @@ pub const FullFormat = struct {
 
 /// This defines how a date-time string is formatted:
 /// Which elements are represented, which separator character(s) sit between elements, and which order elements appear.
+/// OPTIMIZE : This structure contains redundant information, especially since FullFormat envelopes a union
 pub const Formatting = struct {
     /// Which elements are present and separator character(s) come after them
     map: EnumMap(Element, FullFormat),
@@ -924,7 +926,7 @@ pub fn parse(str: []const u8, expected_elements: []const Element) ParseError!Dat
             }
         }
     }
-    const timestamp: Io.Timestamp = try parseInner(&map);
+    const timestamp: Io.Timestamp = try parseInner(&map, null);
     return .{
         .timestamp = timestamp,
         .formatting = .init,
@@ -938,6 +940,7 @@ pub fn parseExact(str: []const u8, formatting: Formatting) ParseExactError!DateT
     var map: EnumMap(Element, []const u8) = .init(.{});
 
     var utc_offset: UtcOffset = .utc;
+    var subsecond_len: ?usize = null;
     var expected_elements: Formatting.Iterator = formatting.iterator();
     var tokenizer: Tokenizer = .init(mem.trim(u8, str, &ascii.whitespace));
     var current_element: Formatting.Entry = expected_elements.next() orelse unreachable;
@@ -952,14 +955,20 @@ pub fn parseExact(str: []const u8, formatting: Formatting) ParseExactError!DateT
             },
             else => {
                 if (tok.value.len > 0) {
-                    if (current_element.key == .utc_offset) {
-                        tokenizer.rollback(tok);
-                        utc_offset = try .parse(&tokenizer);
-                    } else {
-                        if (map.fetchPut(current_element.key, tok.value)) |_| {
-                            panic("Date-time element {t} was present more than once. Attempting to add segment '{s}'.", .{ current_element.key, tok.value });
-                        }
-                        log.debug("Segment ({t}): '{s}'", .{ current_element.key, tok.value });
+                    switch (current_element.key) {
+                        .utc_offset => {
+                            tokenizer.rollback(tok);
+                            utc_offset = try .parse(&tokenizer);
+                        },
+                        else => {
+                            if (current_element.key == .subsecond) {
+                                subsecond_len = current_element.value.fmt.subsecond;
+                            }
+                            if (map.fetchPut(current_element.key, tok.value)) |_| {
+                                panic("Date-time element {t} was present more than once. Attempting to add segment '{s}'.", .{ current_element.key, tok.value });
+                            }
+                            log.debug("Segment ({t}): '{s}'", .{ current_element.key, tok.value });
+                        },
                     }
                     current_element = expected_elements.next() orelse break;
                 }
@@ -971,7 +980,7 @@ pub fn parseExact(str: []const u8, formatting: Formatting) ParseExactError!DateT
         log.err("Expected elements have been filled, but the date-time string has another segment '{s}'.", .{tok.value});
         return error.UnrecognizedSegment;
     }
-    const timestamp: Io.Timestamp = try parseInner(&map);
+    const timestamp: Io.Timestamp = try parseInner(&map, subsecond_len);
     return .{
         .timestamp = timestamp,
         .formatting = formatting,
@@ -979,7 +988,7 @@ pub fn parseExact(str: []const u8, formatting: Formatting) ParseExactError!DateT
     };
 }
 
-fn parseInner(map: *EnumMap(Element, []const u8)) ParseError!Io.Timestamp {
+fn parseInner(map: *EnumMap(Element, []const u8), subsecond_len: ?usize) ParseError!Io.Timestamp {
     var nanoseconds: i96 = 0;
     var iter: EnumMap(Element, []const u8).Iterator = map.iterator();
     while (iter.next()) |kvp| switch (kvp.key) {
@@ -1031,14 +1040,18 @@ fn parseInner(map: *EnumMap(Element, []const u8)) ParseError!Io.Timestamp {
         },
         .subsecond => {
             // okay, we have to determine the length of the slice to how many places we're talking about
-            const power: u64 = switch (kvp.value.len) {
-                1...9 => |x| 9 - x,
-                else => |invalid| {
-                    log.err("Length of subsecond segment must be at least 1 and up to 9. Found {d}.", .{invalid});
-                    return error.InvalidSubsecond;
+            if (kvp.value.len < 1 or kvp.value.len > 9) {
+                log.err("Length of subsecond segment must be at least 1 and up to 9. Found {d}.", .{kvp.value.len});
+                return error.InvalidSubsecond;
+            }
+            var subsecond_str: [9]u8 = @splat('0');
+            for (0..@min(9, kvp.value.len)) |i| {
+                if (subsecond_len) |len| {
+                    if (i == len) break;
                 }
-            };
-            const subseconds: u64 = std.math.pow(u64, 10, power) * (parseUnsigned(u64, kvp.value.*, 10) catch return error.InvalidSubsecond);
+                subsecond_str[i] = kvp.value.*[i];
+            }
+            const subseconds: u64 = parseUnsigned(u64, &subsecond_str, 10) catch return error.InvalidSubsecond;
             nanoseconds += subseconds;
         },
         .utc_offset => unreachable,
@@ -1054,28 +1067,38 @@ fn parseInner(map: *EnumMap(Element, []const u8)) ParseError!Io.Timestamp {
                     return error.InvalidAmPm;
                 },
             }
-            var capital: bool = undefined;
             switch (kvp.value.*[0]) {
                 'A', 'P' => {
                     if (kvp.value.len == 2 and kvp.value.*[1] != 'M') {
                         log.err("Both letters in AM/PM must be capitalized or lowercase. Found '{s}'", .{kvp.value.*});
                         return error.InvalidAmPm;
                     }
-                    capital = true;
                 },
                 'a', 'p' => {
                     if (kvp.value.len == 2 and kvp.value.*[1] != 'm') {
                         log.err("Both letters in AM/PM must be capitalized or lowercase. Found '{s}'", .{kvp.value.*});
                         return error.InvalidAmPm;
                     }
-                    capital = false;
                 },
                 else => {
                     log.err("AM/PM does not start with a lower/upper 'a' or 'm'. Found '{s}'", .{kvp.value.*});
                     return error.InvalidAmPm;
                 }
             }
-            // TODO : any bearing on the timestamp?
+
+            const hour: u5 = parseUnsigned(u5, map.get(.hour) orelse return error.MissingHour, 10) catch return error.InvalidHour;
+            if (hour > 23) return error.InvalidHour;
+            const Meridiem = enum { am, pm };
+            const meridiem: Meridiem = switch (ascii.toLower(kvp.value.*[0])) {
+                'a' => .am,
+                'p' => .pm,
+                else => unreachable,
+            };
+            if (hour == 12 and meridiem == .am) {
+                nanoseconds -= (12 * time.ns_per_hour);
+            } else if (hour != 12 and meridiem == .pm) {
+                nanoseconds += (12 * time.ns_per_hour);
+            }
         },
     };
 
@@ -1153,8 +1176,8 @@ test "max i96 buf" {
     try testing.expectEqual(29, writer.buffered().len);
 }
 test parseExact {
-    const date_str = "2026-05-22T21:48:47.036Z";
-    const date_time: DateTimeFormat = try .parseExact(date_str, .iso);
+    var date_str: []const u8 = "2026-05-22T21:48:47.036Z";
+    var date_time: DateTimeFormat = try .parseExact(date_str, .iso);
 
     errdefer {
         var iter: Formatting.Iterator = date_time.formatting.iterator();
@@ -1165,6 +1188,11 @@ test parseExact {
 
     try testing.expectEqual(1779486527036000000, date_time.timestamp.nanoseconds);
     try testing.expect(date_time.formatting.map.contains(.utc_offset));
+
+    date_str = "Friday, May 22, 2026 09:48:47.0367587 PM"; // <-- the subseconds are expected to be truncated when parsed
+    date_time = try .parseExact(date_str, .fmtStr("DD, MMMM dd, yyyy hh:mm:ss.fff NN"));
+    try testing.expectEqual(1779486527036000000, date_time.timestamp.nanoseconds);
+    try testing.expect(date_time.formatting.map.contains(.am_pm));
 }
 test parse {
     const date_str = "2026-05-22T21:48:47.036Z";
