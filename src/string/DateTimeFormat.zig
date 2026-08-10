@@ -212,6 +212,7 @@ pub const ParseError = error{
     InvalidSecond,
     InvalidSubsecond,
     InvalidUtcOffset,
+    InvalidAmPm,
     MissingYear,
     MissingMonth,
 };
@@ -392,6 +393,7 @@ pub const FullFormat = struct {
         switch (self.fmt) {
             .year => |y| try writer.print("year places: {d}", .{y}),
             .subsecond => |s| try writer.print("subsecond places: {d}", .{s}),
+            .am_pm => try writer.print("AM/PM", .{}),
             inline else => |x| try writer.print("{t}: {t}", .{ self.fmt, x }),
         }
     }
@@ -468,6 +470,7 @@ pub const Formatting = struct {
     /// If a UTC offset is directly preceeded by a '+' or a '-', it will include a '+' in positive offsets, replacing the fill with the correct sign.
     /// If a UTC offset is not directly preceed by a '+' or a '-', positive offsets will simply start with a space.
     pub inline fn fmtStr(comptime format_str: []const u8) Formatting {
+        @setEvalBranchQuota(1200);
         comptime {
             const ElementOrFill = union(enum) {
                 element: Element,
@@ -818,11 +821,12 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
             },
             .hour => |h| {
                 assert(hour >= 0 and hour < 24);
-                var hour_inner: i64 = hour;
+                var hour_inner: u5 = @intCast(hour);
                 if (self.formatting.map.contains(.am_pm)) {
                     switch (hour) {
                         0 => hour_inner = 12, // midnight is 12 am
                         13...23 => hour_inner -= 12, // past noon, we start over at 1
+                        else => unreachable,
                     }
                     assert(hour_inner >= 1 and hour_inner <= 12);
                 }
@@ -1038,6 +1042,41 @@ fn parseInner(map: *EnumMap(Element, []const u8)) ParseError!Io.Timestamp {
             nanoseconds += subseconds;
         },
         .utc_offset => unreachable,
+        .am_pm => {
+            switch (kvp.value.len) {
+                1 => {},
+                2 => if (ascii.toLower(kvp.value.*[1]) != 'm') {
+                    log.err("AM/PM has an invalid second character. Found '{s}'", .{kvp.value.*});
+                    return error.InvalidAmPm;
+                },
+                else => {
+                    log.err("AM/PM cannot exceed 2 characters. Found '{s}'", .{kvp.value.*});
+                    return error.InvalidAmPm;
+                },
+            }
+            var capital: bool = undefined;
+            switch (kvp.value.*[0]) {
+                'A', 'P' => {
+                    if (kvp.value.len == 2 and kvp.value.*[1] != 'M') {
+                        log.err("Both letters in AM/PM must be capitalized or lowercase. Found '{s}'", .{kvp.value.*});
+                        return error.InvalidAmPm;
+                    }
+                    capital = true;
+                },
+                'a', 'p' => {
+                    if (kvp.value.len == 2 and kvp.value.*[1] != 'm') {
+                        log.err("Both letters in AM/PM must be capitalized or lowercase. Found '{s}'", .{kvp.value.*});
+                        return error.InvalidAmPm;
+                    }
+                    capital = false;
+                },
+                else => {
+                    log.err("AM/PM does not start with a lower/upper 'a' or 'm'. Found '{s}'", .{kvp.value.*});
+                    return error.InvalidAmPm;
+                }
+            }
+            // TODO : any bearing on the timestamp?
+        },
     };
 
     return .fromNanoseconds(nanoseconds);
