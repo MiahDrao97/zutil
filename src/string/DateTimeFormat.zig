@@ -402,12 +402,13 @@ pub const FullFormat = struct {
 
 /// This defines how a date-time string is formatted:
 /// Which elements are represented, which separator character(s) sit between elements, and which order elements appear.
-/// OPTIMIZE : This structure contains redundant information, especially since FullFormat envelopes a union
 pub const Formatting = struct {
     /// Which elements are present and separator character(s) come after them
-    map: EnumMap(Element, FullFormat),
+    map: EnumMap(Element, Index),
     /// Since `EnumMap` does not give you the order elements appear, we need this additional array
-    ordering: [@typeInfo(Element).@"enum".fields.len]?Element,
+    ordering: [@typeInfo(Element).@"enum".fields.len]?FullFormat,
+
+    const Index = std.math.IntFittingRange(0, @typeInfo(Element).@"enum".fields.len - 1);
 
     pub const init: Formatting = .{
         .map = .init(.{}),
@@ -568,11 +569,12 @@ pub const Formatting = struct {
     pub const iso: Formatting = .fmtStr(iso_format_str);
 
     pub fn fetchPut(self: *Formatting, key: Element, value: FullFormat) ?FullFormat {
-        if (self.map.fetchPut(key, value)) |old_value| {
-            return old_value;
+        if (self.map.get(key)) |existing_idx| {
+            return self.ordering[existing_idx];
         }
-        const next_idx: usize = mem.indexOfScalar(?Element, &self.ordering, null).?;
-        self.ordering[next_idx] = key;
+        const next_idx: usize = self.map.count();
+        self.ordering[next_idx] = value;
+        assert(self.map.fetchPut(key, @intCast(next_idx)) == null);
         return null;
     }
 
@@ -584,17 +586,26 @@ pub const Formatting = struct {
         return .{ .order = self, .idx = 0 };
     }
 
-    pub const Entry = EnumMap(Element, FullFormat).Entry;
+    pub fn get(self: Formatting, key: Element) ?FullFormat {
+        if (self.map.get(key)) |idx| {
+            const f: FullFormat = self.ordering[idx];
+            assert(f.fmt == key);
+            return f;
+        }
+        return null;
+    }
+
+    pub const Entry = struct { key: Element, value: FullFormat };
 
     pub const Iterator = struct {
         order: Formatting,
-        idx: usize,
+        idx: Index,
 
         pub fn next(self: *Iterator) ?Entry {
             if (self.idx < self.order.ordering.len) {
-                if (self.order.ordering[self.idx]) |key| {
+                if (self.order.ordering[self.idx]) |entry| {
                     defer self.idx += 1;
-                    return .{ .key = key, .value = self.order.map.getPtr(key).? };
+                    return .{ .key = entry.fmt, .value = entry };
                 }
             }
             return null;
@@ -1162,7 +1173,7 @@ test iso {
     errdefer {
         var iter: Formatting.Iterator = datetime_fmt.formatting.iterator();
         while (iter.next()) |entry| {
-            std.debug.print("  Formatting {f}\n", .{entry.value.*});
+            std.debug.print("  Formatting {f}\n", .{entry.value});
         }
     }
 
@@ -1182,7 +1193,7 @@ test parseExact {
     errdefer {
         var iter: Formatting.Iterator = date_time.formatting.iterator();
         while (iter.next()) |entry| {
-            std.debug.print("  Formatting {f}\n", .{entry.value.*});
+            std.debug.print("  Formatting {f}\n", .{entry.value});
         }
     }
 
@@ -1202,7 +1213,7 @@ test parse {
     errdefer {
         var iter: Formatting.Iterator = date_time.formatting.iterator();
         while (iter.next()) |entry| {
-            std.debug.print("  Formatting {f}\n", .{entry.value.*});
+            std.debug.print("  Formatting {f}\n", .{entry.value});
         }
     }
 
@@ -1248,7 +1259,7 @@ test format {
     errdefer {
         var iter: Formatting.Iterator = datetime_fmt.formatting.iterator();
         while (iter.next()) |entry| {
-            std.debug.print("  Formatting {f}\n", .{entry.value.*});
+            std.debug.print("  Formatting {f}\n", .{entry.value});
         }
     }
 
