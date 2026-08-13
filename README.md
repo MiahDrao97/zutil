@@ -1,8 +1,10 @@
 # Zutil
 Library of quick utilities that I find myself copying and pasting in various Zig projects.
 I made this primarily for myself, but perhaps others can find it useful.
+There are likely some bugs in here, but I've tried to make everything as general as possible.
+It's been a great learning excercise for lots of different things, and I'll continue to modify this library as I learn more.
 
-## Installation
+# Installation
 
 You can use the `zig fetch` command like so:
 
@@ -38,9 +40,7 @@ pub fn build(b: *std.Build) void {
 }
 ```
 
-# Features
-
-## `Managed(T)`
+# `Managed(T)`
 This is essentially an arena and a value of type `T`.
 A managed value is incredibly useful when lots of memory is required to create a value,
 resulting in situations where you can't (or event don't want to) free the resulting memory.
@@ -72,7 +72,7 @@ fn parse(gpa: Allocator, to_parse: []const u8) !Managed(Value) {
 }
 ```
 
-## UUID
+# UUID
 Currently supporting v3, v4, v5, and v7 for UUID generation.
 Assumes any 16 bytes can be a valid UUID, but provides parsing and some printing/formatting options.
 
@@ -83,14 +83,14 @@ const gpa: std.Allocator = std.testing.allocator;
 
 const uuid: Uuid = .v4(std.testing.io);
 std.debug.print("UUID: {f}\n", .{uuid}); // formatted like xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (lower-case) by default
-const uuid_str: []const u8 = try uuid.toStringAlloc(gpa, .{}); // can pass in format options
+const uuid_str: []const u8 = try std.fmt.allocPrint(gpa, "{f}", .{uuid.fmt(.{ .casing = .upper, .separator = .none })}); // can pass in format options
 defer gpa.free(uuid_str);
 
-const parsed: Uuid = try .from(uuid_str);
+const parsed: Uuid = try .from(uuid_str); // still parses to the same UUID value
 try std.testing.expect(uuid.eql(parsed));
 ```
 
-## `cli` Namespace
+# `cli` Namespace
 This namespace contains structures useful for parsing CLI args.
 Use `Arg` for arguments that will be assigned a value.
 
@@ -159,8 +159,12 @@ try testing.expect(!b.value);
 try testing.expect(!c.value);
 ```
 
-## `string` Namespace
-Currently only have casing utilies (convert a string to camel case, title case, kebab, snake, and screaming snake).
+# `string` Namespace
+Currently have casing utilies (convert a string to camel case, title case, kebab, snake, and screaming snake) and
+date-time formatting/parsing utilies.
+
+## Casing
+
 ```zig
 const std = @import("std");
 const zutil = @import("zutil");
@@ -174,8 +178,196 @@ test {
     try std.testing.expectEqualStrings("SomethingToCase", stream.written());
 }
 ```
+Title case, camel case, kebab case, snake case, and screaming snake case are supported.
+Naively assumes ASCII encoding.
 
-## `MemCache` and `MemCacheAligned`
+## DateTimeFormat
+Format a `Io.Timestamp` into a date-time, and parse a date-time from a string.
+This is a work in progress as I'm certain there is still more work to be done here.
+
+A `DateTimeFormat` consists of a `Io.Timestamp`, a `Formatting`, and a `UtcOffset`.
+The `Formatting` struct contains the complex formatting details.
+Initialize with a comptime format string using the `fmtStr()` function (e.g. "yyyy-MM-dd hh:mm:ss.fffZ").
+The `Formatting` struct can parse a date-time string with the exact format or write a string with that format.
+
+```zig
+const std = @import("std");
+const zutil = @import("zutil");
+const testing = std.testing;
+const Io = std.Io;
+const DateTimeFormat = zutil.string.DateTimeFormat;
+
+const nanoseconds: i96 = 1779486527036758700; // Friday, May 22, 2026 at 9:48:47.0367587 PM (UTC)
+
+var stream: Io.Writer.Allocating = .init(testing.allocator);
+defer stream.deinit();
+// this is the ISO format, which you can simply use `DateTimeFormat.iso()` as shorthand for this
+try stream.writer.print("{f}", .{DateTimeFormat.fmt(.fmtStr("yyyy-MM-ddThh:mm:ss.fffZ"), .fromNanoseconds(nanoseconds), .utc)});
+try testing.expectEqualStrings("2026-05-22T21:48:47.036Z", stream.written());
+```
+
+### Format guide:
+#### Year (y or Y)
+y - Get the current year without leading zero
+
+yy - Display the last 2 digits of the year
+
+yyy - Display the last 3 digits of the year
+
+yyyy - Display the last 4 digits of the year
+
+yyyyy - Include 5 digits for the year (adds leading zero)
+
+---
+
+#### Month (M)
+M - Represent the month without leading zero
+
+MM - Adds leading zero
+
+MMM - Abreviated name of the month (e.g. "Jan", "Feb", etc.)
+
+MMMM - Full name of the month (e.g. "January", "February", etc.)
+
+---
+
+#### Day (d)
+d - Represent the day of the month without leading zero
+
+dd - Adds leading zero
+
+---
+
+#### Weekday (D)
+D - abbreviated weekday (e.g. "Mon", "Tue", etc)
+
+DD - full week day name (e.g. "Monday", "Tuesday", etc)
+
+---
+
+#### Hour (h or H)
+h - Represent hours without leading zero
+
+hh - Adds leading zero
+
+---
+
+#### Minute (m)
+m - Represent minutes without leading zero
+
+mm - Adds leading zero
+
+---
+
+#### Second (s)
+s - Represent seconds without leading zero
+
+ss - Adds leading zero
+
+---
+
+#### Sub-second (f)
+Represent up to 9 places (note that numbers are truncated, not rounded):
+"f" for 1 place, "ff" for 2 places, etc.
+As a quick reference:
+
+fff yields milliseconds
+
+ffffff yields microseconds
+
+fffffffff yields nanoseconds
+
+---
+
+#### UTC Offset (z)
+z - Represent +/- hours from UTC
+
+zz - Adds leading zero to +/- hours from UTC
+
+zzz - Includes quarter hours (not colon-separated) (e.g. -0715 for -7 hours and 15 minutes from UTC time)
+
+zzzz - ISO 8601 format, which includes quarter hours that are colon-separated (.e.g "-07:15" for -7 hours and 15 minutes from UTC time)
+
+Z - ISO 8601 format (shorthand for zzzz)
+
+---
+
+#### AM/PM (n or N, for "noon")
+n - a for AM, p for PM
+
+N - A for AM, P for PM
+
+nn - am/pm
+
+NN - AM/PM
+
+The accepted separator characters are: ' ', '/', '-', '+', '_', '.', ',', ':', 'T'.
+If there are any trailing separator characters, those will be trimmed.
+
+If a UTC offset is directly preceeded by a '+' or a '-', it will include a '+' in positive offsets, replacing the fill with the correct sign.
+If a UTC offset is not directly preceed by a '+' or a '-', positive offsets will simply start with a space.
+
+### Parsing
+There are 2 parse methods, `parse()` and `parseExact()`:
+```zig
+const std = @import("std");
+const testing = std.testing;
+const Io = std.Io;
+const DateTimeFormat = @import("zutil").string.DateTimeFormat;
+
+test parseExact {
+    const date_str: []const u8 = "Friday, May 22, 2026 09:48:47.0367587 PM"; // <-- the subseconds are expected to be truncated when parsed
+    const date_time: DateTimeFormat = try .parseExact(date_str, .fmtStr("DD, MMMM dd, yyyy hh:mm:ss.fff NN"));
+    try testing.expectEqual(1779486527036000000, date_time.timestamp.nanoseconds);
+    // The resulting DateTimeFormat will have a non-empty `formatting` member, which matches what you pass into `parseExact()`.
+}
+test parse {
+    // Unlike `parseExact()`, this simply requires the order of date-time elements, allowing any fill between elements.
+    // If more string remains after filling out all the elements, will simply ignore the rest of the string.
+    const date_str: []const u8 = "2026-05-22T21:48:47.036Z";
+    var date_time: DateTimeFormat = try .parse(date_str, &.{ .year, .month, .day, .hour, .minute, .second, .subsecond, .utc_offset });
+    try testing.expectEqual(1779486527036000000, date_time.timestamp.nanoseconds);
+
+    date_time = try .parse(date_str, &.{ .year, .month, .day }); // <-- we only want the date, so the time is ignored here
+    try testing.expectEqual(1779408000000000000, date_time.timestamp.nanoseconds);
+
+    var stream: Io.Writer.Allocating = .init(testing.allocator);
+    defer stream.deinit();
+
+    // NOTE : `formatting` is empty when you use `parse()` because `parse()` is intentionally flexible, so we can't assume the formatting.
+    date_time.formatting = .fmtStr("MM/dd/yyyy");
+    try stream.writer.print("{f}", .{date_time});
+    try testing.expectEqualStrings("05/22/2026", stream.written()); // re-formatted date
+
+    stream.clearRetainingCapacity();
+    // let's change our format again...
+    date_time.formatting = .fmtStr("MM/dd/yyyy hh:mm:ss.fff");
+    try stream.writer.print("{f}", .{date_time});
+    try testing.expectEqualStrings("05/22/2026 00:00:00.000", stream.written());
+
+    stream.clearRetainingCapacity();
+
+    // Parsing time without a date...
+    date_time = try .parse("21:48:47.036", &.{ .hour, .minute, .second, .subsecond });
+    try testing.expectEqual(78527036000000, date_time.timestamp.nanoseconds);
+
+    // change formatting again
+    date_time.formatting = .fmtStr("hh:mm:ss.fff");
+    try stream.writer.print("{f}", .{date_time});
+    try testing.expectEqualStrings("21:48:47.036", stream.written());
+}
+```
+
+### Io.Timestamp Best Practice
+Keep in mind that an `Io.Timestamp` is really just a count of nanoseconds.
+It is up to the developer to understand if that timestamp includes any UTC offsets.
+If you parse a string as a `DateTimeFormat` and apply a UTC offset to it, it will *add or subtract* from the timestamp's value when formatted.
+Generally, keep instances of `Io.Timestamp` with a UTC offset of 0.
+Only apply locality in reporting/user interactions.
+
+NOTE - Pre-Unix Epoch date-times are not yet supported. If that ever comes up, I have a lovely error log you'll encounter. Send patches!
+
+# `MemCache` and `MemCacheAligned`
 Used to memoize data of any type, presumably for the purpose of avoiding additional I/O calls.
 Essentially functions as a dictionary with a string key type.
 The value is stored agnostically as an array of bytes.

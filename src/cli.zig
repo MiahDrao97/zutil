@@ -151,8 +151,7 @@ pub const FlagSet = struct {
         for (flags) |f| {
             const put: Set.GetOrPutResult = set.getOrPutAssumeCapacity(f.name);
             if (put.found_existing) {
-                var panic_buf: [64]u8 = undefined;
-                @panic(std.fmt.bufPrint(&panic_buf, "Alias '{c}' has been used for more than one flag.", .{f.name}) catch &panic_buf);
+                std.debug.panic("Alias '{c}' has been used for more than one flag.", .{f.name});
             }
             put.value_ptr.* = f.flag;
         }
