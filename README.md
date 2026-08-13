@@ -214,6 +214,8 @@ yyyy - Display the last 4 digits of the year
 
 yyyyy - Include 5 digits for the year (adds leading zero)
 
+---
+
 #### Month (M)
 M - Represent the month without leading zero
 
@@ -223,39 +225,55 @@ MMM - Abreviated name of the month (e.g. "Jan", "Feb", etc.)
 
 MMMM - Full name of the month (e.g. "January", "February", etc.)
 
+---
+
 #### Day (d)
 d - Represent the day of the month without leading zero
 
 dd - Adds leading zero
+
+---
 
 #### Weekday (D)
 D - abbreviated weekday (e.g. "Mon", "Tue", etc)
 
 DD - full week day name (e.g. "Monday", "Tuesday", etc)
 
+---
+
 #### Hour (h or H)
 h - Represent hours without leading zero
 
 hh - Adds leading zero
+
+---
 
 #### Minute (m)
 m - Represent minutes without leading zero
 
 mm - Adds leading zero
 
+---
+
 #### Second (s)
 s - Represent seconds without leading zero
 
 ss - Adds leading zero
 
+---
+
 #### Sub-second (f)
 Represent up to 9 places (note that numbers are truncated, not rounded):
+"f" for 1 place, "ff" for 2 places, etc.
+As a quick reference:
 
-fff => for milliseconds
+fff yields milliseconds
 
-ffffff => for microseconds
+ffffff yields microseconds
 
-fffffffff => for nanoseconds
+fffffffff yields nanoseconds
+
+---
 
 #### UTC Offset (z)
 z - Represent +/- hours from UTC
@@ -267,6 +285,8 @@ zzz - Includes quarter hours (not colon-separated) (e.g. -0715 for -7 hours and 
 zzzz - ISO 8601 format, which includes quarter hours that are colon-separated (.e.g "-07:15" for -7 hours and 15 minutes from UTC time)
 
 Z - ISO 8601 format (shorthand for zzzz)
+
+---
 
 #### AM/PM (n or N, for "noon")
 n - a for AM, p for PM
