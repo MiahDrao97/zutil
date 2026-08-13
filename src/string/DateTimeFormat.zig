@@ -1229,6 +1229,12 @@ test parse {
     try testing.expectEqualStrings("05/22/2026", stream.written());
 
     stream.clearRetainingCapacity();
+    // let's change our format again...
+    date_time.formatting = .fmtStr("MM/dd/yyyy hh:mm:ss.fff");
+    try stream.writer.print("{f}", .{date_time});
+    try testing.expectEqualStrings("05/22/2026 00:00:00.000", stream.written());
+
+    stream.clearRetainingCapacity();
 
     // what if we only want time?
     date_time = try .parse("21:48:47.036", &.{ .hour, .minute, .second, .subsecond });

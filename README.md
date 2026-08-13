@@ -1,6 +1,8 @@
 # Zutil
 Library of quick utilities that I find myself copying and pasting in various Zig projects.
 I made this primarily for myself, but perhaps others can find it useful.
+There are likely some bugs in here, but I've tried to make everything as general as possible.
+It's been a great learning excercise for lots of different things, and I'll continue to modify this library as I learn more.
 
 # Installation
 
@@ -176,9 +178,11 @@ test {
     try std.testing.expectEqualStrings("SomethingToCase", stream.written());
 }
 ```
+Title case, camel case, kebab case, snake case, and screaming snake case are supported.
+Naively assumes ASCII encoding.
 
 ## DateTimeFormat
-Format and parse date-time from strings.
+Format a `Io.Timestamp` into a date-time, and parse a date-time from a string.
 This is a work in progress as I'm certain there is still more work to be done here.
 
 A `DateTimeFormat` consists of a `Io.Timestamp`, a `Formatting`, and a `UtcOffset`.
@@ -302,6 +306,57 @@ If there are any trailing separator characters, those will be trimmed.
 
 If a UTC offset is directly preceeded by a '+' or a '-', it will include a '+' in positive offsets, replacing the fill with the correct sign.
 If a UTC offset is not directly preceed by a '+' or a '-', positive offsets will simply start with a space.
+
+### Parsing
+There are 2 parse methods, `parse()` and `parseExact()`:
+```zig
+const std = @import("std");
+const testing = std.testing;
+const Io = std.Io;
+const DateTimeFormat = @import("zutil").string.DateTimeFormat;
+
+test parseExact {
+    const date_str: []const u8 = "Friday, May 22, 2026 09:48:47.0367587 PM"; // <-- the subseconds are expected to be truncated when parsed
+    const date_time: DateTimeFormat = try .parseExact(date_str, .fmtStr("DD, MMMM dd, yyyy hh:mm:ss.fff NN"));
+    try testing.expectEqual(1779486527036000000, date_time.timestamp.nanoseconds);
+    // The resulting DateTimeFormat will have a non-empty `formatting` member, which matches what you pass into `parseExact()`.
+}
+test parse {
+    // Unlike `parseExact()`, this simply requires the order of date-time elements, allowing any fill between elements.
+    // If more string remains after filling out all the elements, will simply ignore the rest of the string.
+    const date_str: []const u8 = "2026-05-22T21:48:47.036Z";
+    var date_time: DateTimeFormat = try .parse(date_str, &.{ .year, .month, .day, .hour, .minute, .second, .subsecond, .utc_offset });
+    try testing.expectEqual(1779486527036000000, date_time.timestamp.nanoseconds);
+
+    date_time = try .parse(date_str, &.{ .year, .month, .day }); // <-- we only want the date, so the time is ignored here
+    try testing.expectEqual(1779408000000000000, date_time.timestamp.nanoseconds);
+
+    var stream: Io.Writer.Allocating = .init(testing.allocator);
+    defer stream.deinit();
+
+    // NOTE : `formatting` is empty when you use `parse()` because `parse()` is intentionally flexible, so we can't assume the formatting.
+    date_time.formatting = .fmtStr("MM/dd/yyyy");
+    try stream.writer.print("{f}", .{date_time});
+    try testing.expectEqualStrings("05/22/2026", stream.written()); // re-formatted date
+
+    stream.clearRetainingCapacity();
+    // let's change our format again...
+    date_time.formatting = .fmtStr("MM/dd/yyyy hh:mm:ss.fff");
+    try stream.writer.print("{f}", .{date_time});
+    try testing.expectEqualStrings("05/22/2026 00:00:00.000", stream.written());
+
+    stream.clearRetainingCapacity();
+
+    // Parsing time without a date...
+    date_time = try .parse("21:48:47.036", &.{ .hour, .minute, .second, .subsecond });
+    try testing.expectEqual(78527036000000, date_time.timestamp.nanoseconds);
+
+    // change formatting again
+    date_time.formatting = .fmtStr("hh:mm:ss.fff");
+    try stream.writer.print("{f}", .{date_time});
+    try testing.expectEqualStrings("21:48:47.036", stream.written());
+}
+```
 
 ### Io.Timestamp Best Practice
 Keep in mind that an `Io.Timestamp` is really just a count of nanoseconds.
