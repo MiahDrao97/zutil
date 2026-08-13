@@ -463,10 +463,10 @@ pub const Formatting = struct {
     /// Z - ISO 8601 format (shorthand for zzzz)
     ///
     /// AM/PM (n or N, for "noon")
-    /// n - first letter, lower case
-    /// N - first letter, upper case
-    /// nn - both letters, lower case
-    /// NN - both letters, upper case
+    /// n - a for AM, p for PM
+    /// N - A for AM, P for PM
+    /// nn - am/pm
+    /// NN - AM/PM
     ///
     /// The accepted separator characters are: ' ', '/', '-', '+', '_', '.', ',', ':', 'T'
     /// If there are any trailing separator characters, those will be trimmed.

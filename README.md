@@ -2,7 +2,7 @@
 Library of quick utilities that I find myself copying and pasting in various Zig projects.
 I made this primarily for myself, but perhaps others can find it useful.
 
-## Installation
+# Installation
 
 You can use the `zig fetch` command like so:
 
@@ -38,9 +38,7 @@ pub fn build(b: *std.Build) void {
 }
 ```
 
-# Features
-
-## `Managed(T)`
+# `Managed(T)`
 This is essentially an arena and a value of type `T`.
 A managed value is incredibly useful when lots of memory is required to create a value,
 resulting in situations where you can't (or event don't want to) free the resulting memory.
@@ -72,7 +70,7 @@ fn parse(gpa: Allocator, to_parse: []const u8) !Managed(Value) {
 }
 ```
 
-## UUID
+# UUID
 Currently supporting v3, v4, v5, and v7 for UUID generation.
 Assumes any 16 bytes can be a valid UUID, but provides parsing and some printing/formatting options.
 
@@ -83,14 +81,14 @@ const gpa: std.Allocator = std.testing.allocator;
 
 const uuid: Uuid = .v4(std.testing.io);
 std.debug.print("UUID: {f}\n", .{uuid}); // formatted like xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (lower-case) by default
-const uuid_str: []const u8 = try uuid.toStringAlloc(gpa, .{}); // can pass in format options
+const uuid_str: []const u8 = try std.fmt.allocPrint(gpa, "{f}", .{uuid.fmt(.{ .casing = .upper, .separator = .none })}); // can pass in format options
 defer gpa.free(uuid_str);
 
-const parsed: Uuid = try .from(uuid_str);
+const parsed: Uuid = try .from(uuid_str); // still parses to the same UUID value
 try std.testing.expect(uuid.eql(parsed));
 ```
 
-## `cli` Namespace
+# `cli` Namespace
 This namespace contains structures useful for parsing CLI args.
 Use `Arg` for arguments that will be assigned a value.
 
@@ -159,11 +157,11 @@ try testing.expect(!b.value);
 try testing.expect(!c.value);
 ```
 
-## `string` Namespace
+# `string` Namespace
 Currently have casing utilies (convert a string to camel case, title case, kebab, snake, and screaming snake) and
 date-time formatting/parsing utilies.
 
-### Casing
+## Casing
 
 ```zig
 const std = @import("std");
@@ -179,7 +177,7 @@ test {
 }
 ```
 
-### DateTimeFormat
+## DateTimeFormat
 Format and parse date-time from strings.
 This is a work in progress as I'm certain there is still more work to be done here.
 
@@ -204,65 +202,88 @@ try stream.writer.print("{f}", .{DateTimeFormat.fmt(.fmtStr("yyyy-MM-ddThh:mm:ss
 try testing.expectEqualStrings("2026-05-22T21:48:47.036Z", stream.written());
 ```
 
-#### Format guide:
-Year (y or Y)
+### Format guide:
+#### Year (y or Y)
 y - Get the current year without leading zero
+
 yy - Display the last 2 digits of the year
+
 yyy - Display the last 3 digits of the year
+
 yyyy - Display the last 4 digits of the year
+
 yyyyy - Include 5 digits for the year (adds leading zero)
 
-Month (M)
+#### Month (M)
 M - Represent the month without leading zero
+
 MM - Adds leading zero
+
 MMM - Abreviated name of the month (e.g. "Jan", "Feb", etc.)
+
 MMMM - Full name of the month (e.g. "January", "February", etc.)
 
-Day (d)
+#### Day (d)
 d - Represent the day of the month without leading zero
+
 dd - Adds leading zero
 
-Weekday (D)
+#### Weekday (D)
 D - abbreviated weekday (e.g. "Mon", "Tue", etc)
+
 DD - full week day name (e.g. "Monday", "Tuesday", etc)
 
-Hour (h or H)
+#### Hour (h or H)
 h - Represent hours without leading zero
+
 hh - Adds leading zero
 
-Minute (m)
+#### Minute (m)
 m - Represent minutes without leading zero
+
 mm - Adds leading zero
 
-Second (s)
+#### Second (s)
 s - Represent seconds without leading zero
+
 ss - Adds leading zero
 
-Sub-second (f)
+#### Sub-second (f)
 Represent up to 9 places (note that numbers are truncated, not rounded):
+
 fff => for milliseconds
+
 ffffff => for microseconds
+
 fffffffff => for nanoseconds
 
-UTC Offset (z)
+#### UTC Offset (z)
 z - Represent +/- hours from UTC
+
 zz - Adds leading zero to +/- hours from UTC
+
 zzz - Includes quarter hours (not colon-separated) (e.g. -0715 for -7 hours and 15 minutes from UTC time)
+
 zzzz - ISO 8601 format, which includes quarter hours that are colon-separated (.e.g "-07:15" for -7 hours and 15 minutes from UTC time)
+
 Z - ISO 8601 format (shorthand for zzzz)
 
-AM/PM (n or N, for "noon")
-n - first letter, lower case
-N - first letter, upper case
-nn - both letters, lower case
-NN - both letters, upper case
+#### AM/PM (n or N, for "noon")
+n - a for AM, p for PM
 
-The accepted separator characters are: ' ', '/', '-', '+', '_', '.', ',', ':', 'T'
+N - A for AM, P for PM
+
+nn - am/pm
+
+NN - AM/PM
+
+The accepted separator characters are: ' ', '/', '-', '+', '_', '.', ',', ':', 'T'.
 If there are any trailing separator characters, those will be trimmed.
+
 If a UTC offset is directly preceeded by a '+' or a '-', it will include a '+' in positive offsets, replacing the fill with the correct sign.
 If a UTC offset is not directly preceed by a '+' or a '-', positive offsets will simply start with a space.
 
-#### Io.Timestamp Best Practice
+### Io.Timestamp Best Practice
 Keep in mind that an `Io.Timestamp` is really just a count of nanoseconds.
 It is up to the developer to understand if that timestamp includes any UTC offsets.
 If you parse a string as a `DateTimeFormat` and apply a UTC offset to it, it will *add or subtract* from the timestamp's value when formatted.
@@ -271,7 +292,7 @@ Only apply locality in reporting/user interactions.
 
 NOTE - Pre-Unix Epoch date-times are not yet supported. If that ever comes up, I have a lovely error log you'll encounter. Send patches!
 
-## `MemCache` and `MemCacheAligned`
+# `MemCache` and `MemCacheAligned`
 Used to memoize data of any type, presumably for the purpose of avoiding additional I/O calls.
 Essentially functions as a dictionary with a string key type.
 The value is stored agnostically as an array of bytes.
