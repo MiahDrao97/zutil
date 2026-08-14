@@ -15,8 +15,10 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         value_cache: ValueCache,
         /// The cache containing the length of each value and its reference count
         metadata_cache: MetadataCache,
-        /// Io group that handles entry expirations
-        expiration_group: Io.Group,
+        /// Manages entry expirations
+        expiration_manager: ExpirationManager,
+        /// Dedicated future that handles the expiration
+        expiration_runner: Io.Future(void),
         /// Mutex that guards reads/writes to the cache
         mutex: Io.Mutex,
 
@@ -95,13 +97,22 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             }
         };
 
-        /// Initialize empty cache
-        pub const init: Self = .{
-            .value_cache = .empty,
-            .metadata_cache = .empty,
-            .expiration_group = .init,
-            .mutex = .init,
-        };
+        /// Initialize empty cache, which also starts the background runner that handles entry expirations.
+        pub fn init(self: *Self, io: Io, gpa: Allocator) Io.ConcurrentError!void {
+            self.* = .{
+                .value_cache = .empty,
+                .metadata_cache = .empty,
+                .expiration_manager = .init(io),
+                .mutex = .init,
+                .expiration_runner = .{ .any_future = null, .result = {} },
+            };
+            self.expiration_runner = try io.concurrent(ExpirationManager.run, .{
+                &self.expiration_manager,
+                io,
+                gpa,
+                self,
+            });
+        }
 
         /// Creates a new entry, returning `error.CacheClobber` if an entry with this `key` already exists.
         /// Ensure that `gpa` is thread-safe.
@@ -366,7 +377,11 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             try minefield.stepOn(.start_expiration);
             switch (expiration.timeout) {
                 .none => {},
-                else => try self.expiration_group.concurrent(io, handleExpiration, .{ self, io, gpa, key, expiration.timeout }),
+                else => try self.expiration_manager.add(gpa, .{
+                    .expiration = expiration.timeout,
+                    .key = k,
+                    .created_at = .now(io, .real),
+                }),
             }
         }
 
@@ -442,8 +457,10 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
 
         /// Remove a cache entry, freeing the cached value in the process.
         pub fn remove(self: *Self, io: Io, gpa: Allocator, key: []const u8) Io.Cancelable!bool {
-            const k: StringHash = .hashStr(key);
+            return try self.removeByHash(io, gpa, .hashStr(key));
+        }
 
+        fn removeByHash(self: *Self, io: Io, gpa: Allocator, k: StringHash) Io.Cancelable!bool {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
 
@@ -453,7 +470,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                 }
 
                 const value_kv: ValueCache.KV = self.value_cache.fetchSwapRemove(k) orelse
-                    debug.panic("No raw value for entry '{s}' (hash=0x{x}) was found, even though a metadata value exists.", .{ key, k });
+                    debug.panic("No raw value for entry (hash=0x{x}) was found, even though a metadata value exists.", .{k});
                 const raw: []align(max_alignment.toByteUnits()) const u8 = value_kv.value[0..m.len];
                 m.expiration.cleanup(.{ .raw_value = raw });
 
@@ -467,7 +484,7 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
 
         /// Clear all entries from the cache, freeing the memory created for the cached values.
         pub fn clear(self: *Self, io: Io, gpa: Allocator) void {
-            self.expiration_group.cancel(io);
+            self.expiration_manager.clear();
 
             debug.assert(self.value_cache.count() == self.metadata_cache.count());
 
@@ -519,6 +536,8 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             self.clear(io, gpa);
             self.value_cache.deinit(gpa);
             self.metadata_cache.deinit(gpa);
+            self.expiration_runner.cancel(io);
+            self.expiration_manager.deinit(gpa);
             self.* = undefined;
         }
 
@@ -657,6 +676,86 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
             }
         };
 
+        const ExpirationManager = struct {
+            expiration_queue: ExpirationQueue,
+            mutex: std.atomic.Mutex,
+
+            fn init(io: Io) ExpirationManager {
+                return .{
+                    .expiration_queue = .initContext(io),
+                    .mutex = .unlocked,
+                };
+            }
+
+            fn run(self: *ExpirationManager, io: Io, gpa: Allocator, cache: *Self) void {
+                // OPTIMIZE : What's an ideal sleep time? Make it configurable?
+                while (true) : (io.sleep(.fromMilliseconds(5), .awake) catch return) {
+                    var expired: ?EntryExpiration = null;
+                    {
+                        if (!self.mutex.tryLock()) {
+                            continue; // assuming this is a fairly low-contention lock
+                        }
+                        defer self.mutex.unlock();
+                        if (self.expiration_queue.peekMin()) |exp| {
+                            // TODO :
+                            _ = exp;
+                            const reached_expiration: bool = false;
+                            if (reached_expiration) {
+                                expired = self.expiration_queue.popMin();
+                            }
+                        }
+                    }
+
+                    if (expired) |to_remove| {
+                        _ = cache.removeByHash(io, gpa, to_remove.key) catch return;
+                    }
+                }
+            }
+
+            fn add(self: *ExpirationManager, gpa: Allocator, expiration: EntryExpiration) Allocator.Error!void {
+                while (!self.mutex.tryLock()) {}
+                defer self.mutex.unlock();
+
+                try self.expiration_queue.push(gpa, expiration);
+            }
+
+            fn clear(self: *ExpirationManager) void {
+                while (!self.mutex.tryLock()) {}
+                defer self.mutex.unlock();
+
+                // effectively clears while retaining capacity
+                self.expiration_queue.len = 0;
+            }
+
+            fn deinit(self: *ExpirationManager, gpa: Allocator) void {
+                self.expiration_queue.deinit(gpa);
+                self.* = undefined;
+            }
+        };
+
+        const EntryExpiration = struct {
+            key: StringHash,
+            expiration: Io.Timeout,
+            created_at: Io.Timestamp,
+
+            fn nsUntilExpiration(self: EntryExpiration, now: Io.Timestamp) i96 {
+                return switch (self.expiration) {
+                    .deadline => |deadline| deadline.durationTo(.{ .raw = now, .clock = .real }).raw.nanoseconds,
+                    .duration => |duration| now.durationTo(self.created_at.addDuration(duration)).nanoseconds,
+                    .none => unreachable,
+                };
+            }
+        };
+
+        const ExpirationQueue = std.PriorityDequeue(EntryExpiration, Io, struct {
+            fn compare(io: Io, a: EntryExpiration, b: EntryExpiration) std.math.Order {
+                const now: Io.Timestamp = .now(io, .real);
+                const a_ns: i96 = a.nsUntilExpiration(now);
+                const b_ns: i96 = b.nsUntilExpiration(now);
+                return if (a_ns < b_ns) .lt else if (a_ns > b_ns) .gt else .eq;
+            }
+        }.compare);
+
         /// Determines behavior when a key already exists
         const PutBehavior = enum {
             /// No clobbering allowed
@@ -666,7 +765,8 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         };
 
         test lockReader {
-            var mem_cache: MemCache = .init;
+            var mem_cache: MemCache = undefined;
+            try mem_cache.init(testing.io, testing.allocator);
             defer mem_cache.deinit(testing.io, testing.allocator);
 
             const StructValue = struct {
@@ -721,7 +821,8 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         }
 
         test handleExpiration {
-            var mem_cache: MemCache = .init;
+            var mem_cache: MemCache = undefined;
+            try mem_cache.init(testing.io, testing.allocator);
             defer mem_cache.deinit(testing.io, testing.allocator);
 
             const StructValue = struct {
@@ -750,7 +851,8 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         }
 
         test newEntry {
-            var mem_cache: MemCache = .init;
+            var mem_cache: MemCache = undefined;
+            try mem_cache.init(testing.io, testing.allocator);
             defer mem_cache.deinit(testing.io, testing.allocator);
 
             const StructValue = struct {
@@ -806,7 +908,8 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         }
 
         test newSliceEntry {
-            var mem_cache: MemCache = .init;
+            var mem_cache: MemCache = undefined;
+            try mem_cache.init(testing.io, testing.allocator);
             defer mem_cache.deinit(testing.io, testing.allocator);
 
             const arr: [3]u32 = .{ 1, 2, 3 };
@@ -858,7 +961,8 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         }
 
         test remove {
-            var mem_cache: MemCache = .init;
+            var mem_cache: MemCache = undefined;
+            try mem_cache.init(testing.io, testing.allocator);
             defer mem_cache.deinit(testing.io, testing.allocator);
 
             const arr: [3]u32 = .{ 1, 2, 3 };
@@ -873,7 +977,8 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         }
 
         test clear {
-            var mem_cache: MemCache = .init;
+            var mem_cache: MemCache = undefined;
+            try mem_cache.init(testing.io, testing.allocator);
             defer mem_cache.deinit(testing.io, testing.allocator);
 
             const StructValue = struct {
@@ -924,7 +1029,8 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         }
 
         test overwriteEntry {
-            var mem_cache: MemCache = .init;
+            var mem_cache: MemCache = undefined;
+            try mem_cache.init(testing.io, testing.allocator);
             defer mem_cache.deinit(testing.io, testing.allocator);
 
             const num: i32 = 64;
@@ -941,7 +1047,8 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         }
 
         test overwriteSliceEntry {
-            var mem_cache: MemCache = .init;
+            var mem_cache: MemCache = undefined;
+            try mem_cache.init(testing.io, testing.allocator);
             defer mem_cache.deinit(testing.io, testing.allocator);
 
             const slice1: []const u8 = "asdf";
@@ -960,7 +1067,8 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         test "muliple removes" {
             debug.assert(!builtin.single_threaded);
 
-            var mem_cache: MemCache = .init;
+            var mem_cache: MemCache = undefined;
+            try mem_cache.init(testing.io, testing.allocator);
             defer mem_cache.deinit(testing.io, testing.allocator);
 
             const slice: []const u8 = "asdf";
@@ -975,6 +1083,8 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
 
             var start: Atomic(bool) = .init(false);
             var group: Io.Group = .init;
+            defer group.cancel(testing.io);
+
             group.async(testing.io, removeEntry, .{ &start, &mem_cache, testing.io, testing.allocator, "my_slice" });
             group.async(testing.io, removeEntry, .{ &start, &mem_cache, testing.io, testing.allocator, "my_slice" });
             group.async(testing.io, removeEntry, .{ &start, &mem_cache, testing.io, testing.allocator, "my_slice" });
@@ -988,7 +1098,8 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         test "read and remove conflict" {
             debug.assert(!builtin.single_threaded);
 
-            var mem_cache: MemCache = .init;
+            var mem_cache: MemCache = undefined;
+            try mem_cache.init(testing.io, testing.allocator);
             defer mem_cache.deinit(testing.io, testing.allocator);
 
             const slice: []const u8 = "asdf";
@@ -1016,6 +1127,8 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
 
             var start: Atomic(bool) = .init(false);
             var group: Io.Group = .init;
+            defer group.cancel(testing.io);
+
             group.async(testing.io, readEntry, .{ &start, &mem_cache, testing.io, "my_slice" });
             group.async(testing.io, removeEntry, .{ &start, &mem_cache, testing.io, testing.allocator, "my_slice" });
 
@@ -1037,7 +1150,8 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         test "too many open readers" {
             debug.assert(!builtin.single_threaded);
 
-            var mem_cache: MemCache = .init;
+            var mem_cache: MemCache = undefined;
+            try mem_cache.init(testing.io, testing.allocator);
             defer mem_cache.deinit(testing.io, testing.allocator);
 
             const slice: []const u8 = "asdf";
@@ -1054,7 +1168,8 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         }
 
         test getOrPutEntry {
-            var mem_cache: MemCache = .init;
+            var mem_cache: MemCache = undefined;
+            try mem_cache.init(testing.io, testing.allocator);
             defer mem_cache.deinit(testing.io, testing.allocator);
 
             {
@@ -1120,7 +1235,8 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         }
 
         test getOrPutSliceEntry {
-            var mem_cache: MemCache = .init;
+            var mem_cache: MemCache = undefined;
+            try mem_cache.init(testing.io, testing.allocator);
             defer mem_cache.deinit(testing.io, testing.allocator);
 
             {
@@ -1177,7 +1293,8 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
         }
 
         test waitForReaderLock {
-            var mem_cache: MemCache = .init;
+            var mem_cache: MemCache = undefined;
+            try mem_cache.init(testing.io, testing.allocator);
             defer mem_cache.deinit(testing.io, testing.allocator);
 
             const slice: []const u8 = "asdf";
@@ -1216,7 +1333,8 @@ pub fn MemCacheAligned(comptime max_alignment: Alignment) type {
                 timestamp: i64,
             };
 
-            var mem_cache: MemCache = .init;
+            var mem_cache: MemCache = undefined;
+            try mem_cache.init(testing.io, testing.allocator);
             defer mem_cache.deinit(testing.io, testing.allocator);
 
             const EntryManager = struct {
