@@ -3,6 +3,8 @@
 //! However, because this memory cache can store data of any type, the memory allocated is fragmented and varied in size.
 //! As a result, do not treat this cache as a data-oriented design technique, since the cached entries are almost guaranteed to use RAM.
 //! Rather, this is meant to save on network/IO/SYSCALLs that would be more expensive than RAM usage.
+//! Cache entries cannot exceed `std.math.max(u16)` bytes.
+//! Note that all cache entries are shallow copies, so if you need to get around this limitation, just heap-allocate and cache the pointer.
 //!
 //! Here is a convo I started with Claude for some implementation considerations after inspecting C#'s Microsoft.Extensions.Caching.Memory.MemoryCache:
 //!
@@ -807,7 +809,12 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
             }
 
             pub fn format(self: *const EntryData, writer: *Io.Writer) Io.Writer.Error!void {
-                try writer.print("{{ .ptr = {*}, .len = {d}, .ref_count = {d} }}", .{ self.ptr, self.len, self.ref_count.load(.monotonic) });
+                try writer.print("{{ .ptr = {*}, .len = {d}, .ref_count = {d}, .expiration_timeout = {f} }}", .{
+                    self.ptr,
+                    self.len,
+                    self.ref_count.load(.monotonic),
+                    self.expiration.timeout,
+                });
             }
         };
 
