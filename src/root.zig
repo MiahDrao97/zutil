@@ -14,6 +14,8 @@ pub const string = struct {
 pub const minefield = @import("minefield.zig");
 /// Meta-programming utilities
 pub const meta = @import("meta.zig");
+/// Memory cache and related types
+pub const mem_cache = @import("mem_cache.zig");
 /// General-purpose memory cache for memoizing values
 pub const MemCache = mem_cache.MemCache;
 /// Create a memory cache of any max alignment
@@ -222,7 +224,6 @@ comptime {
 }
 
 const std = @import("std");
-const mem_cache = @import("mem_cache.zig");
 const testing = std.testing;
 const mem = std.mem;
 const Allocator = mem.Allocator;
