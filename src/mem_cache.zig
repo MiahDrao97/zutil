@@ -284,8 +284,8 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
         active_entries: EntryMap,
         /// For quickly creating instances of `EntryData`
         entry_pool: EntryPool,
-        /// Mutex that guards reads/writes to the cache
-        mutex: Io.Mutex,
+        /// RW lock that guards reads/writes to the cache
+        lock: Io.RwLock,
         /// For internal memory operations
         allocator: Allocator,
         /// Configurable behavior
@@ -338,7 +338,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
         pub fn init(gpa: Allocator, opts: Options) Allocator.Error!MemCacheSelf {
             return .{
                 .active_entries = .empty,
-                .mutex = .init,
+                .lock = .init,
                 .entry_pool = if (max_entries) |m| try .initCapacity(gpa, m) else .empty,
                 .allocator = gpa,
                 .opts = opts,
@@ -596,8 +596,8 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
 
             try minefield.stepOn(.lock_mutex);
             // critical section
-            try self.mutex.lock(io);
-            defer self.mutex.unlock(io);
+            try self.lock.lock(io);
+            defer self.lock.unlock(io);
 
             try minefield.stepOn(.insert_entry);
             const gop: EntryMap.GetOrPutResult = try self.active_entries.getOrPut(self.allocator, k);
@@ -633,14 +633,14 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
         /// Read an entry, producing a `SafeReader` that repesents an active read on the entry.
         /// Until the `SafeReader` is released, this entry is safe to read.
         /// Returns null if no entry exists with this key.
-        /// Returns `error.TooManyOpenReaders` if the ref count would exceed max (which is max u16 - 1).
+        /// Returns `error.TooManyOpenReaders` if the ref count would exceed max (configurable on `init()`, but defaults to the hard limit of `std.math.maxInt(u16)`).
         ///
         /// WARN : If the caller fails to call `release()` on the reader, it may produce a deadlock or segmentation fault later in the program.
         pub fn read(self: *MemCacheSelf, io: Io, key: []const u8) OpenReaderError!?Reader {
             const k: StringHash = .hashStr(key);
 
-            try self.mutex.lock(io);
-            defer self.mutex.unlock(io);
+            try self.lock.lockShared(io);
+            defer self.lock.unlockShared(io);
 
             const data: ?*EntryData = self.active_entries.get(k);
             log.debug("Entry for key '{s}' (hash=0x{x}) was {s}.", .{ key, k, if (data == null) "not found" else "found" });
@@ -684,8 +684,8 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
         pub fn remove(self: *MemCacheSelf, io: Io, key: []const u8) Io.Cancelable!bool {
             const k: StringHash = .hashStr(key);
 
-            try self.mutex.lock(io);
-            defer self.mutex.unlock(io);
+            try self.lock.lock(io);
+            defer self.lock.unlock(io);
 
             if (self.active_entries.fetchSwapRemove(k)) |entry| {
                 log.debug("Found entry '{s}' (hash=0x{x}) for removal; preparing to tombstone...", .{ key, k });
@@ -698,8 +698,8 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
         /// Clear all entries from the cache, freeing the memory created for the cached values.
         /// In a cancellation scenario, nothing has been removed; we were simply waiting for the lock.
         pub fn clear(self: *MemCacheSelf, io: Io) Io.Cancelable!void {
-            try self.mutex.lock(io);
-            defer self.mutex.unlock(io);
+            try self.lock.lock(io);
+            defer self.lock.unlock(io);
 
             for (self.active_entries.values()) |entry| {
                 entry.tombstone(self);
@@ -735,8 +735,8 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
 
         /// Dumps the contents of the mem cache to a writer in a thread-safe way.
         pub fn threadsafeDump(self: *MemCacheSelf, io: Io, writer: *Io.Writer) (Io.Writer.Error || Io.Cancelable)!void {
-            try self.mutex.lock(io);
-            defer self.mutex.unlock(io);
+            try self.lock.lockShared(io);
+            defer self.lock.unlockShared(io);
 
             try self.format(writer);
         }
