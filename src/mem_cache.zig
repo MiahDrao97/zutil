@@ -407,7 +407,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
             key: []const u8,
             expiration: Expiration,
             create_entry_ctx: anytype,
-            createEntryFn: fn (@TypeOf(create_entry_ctx), Expiration.CleanupContextOut) TReturn,
+            createEntryFn: fn (@TypeOf(create_entry_ctx), *Expiration.CleanupContext) TReturn,
         ) (ErrorComponent(TReturn) || GetOrPutError)!Reader {
             comptime checkTypeCompatibility(OkComponent(TReturn));
 
@@ -418,7 +418,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
             var expiration_cpy: Expiration = expiration;
             const val: OkComponent(TReturn) = try @as(
                 ErrorComponent(TReturn)!OkComponent(TReturn),
-                createEntryFn(create_entry_ctx, .{ .ctx = &expiration_cpy.cleanup_context.ctx }),
+                createEntryFn(create_entry_ctx, &expiration_cpy.cleanup_context),
             );
 
             const entry_reader: Entry = .{ .raw_value = &mem.toBytes(val) };
@@ -498,7 +498,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
             key: []const u8,
             expiration: Expiration,
             create_entry_ctx: anytype,
-            createEntryFn: fn (@TypeOf(create_entry_ctx), Expiration.CleanupContextOut) TReturn,
+            createEntryFn: fn (@TypeOf(create_entry_ctx), *Expiration.CleanupContext) TReturn,
         ) (ErrorComponent(TReturn) || GetOrPutError || OpenReaderError)!Reader {
             const SliceType = switch (@typeInfo(OkComponent(TReturn))) {
                 .pointer => |p| switch (p.size) {
@@ -509,17 +509,17 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
             };
             comptime checkTypeCompatibility([]const SliceType);
 
-            var expiration_cpy: Expiration = expiration;
-            const val: []const SliceType = try @as(
-                ErrorComponent(TReturn)![]const SliceType,
-                createEntryFn(create_entry_ctx, .{ .ctx = &expiration_cpy.cleanup_context.ctx }),
-            );
-            const entry_reader: Entry = .{ .raw_value = mem.sliceAsBytes(val) };
-            errdefer expiration_cpy.cleanup(entry_reader);
-
             if (try self.read(io, key)) |reader| {
                 return reader;
             }
+
+            var expiration_cpy: Expiration = expiration;
+            const val: []const SliceType = try @as(
+                ErrorComponent(TReturn)![]const SliceType,
+                createEntryFn(create_entry_ctx, &expiration_cpy.cleanup_context),
+            );
+            const entry_reader: Entry = .{ .raw_value = mem.sliceAsBytes(val) };
+            errdefer expiration_cpy.cleanup(entry_reader);
             const v: []align(max_alignment.toByteUnits()) const u8 = try self.createEntryValue(entry_reader.raw_value);
             errdefer self.allocator.free(v);
 
@@ -789,7 +789,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
                     .deadline => |deadline| deadline.nanoseconds,
                     .duration => |duration| self.created_at.addDuration(duration).nanoseconds,
                     .tombstoned => return true,
-                    .none => return false,
+                    .indefinite => return false,
                 };
                 return Io.Timestamp.now(io, .real).nanoseconds >= expiry_ns;
             }
@@ -832,7 +832,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
             };
 
             const s: StructValue = .{ .a = 3.14, .b = 5 };
-            try mem_cache.newEntry(testing.io, "struct_val", s, .none);
+            try mem_cache.newEntry(testing.io, "struct_val", s, .no_expiration);
 
             if (try mem_cache.read(testing.io, "struct_val")) |reader| {
                 var should_free: bool = true;
@@ -851,15 +851,15 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
             const num: u32 = 90;
             try testing.expectError(
                 error.CacheClobber,
-                mem_cache.newEntry(testing.io, "struct_val", num, .none),
+                mem_cache.newEntry(testing.io, "struct_val", num, .no_expiration),
             );
             try testing.expectError(
                 error.CacheClobber,
-                mem_cache.newSliceEntry(u8, testing.io, "struct_val", "oh my", .none),
+                mem_cache.newSliceEntry(u8, testing.io, "struct_val", "oh my", .no_expiration),
             );
 
             const arr: [3]u32 = .{ 1, 2, 3 };
-            try mem_cache.newSliceEntry(u32, testing.io, "slice", &arr, .none);
+            try mem_cache.newSliceEntry(u32, testing.io, "slice", &arr, .no_expiration);
             if (try mem_cache.read(testing.io, "slice")) |reader| {
                 var should_free: bool = true;
                 defer if (should_free) reader.release(&mem_cache);
@@ -875,11 +875,11 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
 
             try testing.expectError(
                 error.CacheClobber,
-                mem_cache.newEntry(testing.io, "slice", num, .none),
+                mem_cache.newEntry(testing.io, "slice", num, .no_expiration),
             );
             try testing.expectError(
                 error.CacheClobber,
-                mem_cache.newSliceEntry(u8, testing.io, "slice", "oh my", .none),
+                mem_cache.newSliceEntry(u8, testing.io, "slice", "oh my", .no_expiration),
             );
         }
 
@@ -893,11 +893,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
             };
 
             const s: StructValue = .{ .a = 3.14, .b = 5 };
-            const expiration: Timeout = .{
-                .duration = .fromMilliseconds(5),
-            };
-
-            try mem_cache.newEntry(testing.io, "struct_val", s, .init(expiration, .{}));
+            try mem_cache.newEntry(testing.io, "struct_val", s, .lifetime(.{ .duration = .fromMilliseconds(5) }, .no_callback));
 
             if (try mem_cache.read(testing.io, "struct_val")) |reader| {
                 try testing.expectEqual(.one, reader.release_strategy.arc.load(.monotonic));
@@ -922,7 +918,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
             minefield.detonateOn(.alloc, error.OutOfMemory);
             try testing.expectError(
                 error.OutOfMemory,
-                mem_cache.newEntry(testing.io, "struct_value", s, .none),
+                mem_cache.newEntry(testing.io, "struct_value", s, .no_expiration),
             );
             try minefield.cleanup(.reset);
             try testing.expectEqual(0, mem_cache.active_entries.count());
@@ -930,7 +926,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
             minefield.detonateOn(.lock_mutex, error.Canceled);
             try testing.expectError(
                 error.Canceled,
-                mem_cache.newEntry(testing.io, "struct_value", s, .none),
+                mem_cache.newEntry(testing.io, "struct_value", s, .no_expiration),
             );
             try minefield.cleanup(.reset);
             try testing.expectEqual(0, mem_cache.active_entries.count());
@@ -938,7 +934,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
             minefield.detonateOn(.insert_entry, error.OutOfMemory);
             try testing.expectError(
                 error.OutOfMemory,
-                mem_cache.newEntry(testing.io, "struct_value", s, .none),
+                mem_cache.newEntry(testing.io, "struct_value", s, .no_expiration),
             );
             try minefield.cleanup(.reset);
             try testing.expectEqual(0, mem_cache.active_entries.count());
@@ -953,7 +949,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
             minefield.detonateOn(.alloc, error.OutOfMemory);
             try testing.expectError(
                 error.OutOfMemory,
-                mem_cache.newSliceEntry(u32, testing.io, "my_slice", &arr, .none),
+                mem_cache.newSliceEntry(u32, testing.io, "my_slice", &arr, .no_expiration),
             );
             try minefield.cleanup(.reset);
             try testing.expectEqual(0, mem_cache.active_entries.count());
@@ -961,7 +957,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
             minefield.detonateOn(.lock_mutex, error.Canceled);
             try testing.expectError(
                 error.Canceled,
-                mem_cache.newEntry(testing.io, "my_slice", &arr, .none),
+                mem_cache.newEntry(testing.io, "my_slice", &arr, .no_expiration),
             );
             try minefield.cleanup(.reset);
             try testing.expectEqual(0, mem_cache.active_entries.count());
@@ -969,7 +965,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
             minefield.detonateOn(.insert_entry, error.OutOfMemory);
             try testing.expectError(
                 error.OutOfMemory,
-                mem_cache.newSliceEntry(u32, testing.io, "my_slice", &arr, .none),
+                mem_cache.newSliceEntry(u32, testing.io, "my_slice", &arr, .no_expiration),
             );
             try minefield.cleanup(.reset);
             try testing.expectEqual(0, mem_cache.active_entries.count());
@@ -982,7 +978,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
             // basic test
             {
                 const arr: [3]u32 = .{ 1, 2, 3 };
-                try mem_cache.newSliceEntry(u32, testing.io, "my_slice", &arr, .none);
+                try mem_cache.newSliceEntry(u32, testing.io, "my_slice", &arr, .no_expiration);
                 if (try mem_cache.read(testing.io, "my_slice")) |reader|
                     reader.release(&mem_cache)
                 else
@@ -994,7 +990,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
             // remove while reader is still active
             {
                 const arr: [3]u32 = .{ 1, 2, 3 };
-                try mem_cache.newSliceEntry(u32, testing.io, "my_slice", &arr, .none);
+                try mem_cache.newSliceEntry(u32, testing.io, "my_slice", &arr, .no_expiration);
                 const reader: Default.Reader = (try mem_cache.read(testing.io, "my_slice")) orelse return error.NoEntry;
                 defer reader.release(&mem_cache);
 
@@ -1003,7 +999,10 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
                 // confirm we CAN'T get a new reader now that it's tombstoned
                 if (try mem_cache.read(testing.io, "my_slice")) |_| return error.ExpectedNoEntry;
 
-                // on the deferred release, memory should get freed
+                // the active reader should still be able to read the contents of the tombstoned entry
+                try testing.expectEqualSlices(u32, &arr, reader.entry.readSlice(u32));
+
+                // on the deferred release, memory should get freed then
             }
         }
 
@@ -1018,8 +1017,8 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
 
             const s: StructValue = .{ .a = 3.14, .b = 5 };
             const arr: [3]u32 = .{ 1, 2, 3 };
-            try mem_cache.newSliceEntry(u32, testing.io, "my_slice", &arr, .none);
-            try mem_cache.newEntry(testing.io, "struct_val", s, .none);
+            try mem_cache.newSliceEntry(u32, testing.io, "my_slice", &arr, .no_expiration);
+            try mem_cache.newEntry(testing.io, "struct_val", s, .no_expiration);
 
             if (try mem_cache.read(testing.io, "my_slice")) |reader|
                 reader.release(&mem_cache)
@@ -1035,7 +1034,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
             if (try mem_cache.read(testing.io, "my_slice")) |_| return error.ExpectedNoEntry;
             if (try mem_cache.read(testing.io, "struct_val")) |_| return error.ExpectedNoEntry;
 
-            const expiration: Expiration = .init(.{ .duration = .fromMilliseconds(5) }, .{});
+            const expiration: Expiration = .lifetime(.{ .duration = .fromMilliseconds(5) }, .no_callback);
             // re-add with expiration
             try mem_cache.newSliceEntry(u32, testing.io, "my_slice", &arr, expiration);
             try mem_cache.newEntry(testing.io, "struct_value", s, expiration);
@@ -1060,8 +1059,8 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
                 const num1: i32 = 64;
                 const num2: i32 = -72;
 
-                try mem_cache.overwriteEntry(testing.io, "my_entry", num1, .none);
-                try mem_cache.overwriteEntry(testing.io, "my_entry", num2, .none);
+                try mem_cache.overwriteEntry(testing.io, "my_entry", num1, .no_expiration);
+                try mem_cache.overwriteEntry(testing.io, "my_entry", num2, .no_expiration);
 
                 if (try mem_cache.read(testing.io, "my_entry")) |reader| {
                     defer reader.release(&mem_cache);
@@ -1074,11 +1073,11 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
                 const num1: i32 = 64;
                 const num2: i32 = -72;
 
-                try mem_cache.overwriteEntry(testing.io, "my_entry", num1, .none);
+                try mem_cache.overwriteEntry(testing.io, "my_entry", num1, .no_expiration);
                 const reader_a: Default.Reader = (try mem_cache.read(testing.io, "my_entry")) orelse return error.NoEntry;
                 defer reader_a.release(&mem_cache);
 
-                try mem_cache.overwriteEntry(testing.io, "my_entry", num2, .none);
+                try mem_cache.overwriteEntry(testing.io, "my_entry", num2, .no_expiration);
                 const reader_b: Default.Reader = (try mem_cache.read(testing.io, "my_entry")) orelse return error.NoEntry;
                 defer reader_b.release(&mem_cache);
 
@@ -1094,8 +1093,8 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
             const slice1: []const u8 = "asdf";
             const slice2: []const u8 = "blarf";
 
-            try mem_cache.overwriteSliceEntry(u8, testing.io, "my_slice", slice1, .none);
-            try mem_cache.overwriteSliceEntry(u8, testing.io, "my_slice", slice2, .none);
+            try mem_cache.overwriteSliceEntry(u8, testing.io, "my_slice", slice1, .no_expiration);
+            try mem_cache.overwriteSliceEntry(u8, testing.io, "my_slice", slice2, .no_expiration);
 
             if (try mem_cache.read(testing.io, "my_slice")) |reader| {
                 defer reader.release(&mem_cache);
@@ -1113,7 +1112,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
             defer mem_cache.deinit();
 
             const slice: []const u8 = "asdf";
-            try mem_cache.overwriteSliceEntry(u8, testing.io, "my_slice", slice, .none);
+            try mem_cache.overwriteSliceEntry(u8, testing.io, "my_slice", slice, .no_expiration);
 
             const removeEntry = struct {
                 fn removeEntry(start: *Atomic(bool), cache: *Default, io: Io, key: []const u8) Io.Cancelable!void {
@@ -1145,7 +1144,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
             defer mem_cache.deinit();
 
             const slice: []const u8 = "asdf";
-            try mem_cache.overwriteSliceEntry(u8, testing.io, "my_slice", slice, .none);
+            try mem_cache.overwriteSliceEntry(u8, testing.io, "my_slice", slice, .no_expiration);
 
             const removeEntry = struct {
                 fn removeEntry(start: *Atomic(bool), cache: *Default, io: Io, key: []const u8) Io.Cancelable!void {
@@ -1198,7 +1197,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
             defer mem_cache.deinit();
 
             const slice: []const u8 = "asdf";
-            try mem_cache.overwriteSliceEntry(u8, testing.io, "my_slice", slice, .none);
+            try mem_cache.overwriteSliceEntry(u8, testing.io, "my_slice", slice, .no_expiration);
 
             const reader: Default.Reader = (try mem_cache.read(testing.io, "my_slice")) orelse return error.NoEntry;
             defer reader.release(&mem_cache);
@@ -1213,8 +1212,8 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
 
             {
                 // no error and no args in createEntry()
-                const reader: Default.Reader = try mem_cache.getOrPutEntry(i32, testing.io, "my_val", .none, {}, struct {
-                    fn createEntry(_: void, _: Expiration.CleanupContextOut) i32 {
+                const reader: Default.Reader = try mem_cache.getOrPutEntry(i32, testing.io, "my_val", .no_expiration, {}, struct {
+                    fn createEntry(_: void, _: *Expiration.CleanupContext) i32 {
                         return 64;
                     }
                 }.createEntry);
@@ -1228,7 +1227,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
                 const EntryManager = struct {
                     gpa: Allocator,
 
-                    fn createEntry(this: @This(), cleanup_ctx_out: Expiration.CleanupContextOut) Allocator.Error!*const u32 {
+                    fn createEntry(this: @This(), cleanup_ctx_out: *Expiration.CleanupContext) Allocator.Error!*const u32 {
                         // In general, this pattern is best for when you have a structure with 1 or more pointer members.
                         // The pointer members can be allocated like so when creating the entry, and a shallow copy of the structure works perfectly.
                         // The pointer(s) remain valid until the entry is cleaned up, which at that point, the pointer(s) can be deallocated.
@@ -1257,7 +1256,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
                     Allocator.Error!*const u32,
                     testing.io,
                     "my_other_val",
-                    .init(.none, .{ .runCleanup = EntryManager.cleanup }),
+                    .lifetime(.indefinite, .callback(EntryManager.cleanup)),
                     entry_manager,
                     EntryManager.createEntry,
                 );
@@ -1274,8 +1273,8 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
 
             {
                 // no error and no args in createEntry()
-                const reader: Default.Reader = try mem_cache.getOrPutSliceEntry([]const u8, testing.io, "my_val", .none, {}, struct {
-                    fn createEntry(_: void, _: Expiration.CleanupContextOut) []const u8 {
+                const reader: Default.Reader = try mem_cache.getOrPutSliceEntry([]const u8, testing.io, "my_val", .no_expiration, {}, struct {
+                    fn createEntry(_: void, _: *Expiration.CleanupContext) []const u8 {
                         return "blarf";
                     }
                 }.createEntry);
@@ -1290,7 +1289,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
                     gpa: Allocator,
                     created_slice: []const u8 = undefined,
 
-                    fn createEntry(this: @This(), cleanup_ctx_out: Expiration.CleanupContextOut) Allocator.Error![]const u8 {
+                    fn createEntry(this: @This(), cleanup_ctx_out: *Expiration.CleanupContext) Allocator.Error![]const u8 {
                         const this_cpy: *@This() = try this.gpa.create(@This());
                         errdefer this.gpa.destroy(this_cpy);
 
@@ -1314,7 +1313,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
                     Allocator.Error![]const u8,
                     testing.io,
                     "my_other_val",
-                    .{ .timeout = .none, .cleanup_context = .{ .runCleanup = EntryManager.cleanup } },
+                    .lifetime(.indefinite, .callback(EntryManager.cleanup)),
                     entry_manager,
                     EntryManager.createEntry,
                 );
@@ -1329,7 +1328,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
             defer mem_cache.deinit();
 
             const slice: []const u8 = "asdf";
-            try mem_cache.overwriteSliceEntry(u8, testing.io, "my_slice", slice, .none);
+            try mem_cache.overwriteSliceEntry(u8, testing.io, "my_slice", slice, .no_expiration);
 
             // deliberately interfere with the data cuz I don't wanna make 32K references just for a unit test
             mem_cache.active_entries.get(StringHash.hashStr("my_slice")).?.ref_count.store(.max, .release);
@@ -1381,7 +1380,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
                 /// See `cleanup()` to see how the cleanup context will be used.
                 fn createEntry(
                     this: @This(),
-                    cleanup_ctx_out: Expiration.CleanupContextOut,
+                    cleanup_ctx_out: *Expiration.CleanupContext,
                 ) Allocator.Error!DatabaseRow {
                     // imagine a database query takes place here...
                     const timestamp: Io.Timestamp = .now(this.io, .real);
@@ -1414,9 +1413,9 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
                 .io = testing.io,
                 .id = 1,
             };
-            const expiration: Expiration = .init(
+            const expiration: Expiration = .lifetime(
                 .{ .duration = .fromSeconds(15) },
-                .{ .runCleanup = EntryManager.cleanup }, // this will be run on removal/expiration
+                .callback(EntryManager.cleanup), // this will be run on removal/expiration
             );
             const reader: Default.Reader = try mem_cache.getOrPutEntry(
                 Allocator.Error!DatabaseRow,
@@ -1457,7 +1456,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
                 /// See `cleanup()` to see how the cleanup context will be used.
                 fn createEntry(
                     this: @This(),
-                    cleanup_ctx_out: Expiration.CleanupContextOut,
+                    cleanup_ctx_out: *Expiration.CleanupContext,
                 ) Allocator.Error!DatabaseRow {
                     // imagine a database query takes place here...
                     const timestamp: Io.Timestamp = .now(this.io, .real);
@@ -1490,9 +1489,9 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
                 .io = testing.io,
                 .id = 1,
             };
-            const expiration: Expiration = .init(
+            const expiration: Expiration = .lifetime(
                 .{ .duration = .fromSeconds(15) },
-                .{ .runCleanup = EntryManager.cleanup }, // this will be run on removal/expiration
+                .callback(EntryManager.cleanup), // this will be run on removal/expiration
             );
             const reader_a: SpecialMemCache.Reader = try mem_cache.getOrPutEntry(
                 Allocator.Error!DatabaseRow,
@@ -1594,28 +1593,38 @@ pub const Expiration = struct {
     /// Defines a callback to run when an entry is removed
     pub const CleanupContext = struct {
         /// Optional cleanup context to be passed `runCleanup` (run when the entry is removed).
-        ctx: *anyopaque = @constCast(&@as(u8, 0xAA)),
+        ctx: *anyopaque,
         /// Cleanup function to be run when the entry is removed.
-        runCleanup: *const fn (context: *anyopaque, entry: Entry) void = noopCleanup,
-    };
+        runCleanup: *const fn (context: *anyopaque, entry: Entry) void,
 
-    /// Assign a context to this out parameter when creating an entry
-    pub const CleanupContextOut = struct {
-        ctx: **anyopaque,
+        /// No callback configured => this is a no-op
+        pub const no_callback: CleanupContext = .{
+            .ctx = @constCast(&@as(u8, 0xAA)),
+            .runCleanup = Expiration.noopCleanup,
+        };
+
+        /// Assumes the callback does not read the first parameter or the context will be set when creating the entry
+        /// (see `getOrPutEntry` and `getOrPutSliceEntry`).
+        pub fn callback(runCleanup: *const fn (_: *anyopaque, entry: Entry) void) CleanupContext {
+            return .{
+                .ctx = @constCast(&@as(u8, 0xAA)),
+                .runCleanup = runCleanup,
+            };
+        }
 
         /// Set the cleanup context to any pointer
-        pub fn setContext(self: CleanupContextOut, any_ptr: *anyopaque) void {
-            self.ctx.* = any_ptr;
+        pub fn setContext(self: *CleanupContext, any_ptr: *anyopaque) void {
+            self.ctx = any_ptr;
         }
     };
 
     /// No expiration: assumes that nothing needs to be run when the entry is removed
-    pub const none: Expiration = .{
-        .timeout = .none,
-        .cleanup_context = .{},
+    pub const no_expiration: Expiration = .{
+        .timeout = .indefinite,
+        .cleanup_context = .no_callback,
     };
 
-    pub fn init(timeout: Timeout, cleanup_context: CleanupContext) Expiration {
+    pub fn lifetime(timeout: Timeout, cleanup_context: CleanupContext) Expiration {
         return .{
             .timeout = timeout,
             .cleanup_context = cleanup_context,
@@ -1629,6 +1638,7 @@ pub const Expiration = struct {
         self.cleanup_context.runCleanup(self.cleanup_context.ctx, entry);
     }
 };
+
 /// Configurable timeout for setting an entries expiration
 pub const Timeout = union(enum) {
     /// The entry lives only this long after creation
@@ -1638,13 +1648,13 @@ pub const Timeout = union(enum) {
     /// Used internally to mark an entry as dead, either by explicit removal or expiration
     tombstoned,
     /// No timeout
-    none,
+    indefinite,
 
     pub fn format(self: Timeout, writer: *Io.Writer) Io.Writer.Error!void {
         switch (self) {
             .duration => |d| try writer.print("{t}: {d}", .{ self, d.nanoseconds }),
             .deadline => |d| try writer.print("{t}: {d}", .{ self, d.nanoseconds }),
-            .tombstoned, .none => try writer.writeAll(@tagName(self)),
+            .tombstoned, .indefinite => try writer.writeAll(@tagName(self)),
         }
     }
 };

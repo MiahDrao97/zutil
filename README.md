@@ -381,8 +381,8 @@ This shows very basic usage of the memory cache:
 ```zig
 // assume io: Io and gpa: Allocator exist in this context
 
-var mem_cache: MemCache = .init;
-defer mem_cache.deinit(io, gpa);
+var mem_cache: MemCache = try .init(gpa, .{});
+defer mem_cache.deinit();
 
 const StructValue = struct {
     a: f32,
@@ -390,18 +390,12 @@ const StructValue = struct {
 };
 
 const s: StructValue = .{ .a = 3.14, .b = 5 };
-const expiration: Io.Timeout = .{
-    .duration = .{
-        .raw = .fromSeconds(15),
-        .clock = .awake,
-    },
-};
 // create a new entry in the memory cache with an expiration
-try mem_cache.newEntry(io, gpa, "struct_val", s, .{ .timeout = expiration });
+try mem_cache.newEntry(io, "struct_val", s, .lifetime(.{ .duration = .fromSeconds(15) }, .no_callback));
 
 // uses atomic reference counting to ensure that an entry cannot be removed or modified while there are active readers
-const reader: MemCache.SafeReader = (try mem_cache.lockReader(io, "struct_val"))).?;
-defer reader.release(); // don't forget to release the reader to decrement the reference count
+const reader: MemCache.Reader = (try mem_cache.reader(io, "struct_val"))).?;
+defer reader.release(&mem_cache); // don't forget to release the reader to decrement the reference count
 
 const entry: *const StructValue = reader.entry.read(StructValue);
 // use entry...
@@ -417,8 +411,8 @@ const DatabaseRow = struct {
     timestamp: i64,
 };
 
-var mem_cache: MemCache = .init;
-defer mem_cache.deinit(io, gpa);
+var mem_cache: MemCache = try .init(gpa, .{});
+defer mem_cache.deinit();
 
 const EntryManager = struct {
     gpa: Allocator,
@@ -432,7 +426,7 @@ const EntryManager = struct {
     /// See `cleanup()` to see how the cleanup context will be used.
     fn createEntry(
         this: @This(),
-        cleanup_ctx_out: Expiration.CleanupContextOut,
+        cleanup_ctx_out: *Expiration.CleanupContext,
     ) Allocator.Error!DatabaseRow {
         // imagine a database query takes place here...
         const timestamp: Io.Timestamp = .now(this.io, .real);
@@ -465,26 +459,16 @@ const entry_manager: EntryManager = .{
     .io = io,
     .id = 1,
 };
-const expiration: MemCache.Expiration = .{
-    .runCleanup = EntryManager.cleanup, // this will be run on removal/expiration
-    .timeout = .{
-        .duration = .{
-            .raw = .fromSeconds(15),
-            .clock = .real,
-        },
-    },
-};
 // either creates a new entry or returns an existing one: returns a `SafeReader` for the entry regardless
 const reader: MemCache.SafeReader = try mem_cache.getOrPutEntry(
     (Allocator.Error || Io.Clock.Error)!DatabaseRow,
     io,
-    gpa,
     "DbRow(1)",
-    expiration,
+    .lifetime(.{ .duration = .fromSeconds(15) }, .callback(EntryManager.cleanup)), // 15-second lifetime with callback that will be run on removal/expiration
     entry_manager,
     EntryManager.createEntry,
 );
-defer reader.release();
+defer reader.release(&mem_cache);
 
 const entry: *const DatabaseRow = reader.entry.read(DatabaseRow);
 // use entry...
