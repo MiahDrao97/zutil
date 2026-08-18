@@ -461,7 +461,7 @@ const entry_manager: EntryManager = .{
 };
 // either creates a new entry or returns an existing one: returns a `SafeReader` for the entry regardless
 const reader: MemCache.SafeReader = try mem_cache.getOrPutEntry(
-    (Allocator.Error || Io.Clock.Error)!DatabaseRow,
+    Allocator.Error!DatabaseRow,
     io,
     "DbRow(1)",
     .lifetime(.{ .duration = .fromSeconds(15) }, .callback(EntryManager.cleanup)), // 15-second lifetime with callback that will be run on removal/expiration
@@ -473,3 +473,22 @@ defer reader.release(&mem_cache);
 const entry: *const DatabaseRow = reader.entry.read(DatabaseRow);
 // use entry...
 ```
+
+Keep in mind that `MemCache` is an alias for `mem_cache.Default`, and `MemCacheAligned` is an alias for `mem_cache.Aligned`.
+This data structure is _managed_ by necessity because atomic reference counting makes for some difficult lifetimes.
+It also gives the caller the ability to use a different allocator when creating an entry and freeing it through a callback.
+If an entry is removed either by expiration or explicit removal, that entry is considered "tombstoned."
+That memory remains valid until the last reader sets the reference count to 0, which then prompts the memory cache to free that memory.
+This has the side effect of multiple "generations" of a cache entry being possible, so keep that in mind.
+If you are diligent about releasing readers quickly, this shouldn't be something you run into very often.
+Expiration is evaluated on `read()`, where if an entry is determined to be expired, it will be tombstoned instead of returning a reader.
+The memory cache will only open new readers for the active generation; tombstoned entries cannot have new readers.
+Keep in mind that `deinit()` will panic if there are any active readers.
+
+Internally, the memory cache uses a `std.heap.MemoryPool` for creating entries.
+You can set a comptime upper-bound on entries with the aligned type function, which will pre-allocate that much space when `.init(...)` is called.
+Additionally, you can set the max number of readers with the runtime options passed into `.init(...)`.
+Keep in mind that the hard limit is `std.math.maxInt(u16)` readers on a single entry.
+Each entry cannot exceed `std.math.maxInt(u16)` bytes.
+I feel like that's pretty reasonable, especially since entries are shallow copies.
+If you run into this issue, maybe you can heap allocate portions of the entry; again, you can always pass in a callback to free that memory on expiration.

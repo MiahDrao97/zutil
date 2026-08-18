@@ -1685,7 +1685,7 @@ const StringHash = enum(u32) {
 const RefCount = enum(u16) {
     zero = 0,
     one = 1,
-    max = std.math.maxInt(u16) - 1,
+    max = std.math.maxInt(u16),
     _,
 
     fn compare(lh: RefCount, op: std.math.CompareOperator, rh: RefCount) bool {
