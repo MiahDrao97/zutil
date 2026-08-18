@@ -443,8 +443,19 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
                 else => |e| return e,
             };
 
-            return (try self.read(io, key)) orelse // should be impossible...
-                debug.panic("Finished performing `getOrPutEntry` with key '{s}', but the entry was not found.", .{key});
+            return (try self.read(io, key)) orelse contigency: {
+                // should be impossible...
+                log.warn("Finished performing `getOrPutEntry` with key '{s}', but the entry was not found. Was the expiration long enough to create the entry? - {f}", .{ key, expiration.timeout });
+                break :contigency .{
+                    .entry = .{ .raw_value = v },
+                    .release_strategy = .{
+                        .not_cached = .{
+                            .ctx = expiration_cpy.cleanup_context.ctx,
+                            .runCleanup = expiration_cpy.cleanup_context.runCleanup,
+                        },
+                    },
+                };
+            };
         }
 
         /// Creates a new slice entry, returning `error.CacheClobber` if an entry with this `key` already exists.
@@ -539,8 +550,19 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
                 else => |e| return e,
             };
 
-            return (try self.read(io, key)) orelse // should be impossible...
-                debug.panic("Finished performing `getOrPutSliceEntry` with key '{s}', but the entry was not found.", .{key});
+            return (try self.read(io, key)) orelse contigency: {
+                // should be impossible...
+                log.warn("Finished performing `getOrPutSliceEntry` with key '{s}', but the entry was not found. Was the expiration long enough to create the entry? - {f}", .{ key, expiration.timeout });
+                break :contigency .{
+                    .entry = .{ .raw_value = v },
+                    .release_strategy = .{
+                        .not_cached = .{
+                            .ctx = expiration_cpy.cleanup_context.ctx,
+                            .runCleanup = expiration_cpy.cleanup_context.runCleanup,
+                        },
+                    },
+                };
+            };
         }
 
         inline fn checkTypeCompatibility(comptime T: type) void {
