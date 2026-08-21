@@ -491,4 +491,5 @@ Additionally, you can set the max number of readers with the runtime options pas
 Keep in mind that the hard limit is `std.math.maxInt(u16)` readers on a single entry.
 Each entry cannot exceed `std.math.maxInt(u16)` bytes.
 I feel like that's pretty reasonable, especially since entries are shallow copies.
-If you run into this issue, maybe you can heap allocate portions of the entry; again, you can always pass in a callback to free that memory on expiration.
+If you run into this limitation, maybe you can heap allocate portions of the entry;
+again, you can always pass in a callback to free that memory on expiration.

@@ -5,279 +5,14 @@
 //! Rather, this is meant to save on network/IO/SYSCALLs that would be more expensive than RAM usage.
 //! Cache entries cannot exceed `std.math.max(u16)` bytes.
 //! Note that all cache entries are shallow copies, so if you need to get around this limitation, just heap-allocate and cache the pointer.
-//!
-//! Here is a convo I started with Claude for some implementation considerations after inspecting C#'s Microsoft.Extensions.Caching.Memory.MemoryCache:
-//!
-//! # Me:
-//! How does C#'s MemoryCache internally work regarding entries reaching their expiration?
-//! The naive assumption I had was that each entry with an expiration would begin a new future that simply slept until the deadline and removed the entry after waking up.
-//! However, I could imagine this would be resource-intensive to have a background task for every entry.
-//! So this prompted me to wonder how MemoryCache actually does this.
-//! I'm currently trying to implement a memory cache in Zig since nothing like that currently exists, and this is one of the things that I'm scrutinizing in my naive implementation.
-//!
-//! # Claudius Maximus:
-//! Your naive assumption was reasonable, but MemoryCache does something more interesting — and honestly a bit more surprising — than "one timer per entry" *or* "one shared timer for the whole cache."
-//! It has **no dedicated timer object at all**.
-//! The MemoryCache doesn't have a timer to check for expiration; it tests if an expiry scan is needed each time it is accessed.
-//!
-//! **The two mechanisms**
-//!
-//! 1. **Lazy check-on-access.**
-//! Every `TryGetValue`/`Set` call runs the entry it touches through `CheckExpired(now)`.
-//! If an entry is past its absolute/sliding deadline, it's treated as a miss and queued for removal right then — no waiting for any sweep.
-//! This is essentially free: you're already touching the entry's memory for the lookup, so the expiration check just rides along.
-//!
-//! 2. **Piggybacked periodic sweep.**
-//! Separately, on *every* cache operation, MemoryCache checks how long it's been since the last full sweep:
-//! ```csharp
-//! if (_options.ExpirationScanFrequency < utcNow - _lastExpirationScan)
-//! {
-//!     ScheduleTask(utcNow);
-//! }
-//! ``` where `ScheduleTask` does `_lastExpirationScan = utcNow; Task.Factory.StartNew(() => ScanForExpiredItems(...))`.
-//! `ExpirationScanFrequency` defaults to `TimeSpan.FromMinutes(1)`.
-//! The scan itself is a brute-force linear walk:
-//! ```csharp
-//! foreach (KeyValuePair<object, CacheEntry> item in cache._entries)
-//! {
-//!     CacheEntry entry = item.Value;
-//!     if (entry.CheckExpired(now))
-//!     {
-//!         cache.RemoveEntry(entry);
-//!     }
-//! }
-//! ``` — a full O(n) pass over the `ConcurrentDictionary<object, CacheEntry>` backing store, dispatched onto the thread pool via `Task.Factory.StartNew` so it doesn't block the caller that happened to trigger it.
-//!
-//! So the "background task" you imagined does exist — but there's at most one in flight at a time (in theory).
-//! It's not scheduled by a timer; it's opportunistically kicked off by whatever thread happens to call into the cache after the interval has elapsed, and it sweeps *everything* rather than targeting the one entry that's actually due.
-//!
-//! **Notable consequence for your design:**
-//! Because the sweep is entirely piggybacked on cache traffic, a cache that goes completely idle after entries expire will never reclaim that memory — there's nothing driving cleanup except calls into the cache.
-//! If you want a guarantee that expired entries get evicted even without traffic, MemoryCache doesn't give you that; you'd need your own idle timer for it.
-//!
-//! **Expiration tokens are different — push, not pull.**
-//! `IChangeToken`-based expiration (e.g. `CancellationChangeToken`) registers a callback via `RegisterChangeCallback` at entry-creation time.
-//! When the token fires, the callback runs immediately and evicts the entry — that part *is* genuinely event-driven/push-based, not polled.
-//! It's really only time-based (`AbsoluteExpiration`/`SlidingExpiration`) that's handled via the pull model above.
-//!
-//! **Known rough edges worth knowing before you copy the design:**
-//! - The check-and-set on `_lastExpirationScan` isn't guarded by a lock, so under concurrent load multiple full-dictionary scans can get scheduled at once — this method doesn't check if the scan isn't underway, and there is a possibility that ScanForExpiredItems will be invoked many times concurrently, which is exactly the kind of thundering-herd bug you'd want to avoid in a from-scratch implementation.
-//! - At high entry turnover with eviction callbacks registered, each eviction gets its own `Task.Factory.StartNew` for the callback, which can flood the thread pool — ScanForExpiredItems calls CacheEntry.InvokeEvictionCallbacks() for each expired entry, and this routine uses Task.Factory.StartNew() to queue each eviction callback as a thread pool work item, causing queueing/backpressure under sustained load.
-//!
-//! **For your Zig implementation**, given you're explicitly performance-focused, I'd flag the O(n) linear sweep as the part *not* worth imitating.
-//! MemoryCache gets away with it because sweeps are rate-limited to once a minute and most workloads don't have millions of resident entries,
-//! but a full dictionary walk is a poor fit if you care about predictable latency or very large entry counts. The classic alternatives, in ascending order of complexity:
-//!
-//! - **Min-heap keyed by expiration deadline** — pop-while-expired is O(log n) per eviction, and you only touch entries that are actually near expiry, not the whole table.
-//! - **Hierarchical timing wheel** (what Redis/Kafka/Netty use) — O(1) amortized insert and expiry-bucket advancement, at the cost of some coarser time-resolution and bucket bookkeeping.
-//! - **Sorted skip-list/BTreeMap by deadline** if you want range queries over expiration times too.
-//!
-//! Any of these lets you decouple "how many entries exist" from "cost of finding what's expired," which the dictionary-scan approach explicitly doesn't do.
-//! Combining that structure with the same lazy check-on-access trick (cheap, no reason to drop it) gives you the best of both:
-//! O(1) amortized proactive eviction *and* zero-cost correctness on the read path even if the sweep hasn't caught something yet.
-//!
-//! # Me:
-//! Okay, the in-place expiration evaluation totally makes sense.
-//! Presumably a memory cache should have a lot of hits (otherwise, why are you using a cache?), so it should be rare to see an idle entry.
-//! Another interesting issue that I found myself running into was more specific to memory management.
-//! An issue arises when we reach expiration and other threads could be holding a reference to that memory.
-//! It would be unsafe to free memory related to that expired entry without ensuring that there are no active references to it.
-//! Thus, I attempted to handroll my own atomic reference-counting, but there could be an issue of contention when it's time to let an entry expire.
-//! Here is the code as it exists right now: https://github.com/MiahDrao97/zutil/blob/main/src/mem_cache.zig#L394.
-//! I have an open branch to address these concerns I've been having (I'm using spin locks, which aren't great for the CPU in high-contention scenarios).
-//! One idea I had was to have the memory cache copy the entry's memory with the `SafeReader` struct so that ref-counting becomes unnecessary.
-//! At the very least, we can setup a lock whenever a reader needs to copy an entry and then go from there. It becomes complex when an entry contains strings or other pointers since this could involve nested copying.
-//! What are some of your thoughts?
-//!
-//! # Claudester:
-//! Good — I pulled up the file. The relevant bit is the `Metadata.safeSwap`/`safeDestroy`/`safeRead` trio and the way `putEntry` (replace path) and `remove`/`clear` consume them:
-//!
-//! ```zig
-//! while (!try metadata.safeSwap(io)) {}          // in putEntry's .replace branch
-//! while (!m.safeDestroy()) : (try io.checkCancel()) {}   // in remove() / clear()
-//! ```
-//!
-//! **Where the actual CPU cost is coming from**
-//!
-//! The CAS retry loop inside `safeRead` (incrementing the ref count) isn't really your problem —
-//! that's a normal, cheap CAS-retry-on-contention pattern that every lock-free counter has, and it resolves in a handful of iterations.
-//!
-//! The expensive part is `safeSwap`/`safeDestroy`: they require `ref_count == 0` *before* the transition succeeds, and the calling code spins synchronously until that's true.
-//! Under a read-heavy workload (which, as you said, a cache should be), there's no fairness mechanism —
-//! a writer trying to swap or destroy can be starved indefinitely by a steady stream of readers, each of which is free to increment the count again the instant it drops toward zero.
-//! That's a genuine livelock risk, not just "CAS retries are a little wasteful," and it's exactly the failure mode classic readers-writer spinlocks have when they favor readers.
-//!
-//! **Copy-on-read trades one cost for a worse one**
-//!
-//! Before getting to the fix — I'd push back a little on the copy-into-`SafeReader` idea as the primary solution.
-//! It removes the ref-count contention, sure, but it reintroduces an allocation + memcpy on *every single read*, which for a cache whose entire purpose is "avoid doing expensive work repeatedly" is a strange trade:
-//! you'd be guaranteeing an alloc on the hot path to avoid an atomic increment on the hot path.
-//! For large entries especially, that's very likely a net loss.
-//! And you've already found the sharp edge yourself — nested pointers force a real ownership-aware deep clone, which is a much bigger problem than the concurrency issue you're actually trying to solve.
-//!
-//! Worth noting: your doc comment already says entries are stored as **shallow copies** — pointer members aren't dereferenced.
-//! That's a design decision you've already made at the `newEntry`/`overwriteEntry` layer.
-//! I'd lean into that rather than fight it: keep MemCache scoped to POD/flat-layout values (which is what `mem.toBytes`/`bytesAsValue` already assumes),
-//! and push ownership of anything with nested pointers onto the caller via the `Expiration.runCleanup` callback you already have.
-//! Trying to make the cache itself deep-clone-aware is solving a problem your API surface has arguably already declined to take on.
-//!
-//! **The fix that fits your existing design: tombstone + last-reader-frees**
-//!
-//! Rather than requiring the writer to wait for `ref_count == 0` before transitioning, decouple "mark this entry as going away" from "free the memory":
-//!
-//! 1. **Removal/replace initiates a tombstone immediately** — no spin, no waiting for zero.
-//! Just one atomic store (e.g. set a `.retiring` state), which either succeeds (you're the one responsible for this entry's fate) or fails because someone else already retired it —
-//! same single-winner CAS you already do, just without looping on the *count* condition.
-//! 2. **New readers reject a retiring entry** — `safeRead` already has a place for this:
-//! `.destroying => return .destroying` (or a new `.retiring` variant) simply means "treat as a miss," same as today.
-//! No new readers join once retirement starts.
-//! 3. **Whoever's decrement crosses zero does the free.**
-//! This is the key trick: `fetchSub` returns the *previous* value.
-//! Exactly one thread's decrement will ever observe "previous was 1" (i.e., it just brought the count to zero) — that's a mathematical guarantee, not a race you need to guard with another CAS.
-//! So: in `release()`, after the `fetchSub`, check if the entry is retiring *and* the previous count was 1.
-//! If both, that release() call is now responsible for the actual `gpa.free()` + cleanup callback — not the thread that called `remove()`.
-//! 4. **The retiring thread itself just needs to handle the case where the count was already zero** at the moment it set the tombstone (no active readers) —
-//! then it does the free itself, synchronously, no spin required either way.
-//!
-//! This is the same "last one out turns off the lights" pattern used in refcounted lock-free structures generally (Linux `kref_put`, Rust `Arc`'s drop).
-//! It keeps your existing `RefCount` atomic and CAS machinery almost entirely intact — you're just moving *when* the free happens (from "writer waits, then frees" to "whoever's decrement empties it, frees") rather than replacing the whole scheme.
-//!
-//! For the `.replace` path specifically, this maps naturally onto an RCU-style publish:
-//! swap the value pointer in `ValueCache` first (so new readers immediately see the new value), then treat the *old* value+metadata as a retiring generation subject to the same last-reader-frees rule.
-//! You're already halfway there — you just currently gate the pointer swap behind the zero-wait instead of doing it first and deferring cleanup.
-//!
-//! **One more thing worth checking:** since every `read` call does an atomic RMW on `ref_count`, make sure `Metadata` isn't sharing a cache line with neighboring entries' metadata in `MetadataCache`'s backing array —
-//! if `Metadata` isn't padded to `std.atomic.cache_line`, hot concurrent reads across *different* keys can false-share and bounce cache lines between cores even though logically they're touching unrelated entries.
-//! Given you're already cache-line-aligning the value storage, the metadata array is the one place I'd double check.
-//!
-//! If you want to go further than this later — say, if you find even the tombstone-CAS has too much contention under really hot key churn —
-//! epoch-based reclamation (à la Crossbeam's `epoch` crate or RCU) is the "proper" general answer to this whole class of problem,
-//! since it eliminates the per-read atomic write entirely in favor of readers just recording an epoch they're "in." But that's a meaningfully bigger redesign, and I don't think you need it yet.
-//! The tombstone approach should kill the livelock with a much smaller diff against what you already have.
-//!
-//! # Me:
-//! Interesting note on the padding of `Metadata`.
-//! Are you saying that the backing array of the hashmap should always be padded to `std.atomic.cache_line`, regardless of the alignment value passed in to `Aligned()`?
-//! The intent behind that alignment was for the max alignment of an entry so that I can cast the aligned byte array to the entry type without any thought given to the `Metadata` map.
-//!
-//! # Claudeface:
-//! Good distinction to draw out — no, `max_alignment` and the padding concern are unrelated, and I should've been clearer about that.
-//!
-//! `max_alignment` governs the **value buffer's** alignment —
-//! it exists so that `mem.bytesAsValue`/`bytesAsSlice` can safely reinterpret the `[]u8` cache storage as `*const T` without UB, regardless of what `T` the caller stashes in.
-//! That's a correctness requirement tied to the type being cached, and it has nothing to do with how `Metadata` structs sit in `MetadataCache`'s backing array.
-//!
-//! The false-sharing concern is a separate, purely mechanical one:
-//! `std.ArrayHashMapUnmanaged` stores its values as a **dense, tightly packed array**.
-//! `Metadata` instances for different keys sit back-to-back in memory with no gaps, in insertion order. Your `Metadata` is roughly:
-//!
-//! ```
-//! expiration: Expiration   // Io.Timeout + a fn ptr + a context ptr — probably 24-32 bytes
-//! len: u32
-//! ref_count: Atomic(RefCount)  // u16
-//! ```
-//!
-//! That's easily 2-3 `Metadata` instances per 64-byte cache line.
-//! So if two threads are concurrently incrementing/decrementing `ref_count` for two *different* keys that happen to land in adjacent slots,
-//! you get cache-line ping-pong between cores even though there's zero logical contention between those two operations.
-//! That's textbook false sharing, and it's independent of anything the caller's `T` looks like.
-//!
-//! **Should you always pad `Metadata` to a full cache line regardless of `max_alignment`?**
-//! I'd stop short of "always" — it's a real tradeoff, not a free win:
-//!
-//! - **Cost of padding everything:** if `Metadata` is naturally ~24-32 bytes, forcing it to 64 means roughly doubling the size of the metadata table.
-//! That directly hurts the thing dense packing was buying you — good locality when you scan (`format()`/`threadsafeDump()`,
-//! and implicitly whenever `getPtr` walks probe sequences) — and for a cache with many entries but modest concurrency, that memory/locality cost may not be worth paying.
-//! - **Whether it even bites depends on your workload:**
-//! false sharing here only matters when two *hot* keys happen to land in adjacent slots and get hit concurrently from different cores.
-//! Since the array is insertion-ordered (not sparse), that's essentially incidental — a function of insertion order relative to which keys turn out to be hot.
-//! A cache with a handful of very hot keys inserted early and mostly-cold keys after has a decent chance of avoiding it entirely;
-//! a cache under heavy concurrent churn across many hot keys is much more likely to hit it.
-//! This is genuinely a "profile before you pay for it" situation — `perf c2c` (cache-to-cache transfer analysis) would tell you concretely whether it's happening rather than guessing.
-//!
-//! **If you do want to fix it, I'd do it surgically rather than blanket-padding `Metadata`.**
-//! The only field under concurrent *write* pressure is `ref_count` — `len` and `expiration` are read-heavy/write-rare (only touched on create/replace). So split them:
-//!
-//! ```zig
-//! // Hot, mutated every read/release — isolate to its own cache line per entry
-//! const RefCountCell = struct {
-//!     ref_count: Atomic(RefCount),
-//!     _pad: [std.atomic.cache_line - @sizeOf(Atomic(RefCount))]u8 = undefined,
-//! };
-//!
-//! // Cold, stable after creation — keep this densely packed for scan locality
-//! const Metadata = struct {
-//!     expiration: Expiration,
-//!     len: u32,
-//! };
-//! ```
-//!
-//! with a parallel array (or a second `ArrayHashMapUnmanaged` keyed the same way,
-//! or just a plain `std.ArrayListUnmanaged(RefCountCell)` indexed by the same slot index the hashmap already assigns) holding the `RefCountCell`s.
-//! That gets you cache-line isolation exactly where the false sharing risk actually lives, without bloating the part of the metadata table that benefits from staying small and densely packed.
-//! It's a bit more bookkeeping (you now need to keep two structures' indices in sync, or store an index/pointer from one into the other), but it avoids the blunt "pad everything to 64 bytes" cost.
-//!
-//! Given the tombstone rework we just discussed also touches this same struct, it's probably worth doing both changes together rather than in two passes —
-//! the `RefCountCell` split gives you a natural place to put the retiring flag too, right next to the count it gates.
-//!
-//! # Me:
-//! So let's think about the "epoch" approach as well.
-//! In my own usage of memory caches, they usually will re-fetch the data in an interval of 30 seconds to 5 minutes, re-caching the new data with the same key.
-//! One thing I'm worried about with tombstoning is that if we know we're retiring an entry and new readers attempt to get the entry,
-//! there could be an overlap of old readers still on the old tomb-stoned entry while new readers will be on a new entry with the same key.
-//! I feel this necessitates the epoch pattern so that we know entries with key X are now on the epoch,
-//! and that should be the entry new readers return while the old one is still being de-commissioned until the final reader turns out the light.
-//! Is that an accurate mental model of the problem?
-//!
-//! # Claudalicious:
-//! Yes — that's exactly the bug, and it's worth being precise about *why*, because it changes what the fix needs to be.
-//!
-//! **The real problem: two generations sharing one identity**
-//!
-//! In your current code (and in my tombstone sketch as I described it, if taken literally), there's one `Metadata` struct per key, and `safeSwap` reuses it in place:
-//! it CASes `ref_count` back to `.zero` and swaps the value pointer underneath.
-//! The bug is that `SafeReader.ref_count` is just `*Atomic(RefCount)` — a raw pointer into that one shared struct.
-//! If an old reader is still holding a `SafeReader` from *before* the swap, its eventual `release()` call does `fetchSub` on that same atomic — which, post-swap, is now counting *new*-generation readers.
-//! An old reader releasing decrements the new generation's count;
-//! a burst of old releases could even drive the new generation's count to zero (or negative, into your sentinel range) while new readers are still actively using it.
-//! That's a correctness bug, not just a performance one — refcount corruption across generations, potentially freeing memory a live reader still holds a slice to.
-//!
-//! So yes: **a single ref_count field cannot represent two overlapping generations of the same key.** Your instinct is right.
-//!
-//! **But the fix is generation-scoping, not necessarily full epoch reclamation — those are two different granularities of the same idea, and it's worth separating them:**
-//!
-//! *Lightweight fix — per-key generations:*
-//! On replace, don't touch the old `Metadata` in place at all.
-//! Allocate a **new** `Metadata` (fresh `ref_count` starting at `.zero`) for the new value, and atomically swap the hashmap's pointer/slot so that new lookups of key X immediately resolve to the new generation.
-//! The old `Metadata` — with whatever `ref_count` it's sitting at — becomes an orphan: unreachable from any new lookup, but still valid for any `SafeReader`s that already captured a pointer to it before the swap.
-//! It just needs to sit somewhere (a small retire list, or an async task in your `expiration_group`) waiting for its own `ref_count` to hit zero via the same last-reader-frees rule,
-//! completely independent of whatever the new generation's counter is doing.
-//!
-//! This is really just: give every generation its own identity, so cross-generation corruption is structurally impossible rather than something you have to reason your way out of.
-//! No global epoch counter required.
-//! Given your workload — refetch every 30s–5min, so at any instant you'll typically have at most one old generation lingering briefly while its last readers finish.
-//! The number of concurrently-live generations per key is almost always 1, occasionally 2.
-//! A tiny retire list per key (or even just an `Io.Group.concurrent` task holding the orphaned `Metadata` + buffer by value/pointer until it can free itself) handles that fine.
-//!
-//! *The heavier tool — true epoch-based reclamation (RCU/Crossbeam-style):*
-//! This is a different mechanism solving a different pain point.
-//! Its point isn't "which generation does this reader belong to" (per-key concept) — it's **eliminating the atomic RMW on every read entirely**, cache-wide.
-//! Readers don't touch a shared counter at all; they just stamp a per-thread epoch value on entry/exit (a plain, uncontended store — no cross-core cache-line traffic),
-//! and a background reclaimer periodically checks "have all threads advanced past epoch E" before freeing anything retired in epoch E.
-//! That's the mechanism you'd reach for if profiling showed that even the cheap `fetchAdd`/`fetchSub` pair in `safeRead`/`release` —
-//! not the wait-for-zero spin, which the tombstone fix already kills, but the *steady-state* increment/decrement itself — was the bottleneck, typically under very high core counts hammering the same hot key.
-//!
-//! Given your actual numbers — reads dominating, writes every 30s-5min, a handful of overlapping generations at most —
-//! I'd bet the per-key generation fix resolves the correctness issue and the earlier livelock issue without needing to bring in epochs at all.
-//! Epochs buy you lower per-read cost at the price of real complexity (thread registration, deferred/batched frees, a background epoch-advancing reclaimer) and deferred reclamation latency (memory isn't freed the instant the last reader's gone — it's freed once the global epoch advances past it, which is coarser).
-//! I'd treat it as the escalation path if you later find the per-read atomic itself shows up in a profile, not the default starting point.
 
 /// Aligned to cache line alignment boundary to prevent CPU cache invalidation.
 /// It's expected for memory in this cache to be accessed via RAM rather than CPU caches.
 pub const Default = Aligned(.fromByteUnits(std.atomic.cache_line), null);
 
-/// All entries are aligned to this max alignment.
-pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) type {
+/// `max_alignment` - All entry values are aligned to this max alignment.
+/// `max_entries` - No more than this number of entries will be allowed, and the pool will be pre-allocated when calling `init()`.
+pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) type {
     return struct {
         /// All active entries -
         /// Once an entry is tombstoned, it disappears from this map until the last reader is released, which frees the memory.
@@ -293,64 +28,23 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
 
         const MemCacheSelf = @This();
 
-        /// Allows one to pull an entry from the cache and have it safely read until `release()` is called on this reader.
-        /// Each active reader represents one unit on the entry's reference count (max active references is configurable).
-        pub const Reader = struct {
-            /// The entry
-            entry: Entry,
-            /// What happens when `release()` is called.
-            /// These values are used internally - do not modify
-            release_strategy: ReleaseStrategy,
-
-            /// After this call, the entry is no longer safe to read.
-            pub fn release(self: Reader, cache: *MemCacheSelf) void {
-                switch (self.release_strategy) {
-                    .arc => |ref_count| {
-                        const count_as_int: *Atomic(u16) = @ptrCast(ref_count);
-                        const prev_count: RefCount = @enumFromInt(count_as_int.fetchSub(1, .release));
-                        // The previous ref count must be some value between 1 and the max.
-                        // Otherwise, something's broken...
-                        debug.assert(prev_count.compare(.gt, .zero));
-                        debug.assert(prev_count.compare(.lte, @enumFromInt(cache.opts.max_readers)));
-                        if (prev_count == .one) {
-                            const data: *EntryData = @alignCast(@fieldParentPtr("ref_count", ref_count));
-                            // Tombstoned entries have been removed the cache; so this is just a floating reference.
-                            // We've confirmed we're the last reader, so it's up to us to destroy this metadata.
-                            if (data.expiration.timeout == .tombstoned) {
-                                log.debug("Removing reader for value {*}, len={d}", .{ self.entry.raw_value.ptr, self.entry.raw_value.len });
-                                debug.assert(ref_count.raw == .zero);
-                                data.expiration.cleanup(self.entry);
-                                cache.allocator.free(data.value());
-                                cache.entry_pool.destroy(data);
-                            }
-                        }
-                    },
-                    .not_cached => |c| {
-                        c.runCleanup(c.ctx, self.entry);
-                        cache.allocator.free(@as([]align(max_alignment.toByteUnits()) const u8, @alignCast(self.entry.raw_value)));
-                    },
-                }
-            }
-        };
-
         /// Note that the MemCache is a managed data structure (i.e. it stores its own allocator).
         /// The reason for this is the complex lifetimes required for reference counting.
         pub fn init(gpa: Allocator, opts: Options) Allocator.Error!MemCacheSelf {
             return .{
                 .active_entries = .empty,
                 .lock = .init,
-                .entry_pool = if (max_entries) |m| try .initCapacity(gpa, m) else .empty,
+                .entry_pool = if (max_entries) |max| try .initCapacity(gpa, max) else .empty,
                 .allocator = gpa,
                 .opts = opts,
             };
         }
 
         /// Creates a new entry, returning `error.CacheClobber` if an entry with this `key` already exists.
-        /// Ensure that `gpa` is thread-safe.
         ///
         /// Keys are not stored in this memory cache, so it's the responsibility of the caller to keep track of keys.
         /// The caller must also know the type of the stored values since they're agnostically stored as `[*]const u8`.
-        /// Note that this entry is saved as a shallow copy, which means that pointer members are not dereferenced and saved into the cache.
+        /// This means entries are saved as shallow copies, which means that pointer members are not dereferenced and saved into the cache.
         ///
         /// Use `newSliceEntry()` to cache a slice.
         pub fn newEntry(
@@ -368,12 +62,11 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
         }
 
         /// Creates or overwrites an entry.
-        /// Ensure that `gpa` is thread-safe.
         /// Runs `expiration.cleanup()` on error.
         ///
         /// Keys are not stored in this memory cache, so it's the responsibility of the caller to keep track of keys.
         /// The caller must also know the type of the stored values since they're agnostically stored as `[*]const u8`.
-        /// Note that this entry is saved as a shallow copy, which means that pointer members are not dereferenced and saved into the cache.
+        /// This means entries are saved as shallow copies, which means that pointer members are not dereferenced and saved into the cache.
         ///
         /// Use `overwriteSliceEntry()` to create/overwrite a slice.
         pub fn overwriteEntry(
@@ -391,13 +84,16 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
         }
 
         /// First checks if the entry exists.
-        /// If a `SafeReader` can be obtained from an existing entry, it is returned.
-        /// Otherwise, creates an entry using the `createEntryFn` and passed-in context and returns a `SafeReader` to the new entry.
-        /// Be sure to call `release()` on the `SafeReader`.
-        /// Assumes that the duration of `expiration` is longer than the time it takes to lock a reader.
+        /// If a `Reader` can be obtained from an existing entry, it is returned.
+        /// Otherwise, creates an entry using the `createEntryFn` and passed-in context and returns a `Reader` to the new entry.
+        /// Be sure to call `release()` on the `Reader`.
+        ///
+        /// If this cache is at maximum entries, will still generate the value and return a `Reader` for it, but it will not be cached.
+        /// If the expiration passed in is shorter than the time it takes to create this entry, will still generate the value and return a `Reader` for it, but the entry will no longer exist in the cache.
         ///
         /// Keys are not stored in this memory cache, so it's the responsibility of the caller to keep track of keys.
-        /// Note that this entry is saved as a shallow copy, which means that pointer members are not dereferenced and saved into the cache.
+        /// The caller must also know the type of the stored values since they're agnostically stored as `[*]const u8`.
+        /// This means entries are saved as shallow copies, which means that pointer members are not dereferenced and saved into the cache.
         ///
         /// Use `getOrPutSliceEntry()` for slices.
         pub fn getOrPutEntry(
@@ -416,15 +112,15 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
             }
 
             var expiration_cpy: Expiration = expiration;
-            const val: OkComponent(TReturn) = try @as(
+            var val: OkComponent(TReturn) = try @as(
                 ErrorComponent(TReturn)!OkComponent(TReturn),
                 createEntryFn(create_entry_ctx, &expiration_cpy.cleanup_context),
             );
 
-            const entry_reader: Entry = .{ .raw_value = &mem.toBytes(val) };
+            var entry_reader: Entry = .{ .raw_value = &mem.toBytes(val) };
             errdefer expiration_cpy.cleanup(entry_reader);
 
-            const v: []align(max_alignment.toByteUnits()) const u8 = try self.createEntryValue(entry_reader.raw_value);
+            var v: []align(max_alignment.toByteUnits()) const u8 = try self.createEntryValue(entry_reader.raw_value);
             errdefer self.allocator.free(v);
 
             self.putEntry(io, key, v, expiration_cpy, .no_clobber) catch |err| switch (err) {
@@ -444,8 +140,19 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
             };
 
             return (try self.read(io, key)) orelse contigency: {
-                // should be impossible...
                 log.warn("Finished performing `getOrPutEntry` with key '{s}', but the entry was not found. Was the expiration long enough to create the entry? - {f}", .{ key, expiration.timeout });
+                // Well, we know at this point our entry and everything therein was freed from the `read()` call,
+                // so we need to create everything again.
+                val = try @as(
+                    ErrorComponent(TReturn)!OkComponent(TReturn),
+                    createEntryFn(create_entry_ctx, &expiration_cpy.cleanup_context),
+                );
+                entry_reader = .{ .raw_value = &mem.toBytes(val) };
+                errdefer expiration_cpy.cleanup(entry_reader);
+
+                v = try self.createEntryValue(entry_reader.raw_value);
+                errdefer comptime unreachable;
+
                 break :contigency .{
                     .entry = .{ .raw_value = v },
                     .release_strategy = .{
@@ -459,8 +166,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
         }
 
         /// Creates a new slice entry, returning `error.CacheClobber` if an entry with this `key` already exists.
-        /// Ensure that `gpa` is thread-safe.
-        /// The contents of the entry are copied to the cache.
+        /// The caller must also know the slice type since it's agnostically converted into a slice of bytes.
         /// Runs `expiration.cleanup()` on error.
         pub fn newSliceEntry(
             self: *MemCacheSelf,
@@ -478,8 +184,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
         }
 
         /// Creates or overwrites a slice entry.
-        /// Ensure that `gpa` is thread-safe.
-        /// The contents of the entry are copied to the cache.
+        /// The caller must also know the slice type since it's agnostically converted into a slice of bytes.
         /// Runs `expiration.cleanup()` on error.
         pub fn overwriteSliceEntry(
             self: *MemCacheSelf,
@@ -497,11 +202,13 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
         }
 
         /// First checks if the entry exists.
-        /// If a `SafeReader` can be obtained from an existing entry, it is returned.
-        /// Otherwise, creates an entry using the `createEntryFn` and passed-in context and returns a `SafeReader` to the new entry.
-        /// Be sure to call `release()` on the `SafeReader`.
-        /// Assumes that the reader can be locked before the expiration is up.
-        /// The contents of the entry are copied to the cache.
+        /// If a `Reader` can be obtained from an existing entry, it is returned.
+        /// Otherwise, creates an entry using the `createEntryFn` and passed-in context and returns a `Reader` to the new entry.
+        /// Be sure to call `release()` on the `Reader`.
+        /// The caller must also know the slice type since it's agnostically converted into a slice of bytes.
+        ///
+        /// If this cache is at maximum entries, will still generate the value and return a `Reader` for it, but it will not be cached.
+        /// If the expiration passed in is shorter than the time it takes to create this entry, will still generate the value and return a `Reader` for it, but the entry will no longer exist in the cache.
         pub fn getOrPutSliceEntry(
             self: *MemCacheSelf,
             comptime TReturn: type,
@@ -525,13 +232,13 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
             }
 
             var expiration_cpy: Expiration = expiration;
-            const val: []const SliceType = try @as(
+            var val: []const SliceType = try @as(
                 ErrorComponent(TReturn)![]const SliceType,
                 createEntryFn(create_entry_ctx, &expiration_cpy.cleanup_context),
             );
-            const entry_reader: Entry = .{ .raw_value = mem.sliceAsBytes(val) };
+            var entry_reader: Entry = .{ .raw_value = mem.sliceAsBytes(val) };
             errdefer expiration_cpy.cleanup(entry_reader);
-            const v: []align(max_alignment.toByteUnits()) const u8 = try self.createEntryValue(entry_reader.raw_value);
+            var v: []align(max_alignment.toByteUnits()) const u8 = try self.createEntryValue(entry_reader.raw_value);
             errdefer self.allocator.free(v);
 
             self.putEntry(io, key, v, expiration_cpy, .no_clobber) catch |err| switch (err) {
@@ -551,8 +258,19 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
             };
 
             return (try self.read(io, key)) orelse contigency: {
-                // should be impossible...
                 log.warn("Finished performing `getOrPutSliceEntry` with key '{s}', but the entry was not found. Was the expiration long enough to create the entry? - {f}", .{ key, expiration.timeout });
+                // Well, we know at this point our entry and everything therein was freed from the `read()` call,
+                // so we need to create everything again.
+                val = try @as(
+                    ErrorComponent(TReturn)![]const SliceType,
+                    createEntryFn(create_entry_ctx, &expiration_cpy.cleanup_context),
+                );
+                entry_reader = .{ .raw_value = mem.sliceAsBytes(val) };
+                errdefer expiration_cpy.cleanup(entry_reader);
+
+                v = try self.createEntryValue(entry_reader.raw_value);
+                errdefer comptime unreachable;
+
                 break :contigency .{
                     .entry = .{ .raw_value = v },
                     .release_strategy = .{
@@ -630,12 +348,12 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
             }
         }
 
-        /// Read an entry, producing a `SafeReader` that repesents an active read on the entry.
-        /// Until the `SafeReader` is released, this entry is safe to read.
-        /// Returns null if no entry exists with this key.
+        /// Read an entry, producing a `Reader` that repesents an active read on the entry.
+        /// Until the `Reader` is released, this entry is safe to read.
+        /// Returns null if no entry exists with this key or if the entry has expired.
         /// Returns `error.TooManyOpenReaders` if the ref count would exceed max (configurable on `init()`, but defaults to the hard limit of `std.math.maxInt(u16)`).
         ///
-        /// WARN : If the caller fails to call `release()` on the reader, it may produce a deadlock or segmentation fault later in the program.
+        /// WARN : If the caller fails to call `release()` exactly once on the reader, it may produce a panic or segmentation fault later in the program.
         pub fn read(self: *MemCacheSelf, io: Io, key: []const u8) OpenReaderError!?Reader {
             const k: StringHash = .hashStr(key);
 
@@ -659,10 +377,10 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
 
         /// Call this function instead of `read()` so you don't have to handle `error.TooManyOpenReaders`.
         /// In the event that the max number of readers are open, will simply wait until the next reader is released.
-        /// Until the resulting `SafeReader` is released, this entry is safe to read.
-        /// Returns null if no entry exists with this key.
+        /// Until the resulting `Reader` is released, this entry is safe to read.
+        /// Returns null if no entry exists with this key or if the entry has expired.
         ///
-        /// WARN : If the caller fails to call `release()` on the reader, it may produce a deadlock or segmentation fault later in the program.
+        /// WARN : If the caller fails to call `release()` exactly once on the reader, it may produce a panic or segmentation fault later in the program.
         pub fn waitForReader(self: *MemCacheSelf, io: Io, key: []const u8) Io.Future(Io.Cancelable!?Reader) {
             const waitForReaderLock = struct {
                 fn wait(_self: *MemCacheSelf, _io: Io, _key: []const u8) Io.Cancelable!?Reader {
@@ -680,7 +398,9 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
             return io.async(waitForReaderLock, .{ self, io, key });
         }
 
-        /// Remove a cache entry, freeing the cached value in the process.
+        /// If true, an active entry was tombstoned and no longer able to be read.
+        /// If no active entry was found, returns false.
+        /// In a cancellation scenario, nothing has been removed; we were simply waiting for the lock.
         pub fn remove(self: *MemCacheSelf, io: Io, key: []const u8) Io.Cancelable!bool {
             const k: StringHash = .hashStr(key);
 
@@ -695,7 +415,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
             return false;
         }
 
-        /// Clear all entries from the cache, freeing the memory created for the cached values.
+        /// Tombstones all active entries from the cache.
         /// In a cancellation scenario, nothing has been removed; we were simply waiting for the lock.
         pub fn clear(self: *MemCacheSelf, io: Io) Io.Cancelable!void {
             try self.lock.lock(io);
@@ -743,7 +463,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
 
         /// Deinitialize the memory cache, freeing all entries.
         /// WARN : Only call this during shutdown.
-        /// Will panic if any active readers are found.
+        /// Will panic or produce a segmentation fault if any active readers are found.
         pub fn deinit(self: *MemCacheSelf) void {
             log.debug("WARNING: Preparing to destroy self!!!\n{f}", .{self});
             self.unsafeClear();
@@ -751,6 +471,46 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
             self.entry_pool.deinit(self.allocator);
             self.* = undefined;
         }
+
+        /// Allows one to pull an entry from the cache and have it safely read until `release()` is called on this reader.
+        /// Each active reader represents one unit on the entry's reference count (max active references is configurable).
+        pub const Reader = struct {
+            /// The entry
+            entry: Entry,
+            /// What happens when `release()` is called.
+            /// These values are used internally - do not modify
+            release_strategy: ReleaseStrategy,
+
+            /// After this call, the entry is no longer safe to read.
+            pub fn release(self: Reader, cache: *MemCacheSelf) void {
+                switch (self.release_strategy) {
+                    .arc => |ref_count| {
+                        const count_as_int: *Atomic(u16) = @ptrCast(ref_count);
+                        const prev_count: RefCount = @enumFromInt(count_as_int.fetchSub(1, .release));
+                        // The previous ref count must be some value between 1 and the max.
+                        // Otherwise, something's broken...
+                        debug.assert(prev_count.compare(.gt, .zero));
+                        debug.assert(prev_count.compare(.lte, @enumFromInt(cache.opts.max_readers)));
+                        if (prev_count == .one) {
+                            const data: *EntryData = @alignCast(@fieldParentPtr("ref_count", ref_count));
+                            // Tombstoned entries have been removed the cache; so this is just a floating reference.
+                            // We've confirmed we're the last reader, so it's up to us to destroy this metadata.
+                            if (data.expiration.timeout == .tombstoned) {
+                                log.debug("Removing reader for value {*}, len={d}", .{ self.entry.raw_value.ptr, self.entry.raw_value.len });
+                                debug.assert(ref_count.raw == .zero);
+                                data.expiration.cleanup(self.entry);
+                                cache.allocator.free(data.value());
+                                cache.entry_pool.destroy(data);
+                            }
+                        }
+                    },
+                    .not_cached => |c| {
+                        c.runCleanup(c.ctx, self.entry);
+                        cache.allocator.free(@as([]align(max_alignment.toByteUnits()) const u8, @alignCast(self.entry.raw_value)));
+                    },
+                }
+            }
+        };
 
         /// Landmines to test with
         const minefield = @import("minefield.zig").set(enum {
@@ -1343,6 +1103,49 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
 
                 try testing.expectEqualStrings("whoa", reader.entry.readSlice(u8));
             }
+
+            // expiration too short
+            {
+                const EntryManager = struct {
+                    gpa: Allocator,
+                    created_slice: []const u8 = undefined,
+
+                    fn createEntry(this: @This(), cleanup_ctx_out: *Expiration.CleanupContext) Allocator.Error![]const u8 {
+                        const this_cpy: *@This() = try this.gpa.create(@This());
+                        errdefer this.gpa.destroy(this_cpy);
+
+                        this_cpy.* = this;
+                        cleanup_ctx_out.setContext(this_cpy);
+
+                        this_cpy.created_slice = try this_cpy.gpa.dupe(u8, "whoa");
+                        return this_cpy.created_slice;
+                    }
+
+                    fn cleanup(context: *anyopaque, entry: Entry) void {
+                        _ = entry; // when a slice is entered in the cache, it's copied, so we have to track the slice on this structure
+                        const this: *const @This() = @ptrCast(@alignCast(context));
+                        this.gpa.free(this.created_slice);
+                        this.gpa.destroy(this);
+                    }
+                };
+
+                testing.log_level = .err;
+                defer testing.log_level = .warn;
+
+                const entry_manager: EntryManager = .{ .gpa = testing.allocator };
+                const reader: Default.Reader = try mem_cache.getOrPutSliceEntry(
+                    Allocator.Error![]const u8,
+                    testing.io,
+                    "too_short",
+                    .lifetime(.tombstoned, .callback(EntryManager.cleanup)), // <-- this entry will never be valid
+                    entry_manager,
+                    EntryManager.createEntry,
+                );
+                defer reader.release(&mem_cache);
+
+                try testing.expect(reader.release_strategy == .not_cached);
+                try testing.expectEqualStrings("whoa", reader.entry.readSlice(u8));
+            }
         }
 
         test waitForReader {
@@ -1548,6 +1351,78 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?u32) ty
             const entry_b: *const DatabaseRow = reader_b.entry.read(DatabaseRow);
             try testing.expectEqual(2, entry_b.id);
             try testing.expectEqualStrings("NameColumn_2", entry_b.name);
+        }
+
+        test "getOrPutEntry - expiration too short" {
+            testing.log_level = .err;
+            defer testing.log_level = .warn;
+
+            const DatabaseRow = struct {
+                id: u64,
+                name: []const u8,
+                timestamp: i64,
+            };
+
+            var mem_cache: Default = try .init(testing.allocator, .{});
+            defer mem_cache.deinit();
+
+            const EntryManager = struct {
+                gpa: Allocator,
+                io: Io,
+                id: u64,
+
+                fn createEntry(
+                    this: @This(),
+                    cleanup_ctx_out: *Expiration.CleanupContext,
+                ) Allocator.Error!DatabaseRow {
+                    const timestamp: Io.Timestamp = .now(this.io, .real);
+                    const row: DatabaseRow = .{
+                        .id = this.id,
+                        .name = try this.gpa.dupe(u8, "NameColumn"),
+                        .timestamp = timestamp.toMilliseconds(),
+                    };
+                    errdefer this.gpa.free(row.name);
+
+                    // create a pointer to this structure to assign to the cleanup context output parameter
+                    const this_cpy: *@This() = try this.gpa.create(@This());
+                    this_cpy.* = this;
+                    cleanup_ctx_out.setContext(this_cpy);
+
+                    return row;
+                }
+
+                fn cleanup(context: *anyopaque, entry: Entry) void {
+                    // cast the cleanup context into a pointer to this struct
+                    const this: *const @This() = @ptrCast(@alignCast(context));
+                    const row: *const DatabaseRow = entry.read(DatabaseRow);
+                    this.gpa.free(row.name);
+                    this.gpa.destroy(this);
+                }
+            };
+
+            const entry_manager: EntryManager = .{
+                .gpa = testing.allocator,
+                .io = testing.io,
+                .id = 1,
+            };
+            const expiration: Expiration = .lifetime(
+                .tombstoned, // this entry will never be valid
+                .callback(EntryManager.cleanup), // this will be run on removal/expiration
+            );
+            const reader: Default.Reader = try mem_cache.getOrPutEntry(
+                Allocator.Error!DatabaseRow,
+                testing.io,
+                "DbRow(1)",
+                expiration,
+                entry_manager,
+                EntryManager.createEntry,
+            );
+            defer reader.release(&mem_cache);
+
+            try testing.expect(reader.release_strategy == .not_cached);
+            const entry: *const DatabaseRow = reader.entry.read(DatabaseRow);
+            try testing.expectEqual(1, entry.id);
+            try testing.expectEqualStrings("NameColumn", entry.name);
         }
     };
 }
