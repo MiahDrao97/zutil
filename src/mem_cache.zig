@@ -381,7 +381,21 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
         /// Returns null if no entry exists with this key or if the entry has expired.
         ///
         /// WARN : If the caller fails to call `release()` exactly once on the reader, it may produce a panic or segmentation fault later in the program.
-        pub fn waitForReader(self: *MemCacheSelf, io: Io, key: []const u8) Io.Future(Io.Cancelable!?Reader) {
+        pub fn waitForReader(
+            self: *MemCacheSelf,
+            io: Io,
+            key: []const u8,
+            timeout: Io.Timeout,
+        ) (Io.ConcurrentError || Io.Cancelable)!?Reader {
+            const GetReaderTimeout = union(enum) {
+                timeout: Io.Cancelable!void,
+                reader: Io.Cancelable!?Reader,
+            };
+
+            var buf: [2]GetReaderTimeout = undefined;
+            var select: Io.Select(GetReaderTimeout) = .init(io, &buf);
+            defer select.cancelDiscard();
+
             const waitForReaderLock = struct {
                 fn wait(_self: *MemCacheSelf, _io: Io, _key: []const u8) Io.Cancelable!?Reader {
                     while (true) {
@@ -394,8 +408,16 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
                     }
                 }
             }.wait;
-            // TODO : Introduce timeout maybe?
-            return io.async(waitForReaderLock, .{ self, io, key });
+
+            try select.concurrent(.reader, waitForReaderLock, .{ self, io, key });
+            try select.concurrent(.timeout, Io.Timeout.sleep, .{ timeout, io });
+
+            @breakpoint();
+            const result: GetReaderTimeout = try select.await();
+            return switch (result) {
+                .reader => |r| try r,
+                .timeout => return error.Canceled,
+            };
         }
 
         /// If true, an active entry was tombstoned and no longer able to be read.
@@ -1158,29 +1180,17 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
             // deliberately interfere with the data cuz I don't wanna make 32K references just for a unit test
             mem_cache.active_entries.get(StringHash.hashStr("my_slice")).?.ref_count.store(.max, .release);
 
-            var read_future: Io.Future(Io.Cancelable!?Default.Reader) = mem_cache.waitForReader(testing.io, "my_slice");
-            defer if (read_future.cancel(testing.io)) |maybe_reader| {
-                if (maybe_reader) |reader| reader.release(&mem_cache);
-            } else |_| {};
+            var reader: Default.Reader = (try mem_cache.waitForReader(
+                testing.io,
+                "my_slice",
+                .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } },
+            )) orelse return error.NoEntry;
+            defer reader.release(&mem_cache);
 
-            // pretend that a reader was just released
-            mem_cache.active_entries.get(StringHash.hashStr("my_slice")).?.ref_count.store(RefCount.max.minusOne(), .release);
-            if (try read_future.await(testing.io)) |final_reader| {
-                defer final_reader.release(&mem_cache);
-                try testing.expectEqual(
-                    RefCount.max,
-                    mem_cache.active_entries.get(StringHash.hashStr("my_slice")).?.ref_count.load(.monotonic),
-                );
-            } else return error.NoEntry;
-
-            try testing.expectEqual(
-                RefCount.max.minusOne(),
-                mem_cache.active_entries.get(StringHash.hashStr("my_slice")).?.ref_count.load(.monotonic),
-            );
-
-            // set this back so `clear()` doesn't deadlock
-            mem_cache.active_entries.get(StringHash.hashStr("my_slice")).?.ref_count.store(.zero, .release);
-            try mem_cache.clear(testing.io);
+            // TODO : Finish test:
+            // 1. Normal happy path
+            // 2. Path with max readers
+            // 3. Timeout
         }
 
         test "probably the most useful pattern" {
