@@ -375,49 +375,29 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
             return null;
         }
 
-        /// Call this function instead of `read()` so you don't have to handle `error.TooManyOpenReaders`.
-        /// In the event that the max number of readers are open, will simply wait until the next reader is released.
-        /// Until the resulting `Reader` is released, this entry is safe to read.
-        /// Returns null if no entry exists with this key or if the entry has expired.
+        /// Concurrently attempts to open a reader, trying again in the event of receiving `error.TooManyOpenReaders`.
+        /// It's up to the caller to handle a timeout, if desired.
+        /// Will set the `signal` when the reader is created or no active entries discovered.
         ///
         /// WARN : If the caller fails to call `release()` exactly once on the reader, it may produce a panic or segmentation fault later in the program.
         pub fn waitForReader(
             self: *MemCacheSelf,
             io: Io,
             key: []const u8,
-            timeout: Io.Timeout,
-        ) (Io.ConcurrentError || Io.Cancelable)!?Reader {
-            const GetReaderTimeout = union(enum) {
-                timeout: Io.Cancelable!void,
-                reader: Io.Cancelable!?Reader,
-            };
-
-            var buf: [2]GetReaderTimeout = undefined;
-            var select: Io.Select(GetReaderTimeout) = .init(io, &buf);
-            defer select.cancelDiscard();
-
-            const waitForReaderLock = struct {
-                fn wait(_self: *MemCacheSelf, _io: Io, _key: []const u8) Io.Cancelable!?Reader {
-                    while (true) {
-                        if (_self.read(_io, _key) catch |err| switch (err) {
+            signal: *Io.Event,
+        ) Io.ConcurrentError!Io.Future(Io.Cancelable!?Reader) {
+            return try io.concurrent(struct {
+                fn wait(_self: *MemCacheSelf, _io: Io, _key: []const u8, _signal: *Io.Event) Io.Cancelable!?Reader {
+                    defer _signal.set(_io);
+                    while (true) : (try _io.sleep(.fromMilliseconds(6), .awake)) {
+                        const reader: ?Reader = _self.read(_io, _key) catch |err| switch (err) {
                             error.Canceled => |canceled| return canceled,
                             error.TooManyOpenReaders => continue,
-                        }) |reader| {
-                            return reader;
-                        } else return null;
+                        };
+                        return reader;
                     }
                 }
-            }.wait;
-
-            try select.concurrent(.reader, waitForReaderLock, .{ self, io, key });
-            try select.concurrent(.timeout, Io.Timeout.sleep, .{ timeout, io });
-
-            @breakpoint();
-            const result: GetReaderTimeout = try select.await();
-            return switch (result) {
-                .reader => |r| try r,
-                .timeout => return error.Canceled,
-            };
+            }.wait, .{ self, io, key, signal });
         }
 
         /// If true, an active entry was tombstoned and no longer able to be read.
@@ -1171,26 +1151,40 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
         }
 
         test waitForReader {
-            var mem_cache: Default = try .init(testing.allocator, .{});
+            var mem_cache: Default = try .init(testing.allocator, .{ .max_readers = 1 });
             defer mem_cache.deinit();
 
             const slice: []const u8 = "asdf";
             try mem_cache.overwriteSliceEntry(u8, testing.io, "my_slice", slice, .no_expiration);
 
-            // deliberately interfere with the data cuz I don't wanna make 32K references just for a unit test
-            mem_cache.active_entries.get(StringHash.hashStr("my_slice")).?.ref_count.store(.max, .release);
+            // normal happy path - we should get a reader without deadlocking
+            const reader: Default.Reader = (try mem_cache.read(testing.io, "my_slice")) orelse return error.NoEntry;
+            var should_release: bool = true;
+            defer if (should_release) reader.release(&mem_cache);
+            try testing.expectEqualStrings(slice, reader.entry.readSlice(u8));
 
-            var reader: Default.Reader = (try mem_cache.waitForReader(
-                testing.io,
-                "my_slice",
-                .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } },
-            )) orelse return error.NoEntry;
-            defer reader.release(&mem_cache);
+            var signal: Io.Event = .unset;
+            var blocked_reader_future: Io.Future(Io.Cancelable!?Default.Reader) = try mem_cache.waitForReader(testing.io, "my_slice", &signal);
+            defer _ = blocked_reader_future.cancel(testing.io) catch {};
+            // ^ this should be blocked
 
-            // TODO : Finish test:
-            // 1. Normal happy path
-            // 2. Path with max readers
-            // 3. Timeout
+            try testing.expect(reader.release_strategy == .arc);
+            try testing.expectEqual(
+                @as(u16, @intFromEnum(reader.release_strategy.arc.load(.acquire))),
+                mem_cache.opts.max_readers,
+            );
+
+            should_release = false;
+            reader.release(&mem_cache);
+
+            const now_unblocked_reader: Default.Reader = (try blocked_reader_future.await(testing.io)) orelse return error.NoEntry;
+            defer now_unblocked_reader.release(&mem_cache);
+            try testing.expectEqualStrings(slice, now_unblocked_reader.entry.readSlice(u8));
+            try testing.expect(signal.isSet());
+
+            signal.reset();
+            var will_cancel_future: Io.Future(Io.Cancelable!?Default.Reader) = try mem_cache.waitForReader(testing.io, "my_slice", &signal);
+            try testing.expectError(error.Canceled, will_cancel_future.cancel(testing.io));
         }
 
         test "probably the most useful pattern" {
