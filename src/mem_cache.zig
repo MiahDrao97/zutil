@@ -357,8 +357,9 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
         pub fn read(self: *MemCacheSelf, io: Io, key: []const u8) OpenReaderError!?Reader {
             const k: StringHash = .hashStr(key);
 
+            var should_release: bool = true;
             try self.lock.lockShared(io);
-            defer self.lock.unlockShared(io);
+            defer if (should_release) self.lock.unlockShared(io);
 
             const data: ?*EntryData = self.active_entries.get(k);
             log.debug("Entry for key '{s}' (hash=0x{x}) was {s}.", .{ key, k, if (data == null) "not found" else "found" });
@@ -366,8 +367,19 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
                 // confirm this is a valid entry (i.e. not expired or tombstoned)
                 if (d.isExpired(io)) {
                     log.debug("Entry with key '{s}' (hash=0x{x}) is expired (expiration={f}). Now tombstoning entry...", .{ key, k, d.expiration.timeout });
-                    d.tombstone(self);
-                    debug.assert(self.active_entries.swapRemove(k));
+
+                    // release shared lock and attempt to acquire write lock
+                    should_release = false;
+                    self.lock.unlockShared(io);
+
+                    try self.lock.lock(io);
+                    defer self.lock.unlock(io);
+
+                    // We might not be the thread that actually removes this entry.
+                    // If we're not first, we don't want to unintentionally double-free (which can happen with 2+ subsequent calls to `tombstone()` with 0 readers).
+                    if (self.active_entries.swapRemove(k)) {
+                        d.tombstone(self);
+                    }
                     return null;
                 }
                 return try d.openReader(io, @enumFromInt(self.opts.max_readers));
