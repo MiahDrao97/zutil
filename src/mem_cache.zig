@@ -375,12 +375,12 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
             return null;
         }
 
-        /// Concurrently attempts to open a reader, trying again in the event of receiving `error.TooManyOpenReaders`.
-        /// It's up to the caller to handle a timeout, if desired.
-        /// Will set the `signal` when the reader is created or no active entries discovered.
+        /// Concurrently attempts to open a reader, retrying in the event of receiving `error.TooManyOpenReaders` until a reader is opened or no active entries are discovered.
+        /// At that point, `signal` will be set.
+        /// It's up to the caller to create a timeout, if desired.
         ///
         /// WARN : If the caller fails to call `release()` exactly once on the reader, it may produce a panic or segmentation fault later in the program.
-        pub fn waitForReader(
+        pub fn readConcurrent(
             self: *MemCacheSelf,
             io: Io,
             key: []const u8,
@@ -1150,7 +1150,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
             }
         }
 
-        test waitForReader {
+        test readConcurrent {
             var mem_cache: Default = try .init(testing.allocator, .{ .max_readers = 1 });
             defer mem_cache.deinit();
 
@@ -1164,7 +1164,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
             try testing.expectEqualStrings(slice, reader.entry.readSlice(u8));
 
             var signal: Io.Event = .unset;
-            var blocked_reader_future: Io.Future(Io.Cancelable!?Default.Reader) = try mem_cache.waitForReader(testing.io, "my_slice", &signal);
+            var blocked_reader_future: Io.Future(Io.Cancelable!?Default.Reader) = try mem_cache.readConcurrent(testing.io, "my_slice", &signal);
             defer _ = blocked_reader_future.cancel(testing.io) catch {};
             // ^ this should be blocked
 
@@ -1183,7 +1183,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
             try testing.expect(signal.isSet());
 
             signal.reset();
-            var will_cancel_future: Io.Future(Io.Cancelable!?Default.Reader) = try mem_cache.waitForReader(testing.io, "my_slice", &signal);
+            var will_cancel_future: Io.Future(Io.Cancelable!?Default.Reader) = try mem_cache.readConcurrent(testing.io, "my_slice", &signal);
             try testing.expectError(error.Canceled, will_cancel_future.cancel(testing.io));
         }
 
