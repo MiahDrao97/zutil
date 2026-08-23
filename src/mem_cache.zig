@@ -106,9 +106,21 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
             createEntryFn: fn (@TypeOf(create_entry_ctx), *Expiration.CleanupContext) TReturn,
         ) (ErrorComponent(TReturn) || GetOrPutError)!Reader {
             comptime checkTypeCompatibility(OkComponent(TReturn));
+            const ReadResult = union(enum) {
+                maybe_reader: ?Reader,
+                too_many_readers,
+            };
 
-            if (try self.read(io, key)) |reader| {
-                return reader;
+            var read_result: ReadResult = if (self.read(io, key)) |maybe_reader| .{
+                .maybe_reader = maybe_reader,
+            } else |err| switch (err) {
+                error.TooManyOpenReaders => .too_many_readers,
+                error.Canceled => |canceled| return canceled,
+            };
+
+            switch (read_result) {
+                .maybe_reader => |maybe_reader| if (maybe_reader) |r| return r,
+                .too_many_readers => {},
             }
 
             var expiration_cpy: Expiration = expiration;
@@ -122,6 +134,18 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
 
             var v: []align(max_alignment.toByteUnits()) const u8 = try self.createEntryValue(entry_reader.raw_value);
             errdefer self.allocator.free(v);
+
+            if (read_result == .too_many_readers) {
+                return .{
+                    .entry = .{ .raw_value = v },
+                    .release_strategy = .{
+                        .not_cached = .{
+                            .ctx = expiration_cpy.cleanup_context.ctx,
+                            .runCleanup = expiration_cpy.cleanup_context.runCleanup,
+                        },
+                    },
+                };
+            }
 
             self.putEntry(io, key, v, expiration_cpy, .no_clobber) catch |err| switch (err) {
                 // Some other thread could have beat us here... An entry must exist then.
@@ -139,21 +163,14 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
                 else => |e| return e,
             };
 
-            return (try self.read(io, key)) orelse contigency: {
-                log.warn("Finished performing `getOrPutEntry` with key '{s}', but the entry was not found. Was the expiration long enough to create the entry? - {f}", .{ key, expiration.timeout });
-                // Well, we know at this point our entry and everything therein was freed from the `read()` call,
-                // so we need to create everything again.
-                val = try @as(
-                    ErrorComponent(TReturn)!OkComponent(TReturn),
-                    createEntryFn(create_entry_ctx, &expiration_cpy.cleanup_context),
-                );
-                entry_reader = .{ .raw_value = &mem.toBytes(val) };
-                errdefer expiration_cpy.cleanup(entry_reader);
-
-                v = try self.createEntryValue(entry_reader.raw_value);
-                errdefer comptime unreachable;
-
-                break :contigency .{
+            read_result = if (self.read(io, key)) |maybe_reader| .{
+                .maybe_reader = maybe_reader,
+            } else |err| switch (err) {
+                error.TooManyOpenReaders => .too_many_readers,
+                error.Canceled => |canceled| return canceled,
+            };
+            return switch (read_result) {
+                .too_many_readers => .{
                     .entry = .{ .raw_value = v },
                     .release_strategy = .{
                         .not_cached = .{
@@ -161,7 +178,31 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
                             .runCleanup = expiration_cpy.cleanup_context.runCleanup,
                         },
                     },
-                };
+                },
+                .maybe_reader => |reader| reader orelse contigency: {
+                    log.warn("Finished performing `getOrPutEntry` with key '{s}', but the entry was not found. Was the expiration long enough to create the entry? - {f}", .{ key, expiration.timeout });
+                    // Well, we know at this point our entry and everything therein was freed from the `read()` call,
+                    // so we need to create everything again.
+                    val = try @as(
+                        ErrorComponent(TReturn)!OkComponent(TReturn),
+                        createEntryFn(create_entry_ctx, &expiration_cpy.cleanup_context),
+                    );
+                    entry_reader = .{ .raw_value = &mem.toBytes(val) };
+                    errdefer expiration_cpy.cleanup(entry_reader);
+
+                    v = try self.createEntryValue(entry_reader.raw_value);
+                    errdefer comptime unreachable;
+
+                    break :contigency .{
+                        .entry = .{ .raw_value = v },
+                        .release_strategy = .{
+                            .not_cached = .{
+                                .ctx = expiration_cpy.cleanup_context.ctx,
+                                .runCleanup = expiration_cpy.cleanup_context.runCleanup,
+                            },
+                        },
+                    };
+                },
             };
         }
 
@@ -207,7 +248,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
         /// Be sure to call `release()` on the `Reader`.
         /// The caller must also know the slice type since it's agnostically converted into a slice of bytes.
         ///
-        /// If this cache is at maximum entries, will still generate the value and return a `Reader` for it, but it will not be cached.
+        /// If this cache is at maximum entries or the entry is at maximum readers, it will still generate the value and return a `Reader` for it, but it will not be cached.
         /// If the expiration passed in is shorter than the time it takes to create this entry, will still generate the value and return a `Reader` for it, but the entry will no longer exist in the cache.
         pub fn getOrPutSliceEntry(
             self: *MemCacheSelf,
@@ -227,8 +268,21 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
             };
             comptime checkTypeCompatibility([]const SliceType);
 
-            if (try self.read(io, key)) |reader| {
-                return reader;
+            const ReadResult = union(enum) {
+                maybe_reader: ?Reader,
+                too_many_readers,
+            };
+
+            var read_result: ReadResult = if (self.read(io, key)) |maybe_reader| .{
+                .maybe_reader = maybe_reader,
+            } else |err| switch (err) {
+                error.TooManyOpenReaders => .too_many_readers,
+                error.Canceled => |canceled| return canceled,
+            };
+
+            switch (read_result) {
+                .maybe_reader => |maybe_reader| if (maybe_reader) |r| return r,
+                .too_many_readers => {},
             }
 
             var expiration_cpy: Expiration = expiration;
@@ -240,6 +294,18 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
             errdefer expiration_cpy.cleanup(entry_reader);
             var v: []align(max_alignment.toByteUnits()) const u8 = try self.createEntryValue(entry_reader.raw_value);
             errdefer self.allocator.free(v);
+
+            if (read_result == .too_many_readers) {
+                return .{
+                    .entry = .{ .raw_value = v },
+                    .release_strategy = .{
+                        .not_cached = .{
+                            .ctx = expiration_cpy.cleanup_context.ctx,
+                            .runCleanup = expiration_cpy.cleanup_context.runCleanup,
+                        },
+                    },
+                };
+            }
 
             self.putEntry(io, key, v, expiration_cpy, .no_clobber) catch |err| switch (err) {
                 // Some other thread could have beat us here... An entry must exist then.
@@ -257,21 +323,14 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
                 else => |e| return e,
             };
 
-            return (try self.read(io, key)) orelse contigency: {
-                log.warn("Finished performing `getOrPutSliceEntry` with key '{s}', but the entry was not found. Was the expiration long enough to create the entry? - {f}", .{ key, expiration.timeout });
-                // Well, we know at this point our entry and everything therein was freed from the `read()` call,
-                // so we need to create everything again.
-                val = try @as(
-                    ErrorComponent(TReturn)![]const SliceType,
-                    createEntryFn(create_entry_ctx, &expiration_cpy.cleanup_context),
-                );
-                entry_reader = .{ .raw_value = mem.sliceAsBytes(val) };
-                errdefer expiration_cpy.cleanup(entry_reader);
-
-                v = try self.createEntryValue(entry_reader.raw_value);
-                errdefer comptime unreachable;
-
-                break :contigency .{
+            read_result = if (self.read(io, key)) |maybe_reader| .{
+                .maybe_reader = maybe_reader,
+            } else |err| switch (err) {
+                error.TooManyOpenReaders => .too_many_readers,
+                error.Canceled => |canceled| return canceled,
+            };
+            return switch (read_result) {
+                .too_many_readers => .{
                     .entry = .{ .raw_value = v },
                     .release_strategy = .{
                         .not_cached = .{
@@ -279,7 +338,31 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
                             .runCleanup = expiration_cpy.cleanup_context.runCleanup,
                         },
                     },
-                };
+                },
+                .maybe_reader => |reader| reader orelse contigency: {
+                    log.warn("Finished performing `getOrPutSliceEntry` with key '{s}', but the entry was not found. Was the expiration long enough to create the entry? - {f}", .{ key, expiration.timeout });
+                    // Well, we know at this point our entry and everything therein was freed from the `read()` call,
+                    // so we need to create everything again.
+                    val = try @as(
+                        ErrorComponent(TReturn)![]const SliceType,
+                        createEntryFn(create_entry_ctx, &expiration_cpy.cleanup_context),
+                    );
+                    entry_reader = .{ .raw_value = mem.sliceAsBytes(val) };
+                    errdefer expiration_cpy.cleanup(entry_reader);
+
+                    v = try self.createEntryValue(entry_reader.raw_value);
+                    errdefer comptime unreachable;
+
+                    break :contigency .{
+                        .entry = .{ .raw_value = v },
+                        .release_strategy = .{
+                            .not_cached = .{
+                                .ctx = expiration_cpy.cleanup_context.ctx,
+                                .runCleanup = expiration_cpy.cleanup_context.runCleanup,
+                            },
+                        },
+                    };
+                },
             };
         }
 
@@ -1444,7 +1527,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
 }
 
 /// Error that can be returned writing an entry (assuming that we're under max entries or we simply fetch the value without caching)
-pub const GetOrPutError = OpenReaderError || Allocator.Error;
+pub const GetOrPutError = Io.Cancelable || Allocator.Error;
 
 /// Possible errors returned when adding a new entry
 pub const OverwriteEntryError = error{ReachedMaxEntries} || GetOrPutError;
