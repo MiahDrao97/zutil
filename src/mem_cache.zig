@@ -107,20 +107,21 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
         ) (ErrorComponent(TReturn) || GetOrPutError)!Reader {
             comptime checkTypeCompatibility(OkComponent(TReturn));
             const ReadResult = union(enum) {
-                maybe_reader: ?Reader,
-                too_many_readers,
+                reader: Reader,
+                not_cached,
+                exceeded_max_readers,
             };
 
-            var read_result: ReadResult = if (self.read(io, key)) |maybe_reader| .{
-                .maybe_reader = maybe_reader,
-            } else |err| switch (err) {
-                error.TooManyOpenReaders => .too_many_readers,
+            var read_result: ReadResult = if (self.read(io, key)) |maybe_reader|
+                if (maybe_reader) |r| .{ .reader = r } else .not_cached
+            else |err| switch (err) {
+                error.TooManyOpenReaders => .exceeded_max_readers,
                 error.Canceled => |canceled| return canceled,
             };
 
             switch (read_result) {
-                .maybe_reader => |maybe_reader| if (maybe_reader) |r| return r,
-                .too_many_readers => {},
+                .reader => |r| return r,
+                else => {}
             }
 
             var expiration_cpy: Expiration = expiration;
@@ -135,11 +136,11 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
             var v: []align(max_alignment.toByteUnits()) const u8 = try self.createEntryValue(entry_reader.raw_value);
             errdefer self.allocator.free(v);
 
-            if (read_result == .too_many_readers) {
+            if (read_result == .exceeded_max_readers) {
                 return .{
                     .entry = .{ .raw_value = v },
                     .release_strategy = .{
-                        .not_cached = .{
+                        .exceeded_max_readers = .{
                             .ctx = expiration_cpy.cleanup_context.ctx,
                             .runCleanup = expiration_cpy.cleanup_context.runCleanup,
                         },
@@ -163,24 +164,18 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
                 else => |e| return e,
             };
 
-            read_result = if (self.read(io, key)) |maybe_reader| .{
-                .maybe_reader = maybe_reader,
-            } else |err| switch (err) {
-                error.TooManyOpenReaders => .too_many_readers,
+            read_result = if (self.read(io, key)) |maybe_reader|
+                if (maybe_reader) |r| .{ .reader = r } else .not_cached
+            else |err| switch (err) {
+                error.TooManyOpenReaders => .exceeded_max_readers,
                 error.Canceled => |canceled| return canceled,
             };
             return switch (read_result) {
-                .too_many_readers => .{
-                    .entry = .{ .raw_value = v },
-                    .release_strategy = .{
-                        .not_cached = .{
-                            .ctx = expiration_cpy.cleanup_context.ctx,
-                            .runCleanup = expiration_cpy.cleanup_context.runCleanup,
-                        },
-                    },
-                },
-                .maybe_reader => |reader| reader orelse contigency: {
-                    log.warn("Finished performing `getOrPutEntry` with key '{s}', but the entry was not found. Was the expiration long enough to create the entry? - {f}", .{ key, expiration.timeout });
+                .reader => |r| r,
+                inline else => |_, tag| contingency: {
+                    if (tag == .not_cached) {
+                        log.warn("Finished performing `getOrPutEntry` with key '{s}', but the entry was not found. Was the expiration long enough to create the entry? - {f}", .{ key, expiration.timeout });
+                    }
                     // Well, we know at this point our entry and everything therein was freed from the `read()` call,
                     // so we need to create everything again.
                     val = try @as(
@@ -193,14 +188,12 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
                     v = try self.createEntryValue(entry_reader.raw_value);
                     errdefer comptime unreachable;
 
-                    break :contigency .{
+                    break :contingency .{
                         .entry = .{ .raw_value = v },
-                        .release_strategy = .{
-                            .not_cached = .{
-                                .ctx = expiration_cpy.cleanup_context.ctx,
-                                .runCleanup = expiration_cpy.cleanup_context.runCleanup,
-                            },
-                        },
+                        .release_strategy = @unionInit(ReleaseStrategy, @tagName(tag), .{
+                            .ctx = expiration_cpy.cleanup_context.ctx,
+                            .runCleanup = expiration_cpy.cleanup_context.runCleanup,
+                        }),
                     };
                 },
             };
@@ -269,20 +262,21 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
             comptime checkTypeCompatibility([]const SliceType);
 
             const ReadResult = union(enum) {
-                maybe_reader: ?Reader,
-                too_many_readers,
+                reader: Reader,
+                not_cached,
+                exceeded_max_readers,
             };
 
-            var read_result: ReadResult = if (self.read(io, key)) |maybe_reader| .{
-                .maybe_reader = maybe_reader,
-            } else |err| switch (err) {
-                error.TooManyOpenReaders => .too_many_readers,
+            var read_result: ReadResult = if (self.read(io, key)) |maybe_reader|
+                if (maybe_reader) |r| .{ .reader = r } else .not_cached
+            else |err| switch (err) {
+                error.TooManyOpenReaders => .exceeded_max_readers,
                 error.Canceled => |canceled| return canceled,
             };
 
             switch (read_result) {
-                .maybe_reader => |maybe_reader| if (maybe_reader) |r| return r,
-                .too_many_readers => {},
+                .reader => |r| return r,
+                else => {}
             }
 
             var expiration_cpy: Expiration = expiration;
@@ -295,11 +289,11 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
             var v: []align(max_alignment.toByteUnits()) const u8 = try self.createEntryValue(entry_reader.raw_value);
             errdefer self.allocator.free(v);
 
-            if (read_result == .too_many_readers) {
+            if (read_result == .exceeded_max_readers) {
                 return .{
                     .entry = .{ .raw_value = v },
                     .release_strategy = .{
-                        .not_cached = .{
+                        .exceeded_max_readers = .{
                             .ctx = expiration_cpy.cleanup_context.ctx,
                             .runCleanup = expiration_cpy.cleanup_context.runCleanup,
                         },
@@ -323,24 +317,18 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
                 else => |e| return e,
             };
 
-            read_result = if (self.read(io, key)) |maybe_reader| .{
-                .maybe_reader = maybe_reader,
-            } else |err| switch (err) {
-                error.TooManyOpenReaders => .too_many_readers,
+            read_result = if (self.read(io, key)) |maybe_reader|
+                if (maybe_reader) |r| .{ .reader = r } else .not_cached
+            else |err| switch (err) {
+                error.TooManyOpenReaders => .exceeded_max_readers,
                 error.Canceled => |canceled| return canceled,
             };
             return switch (read_result) {
-                .too_many_readers => .{
-                    .entry = .{ .raw_value = v },
-                    .release_strategy = .{
-                        .not_cached = .{
-                            .ctx = expiration_cpy.cleanup_context.ctx,
-                            .runCleanup = expiration_cpy.cleanup_context.runCleanup,
-                        },
-                    },
-                },
-                .maybe_reader => |reader| reader orelse contigency: {
-                    log.warn("Finished performing `getOrPutSliceEntry` with key '{s}', but the entry was not found. Was the expiration long enough to create the entry? - {f}", .{ key, expiration.timeout });
+                .reader => |r| r,
+                inline else => |_, tag| contingency: {
+                    if (tag == .not_cached) {
+                        log.warn("Finished performing `getOrPutSliceEntry` with key '{s}', but the entry was not found. Was the expiration long enough to create the entry? - {f}", .{ key, expiration.timeout });
+                    }
                     // Well, we know at this point our entry and everything therein was freed from the `read()` call,
                     // so we need to create everything again.
                     val = try @as(
@@ -353,14 +341,12 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
                     v = try self.createEntryValue(entry_reader.raw_value);
                     errdefer comptime unreachable;
 
-                    break :contigency .{
+                    break :contingency .{
                         .entry = .{ .raw_value = v },
-                        .release_strategy = .{
-                            .not_cached = .{
-                                .ctx = expiration_cpy.cleanup_context.ctx,
-                                .runCleanup = expiration_cpy.cleanup_context.runCleanup,
-                            },
-                        },
+                        .release_strategy = @unionInit(ReleaseStrategy, @tagName(tag), .{
+                            .ctx = expiration_cpy.cleanup_context.ctx,
+                            .runCleanup = expiration_cpy.cleanup_context.runCleanup,
+                        }),
                     };
                 },
             };
@@ -459,7 +445,8 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
                     defer self.lock.unlock(io);
 
                     // We might not be the thread that actually removes this entry.
-                    // If we're not first, we don't want to unintentionally double-free (which can happen with 2+ subsequent calls to `tombstone()` with 0 readers).
+                    // If we're not first, we don't want to unintentionally double-free
+                    // (which can happen with 2+ subsequent calls to `tombstone()` when there are 0 readers).
                     if (self.active_entries.swapRemove(k)) {
                         d.tombstone(self);
                     }
@@ -601,8 +588,8 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
                             }
                         }
                     },
-                    .not_cached => |c| {
-                        c.runCleanup(c.ctx, self.entry);
+                    inline .not_cached, .exceeded_max_readers => |x| {
+                        x.runCleanup(x.ctx, self.entry);
                         cache.allocator.free(@as([]align(max_alignment.toByteUnits()) const u8, @alignCast(self.entry.raw_value)));
                     },
                 }
@@ -1575,8 +1562,11 @@ pub const ReleaseStrategy = union(enum) {
     /// Atomic reference counting - the usual strategy
     arc: *Atomic(RefCount),
     /// In this scenario, we've copied the entry value and we simply free it when the reader is released.
-    /// This should only be the case if we hit max entries and can't cache the value.
+    /// This should only be the case if we hit max entries and can't cache the value
+    /// or for handling the edge case of entries that expire before a getOrPut method returns.
     not_cached: Expiration.CleanupContext,
+    /// In a getOrPut method, if we reach max readers on an entry, we'll just create the value and let the caller free it on `release()`.
+    exceeded_max_readers: Expiration.CleanupContext,
 };
 
 /// An entry's expiration
