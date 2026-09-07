@@ -32,14 +32,10 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
         /// Note that the MemCache is a managed data structure (i.e. it stores its own allocator).
         /// The reason for this is the complex lifetimes required for reference counting.
         pub fn init(gpa: Allocator, opts: Options) Allocator.Error!MemCacheSelf {
-            if (comptime max_entries) |max| if (opts.preheat) |p| {
-                debug.assert(p <= max);
-            };
-            const preheat: usize = if (opts.preheat) |p| p else if (comptime max_entries) |max| max else 0;
             return .{
                 .active_entries = .empty,
                 .lock = .init,
-                .entry_pool = try .initCapacity(gpa, preheat),
+                .entry_pool = try .initCapacity(gpa, if (comptime max_entries) |max| max else opts.preheat),
                 .allocator = gpa,
                 .opts = opts,
             };
@@ -560,6 +556,18 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
             self.entry_pool.deinit(self.allocator);
             self.* = undefined;
         }
+
+        pub const Preheat = if (max_entries) |_| void else usize;
+
+        /// Configuration when initializing a memory cache
+        pub const Options = struct {
+            /// Maximum readers allowed before returning `error.TooManyOpenReaders`.
+            /// This cache leverages atomic reference counting to ensure that cache entries are not destroyed before all references have dropped it.
+            max_readers: u16 = @intFromEnum(RefCount.max),
+            /// Preheats this many entries.
+            /// However, if `max_entries` is set, this value is void and `max_entries` will be preheated instead.
+            preheat: Preheat = if (max_entries) |_| {} else 0,
+        };
 
         /// Allows one to pull an entry from the cache and have it safely read until `release()` is called on this reader.
         /// Each active reader represents one unit on the entry's reference count (max active references is configurable).
@@ -1536,15 +1544,6 @@ fn PutError(comptime put_behavior: PutBehavior) type {
         .replace => OverwriteEntryError,
     };
 }
-
-/// Configuration when initializing a memory cache
-pub const Options = struct {
-    /// Maximum readers allowed before returning `error.TooManyOpenReaders`.
-    /// This cache leverages atomic reference counting to ensure that cache entries are not destroyed before all references have dropped it.
-    max_readers: u16 = @intFromEnum(RefCount.max),
-    /// Preheats this many entries (or default behavior if left null)
-    preheat: ?usize = null,
-};
 
 /// Simple reader
 pub const Entry = struct {
