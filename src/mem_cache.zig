@@ -6,12 +6,13 @@
 //! Cache entries cannot exceed `std.math.max(u16)` bytes.
 //! Note that all cache entries are shallow copies, so if you need to get around this limitation, just heap-allocate and cache the pointer.
 
-/// Aligned to cache line alignment boundary to prevent CPU cache invalidation.
+/// Aligned to cache line to prevent CPU cache invalidation.
 /// It's expected for memory in this cache to be accessed via RAM rather than CPU caches.
 pub const Default = Aligned(.fromByteUnits(std.atomic.cache_line), null);
 
 /// `max_alignment` - All entry values are aligned to this max alignment.
 /// `max_entries` - No more than this number of entries will be allowed, and the pool will be pre-allocated when calling `init()`.
+///                 If null, then will grow as needed (no pre-allocation).
 pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) type {
     return struct {
         /// All active entries -
@@ -31,10 +32,14 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
         /// Note that the MemCache is a managed data structure (i.e. it stores its own allocator).
         /// The reason for this is the complex lifetimes required for reference counting.
         pub fn init(gpa: Allocator, opts: Options) Allocator.Error!MemCacheSelf {
+            if (comptime max_entries) |max| if (opts.preheat) |p| {
+                debug.assert(p <= max);
+            };
+            const preheat: usize = if (opts.preheat) |p| p else if (comptime max_entries) |max| max else 0;
             return .{
                 .active_entries = .empty,
                 .lock = .init,
-                .entry_pool = if (max_entries) |max| try .initCapacity(gpa, max) else .empty,
+                .entry_pool = try .initCapacity(gpa, preheat),
                 .allocator = gpa,
                 .opts = opts,
             };
@@ -173,7 +178,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
             return switch (read_result) {
                 .reader => |r| r,
                 inline else => |_, tag| contingency: {
-                    if (tag == .not_cached) {
+                    if (comptime tag == .not_cached) {
                         log.warn("Finished performing `getOrPutEntry` with key '{s}', but the entry was not found. Was the expiration long enough to create the entry? - {f}", .{ key, expiration.timeout });
                     }
                     // Well, we know at this point our entry and everything therein was freed from the `read()` call,
@@ -326,7 +331,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
             return switch (read_result) {
                 .reader => |r| r,
                 inline else => |_, tag| contingency: {
-                    if (tag == .not_cached) {
+                    if (comptime tag == .not_cached) {
                         log.warn("Finished performing `getOrPutSliceEntry` with key '{s}', but the entry was not found. Was the expiration long enough to create the entry? - {f}", .{ key, expiration.timeout });
                     }
                     // Well, we know at this point our entry and everything therein was freed from the `read()` call,
@@ -991,9 +996,9 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
             var group: Io.Group = .init;
             defer group.cancel(testing.io);
 
-            group.async(testing.io, removeEntry, .{ &start, &mem_cache, testing.io, "my_slice" });
-            group.async(testing.io, removeEntry, .{ &start, &mem_cache, testing.io, "my_slice" });
-            group.async(testing.io, removeEntry, .{ &start, &mem_cache, testing.io, "my_slice" });
+            try group.concurrent(testing.io, removeEntry, .{ &start, &mem_cache, testing.io, "my_slice" });
+            try group.concurrent(testing.io, removeEntry, .{ &start, &mem_cache, testing.io, "my_slice" });
+            try group.concurrent(testing.io, removeEntry, .{ &start, &mem_cache, testing.io, "my_slice" });
 
             start.store(true, .release);
             try group.await(testing.io);
@@ -1036,8 +1041,8 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
             var group: Io.Group = .init;
             defer group.cancel(testing.io);
 
-            group.async(testing.io, readEntry, .{ &start, &mem_cache, testing.io, "my_slice" });
-            group.async(testing.io, removeEntry, .{ &start, &mem_cache, testing.io, "my_slice" });
+            try group.concurrent(testing.io, readEntry, .{ &start, &mem_cache, testing.io, "my_slice" });
+            try group.concurrent(testing.io, removeEntry, .{ &start, &mem_cache, testing.io, "my_slice" });
 
             start.store(true, .release);
             try group.await(testing.io);
@@ -1045,8 +1050,8 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
             if (try mem_cache.read(testing.io, "my_slice")) |_| return error.ExpectedNoEntry;
 
             start.store(false, .release);
-            group.async(testing.io, removeEntry, .{ &start, &mem_cache, testing.io, "my_slice" });
-            group.async(testing.io, readEntry, .{ &start, &mem_cache, testing.io, "my_slice" });
+            try group.concurrent(testing.io, removeEntry, .{ &start, &mem_cache, testing.io, "my_slice" });
+            try group.concurrent(testing.io, readEntry, .{ &start, &mem_cache, testing.io, "my_slice" });
 
             start.store(true, .release);
             try group.await(testing.io);
@@ -1537,6 +1542,8 @@ pub const Options = struct {
     /// Maximum readers allowed before returning `error.TooManyOpenReaders`.
     /// This cache leverages atomic reference counting to ensure that cache entries are not destroyed before all references have dropped it.
     max_readers: u16 = @intFromEnum(RefCount.max),
+    /// Preheats this many entries (or default behavior if left null)
+    preheat: ?usize = null,
 };
 
 /// Simple reader
