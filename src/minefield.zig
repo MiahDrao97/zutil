@@ -15,7 +15,7 @@ pub fn set(comptime F: type, comptime E: anytype) type {
         /// Expose `F` back
         pub const Fuse = F;
         /// Expose `E` back
-        pub const Error = ErrorType(if (@TypeOf(E) == type) E else @TypeOf(E));
+        pub const Error = ErrorComponent(if (@TypeOf(E) == type) E else @TypeOf(E));
 
         comptime {
             debug.assert(@typeInfo(Fuse) == .@"enum");
@@ -162,4 +162,4 @@ const builtin = @import("builtin");
 const debug = std.debug;
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
-const ErrorType = @import("meta.zig").ErrorType;
+const ErrorComponent = @import("meta.zig").ErrorComponent;

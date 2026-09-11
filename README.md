@@ -380,9 +380,10 @@ Entries can be read, exchanged, removed, or all entries can be cleared entirely.
 This shows very basic usage of the memory cache:
 ```zig
 // assume io: Io and gpa: Allocator exist in this context
+const MemCache = @import("zutil").MemCache;
 
-var mem_cache: MemCache = .init;
-defer mem_cache.deinit(io, gpa);
+var mem_cache: MemCache = try .init(gpa, .{});
+defer mem_cache.deinit();
 
 const StructValue = struct {
     a: f32,
@@ -390,18 +391,12 @@ const StructValue = struct {
 };
 
 const s: StructValue = .{ .a = 3.14, .b = 5 };
-const expiration: Io.Timeout = .{
-    .duration = .{
-        .raw = .fromSeconds(15),
-        .clock = .awake,
-    },
-};
 // create a new entry in the memory cache with an expiration
-try mem_cache.newEntry(io, gpa, "struct_val", s, .{ .timeout = expiration });
+try mem_cache.newEntry(io, "struct_val", s, .lifetime(.{ .duration = .fromSeconds(15) }, .no_callback));
 
-// uses atomic reference counting to ensure that an entry cannot be removed or modified while there are active readers
-const reader: MemCache.SafeReader = (try mem_cache.lockReader(io, "struct_val"))).?;
-defer reader.release(); // don't forget to release the reader to decrement the reference count
+// uses atomic reference counting to ensure that an entry will point to valid memory as long as there are active readers
+const reader: MemCache.Reader = (try mem_cache.reader(io, "struct_val"))).?;
+defer reader.release(&mem_cache); // don't forget to release the reader to decrement the reference count
 
 const entry: *const StructValue = reader.entry.read(StructValue);
 // use entry...
@@ -410,6 +405,7 @@ const entry: *const StructValue = reader.entry.read(StructValue);
 There are more methods available, but the most useful pattern would be something like the following:
 ```zig
 // assume io: Io and gpa: Allocator exist in this context
+const MemCache = @import("zutil").MemCache;
 
 const DatabaseRow = struct {
     id: u64,
@@ -417,8 +413,8 @@ const DatabaseRow = struct {
     timestamp: i64,
 };
 
-var mem_cache: MemCache = .init;
-defer mem_cache.deinit(io, gpa);
+var mem_cache: MemCache = try .init(gpa, .{});
+defer mem_cache.deinit();
 
 const EntryManager = struct {
     gpa: Allocator,
@@ -432,7 +428,7 @@ const EntryManager = struct {
     /// See `cleanup()` to see how the cleanup context will be used.
     fn createEntry(
         this: @This(),
-        cleanup_ctx_out: Expiration.CleanupContextOut,
+        cleanup_ctx_out: *Expiration.CleanupContext,
     ) Allocator.Error!DatabaseRow {
         // imagine a database query takes place here...
         const timestamp: Io.Timestamp = .now(this.io, .real);
@@ -465,27 +461,38 @@ const entry_manager: EntryManager = .{
     .io = io,
     .id = 1,
 };
-const expiration: MemCache.Expiration = .{
-    .runCleanup = EntryManager.cleanup, // this will be run on removal/expiration
-    .timeout = .{
-        .duration = .{
-            .raw = .fromSeconds(15),
-            .clock = .real,
-        },
-    },
-};
-// either creates a new entry or returns an existing one: returns a `SafeReader` for the entry regardless
-const reader: MemCache.SafeReader = try mem_cache.getOrPutEntry(
-    (Allocator.Error || Io.Clock.Error)!DatabaseRow,
+// either creates a new entry or returns an existing one: returns a `Reader` for the entry regardless
+const reader: MemCache.Reader = try mem_cache.getOrPutEntry(
+    Allocator.Error!DatabaseRow,
     io,
-    gpa,
     "DbRow(1)",
-    expiration,
+    .lifetime(.{ .duration = .fromSeconds(15) }, .callback(EntryManager.cleanup)), // 15-second lifetime with callback that will be run on removal/expiration
     entry_manager,
     EntryManager.createEntry,
 );
-defer reader.release();
+defer reader.release(&mem_cache);
 
 const entry: *const DatabaseRow = reader.entry.read(DatabaseRow);
 // use entry...
 ```
+
+Keep in mind that `MemCache` is an alias for `mem_cache.Default`, and `MemCacheAligned` is an alias for `mem_cache.Aligned`.
+This data structure is _managed_ by necessity because atomic reference counting makes for some complex lifetimes.
+It also gives the caller the ability to use a different allocator when creating an entry and freeing it through a callback.
+If an entry is overwritten or removed (either by expiration or explicit removal), that entry is considered "tombstoned."
+Memory remains valid until the last reader sets the reference count to 0, which then prompts the memory cache to free that memory.
+This has the side effect of multiple "generations" of a cache entry being possible, so keep that in mind.
+If you are diligent about releasing readers quickly, this shouldn't be something you run into very often.
+Expiration is evaluated on `read()`, where, if an entry is determined to be expired, it will be tombstoned instead of returning a reader.
+The memory cache will only open new readers for the active generation; tombstoned entries cannot have new readers.
+Keep in mind that `deinit()` will panic if there are any active readers.
+
+Internally, the memory cache uses a `std.heap.MemoryPool` for creating entries.
+You can set a comptime upper-bound on entries with the aligned type function, which will pre-allocate that much space when `.init(...)` is called.
+If you don't set a comptime upper-bound, then you can specify how many entries you wish to preheat in the options passed to `.init(...)`.
+Additionally, you can use those options to set the max number of readers.
+Keep in mind that the hard limit is `std.math.maxInt(u16)` readers on a single entry.
+Each entry cannot exceed `std.math.maxInt(u16)` bytes.
+I feel like that's pretty reasonable, especially since entries are shallow copies.
+If this limitation becomes an issue, I recommend heap allocating portions of the entry
+(again, you can always pass in a callback to free that memory on expiration).
