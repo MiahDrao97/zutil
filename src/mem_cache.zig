@@ -41,10 +41,13 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
                 try active_entries.ensureTotalCapacity(gpa, opts.preheat);
             }
 
+            const entry_pool: EntryPool = try .initCapacity(gpa, if (comptime max_entries) |max| max else opts.preheat);
+            errdefer comptime unreachable;
+
             return .{
                 .active_entries = active_entries,
                 .lock = .init,
-                .entry_pool = try .initCapacity(gpa, if (comptime max_entries) |max| max else opts.preheat),
+                .entry_pool = entry_pool,
                 .allocator = gpa,
                 .opts = opts,
             };
