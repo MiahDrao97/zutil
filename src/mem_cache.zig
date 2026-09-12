@@ -1603,7 +1603,7 @@ pub const Expiration = struct {
 
         /// No callback configured => this is a no-op
         pub const no_callback: CleanupContext = .{
-            .ctx = @constCast(&@as(u8, 0xAA)),
+            .ctx = @ptrFromInt(0xDEADBEEF),
             .runCleanup = Expiration.noopCleanup,
         };
 
@@ -1611,7 +1611,7 @@ pub const Expiration = struct {
         /// (see `getOrPutEntry` and `getOrPutSliceEntry`).
         pub fn callback(runCleanup: *const fn (_: *anyopaque, entry: Entry) void) CleanupContext {
             return .{
-                .ctx = @constCast(&@as(u8, 0xAA)),
+                .ctx = @ptrFromInt(0xDEADBEEF),
                 .runCleanup = runCleanup,
             };
         }
