@@ -32,10 +32,22 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
         /// Note that the MemCache is a managed data structure (i.e. it stores its own allocator).
         /// The reason for this is the complex lifetimes required for reference counting.
         pub fn init(gpa: Allocator, opts: Options) Allocator.Error!MemCacheSelf {
+            var active_entries: EntryMap = .empty;
+            errdefer active_entries.deinit(gpa);
+
+            if (comptime max_entries) |max| {
+                try active_entries.ensureTotalCapacity(gpa, max);
+            } else if (opts.preheat > 0) {
+                try active_entries.ensureTotalCapacity(gpa, opts.preheat);
+            }
+
+            const entry_pool: EntryPool = try .initCapacity(gpa, if (comptime max_entries) |max| max else opts.preheat);
+            errdefer comptime unreachable;
+
             return .{
-                .active_entries = .empty,
+                .active_entries = active_entries,
                 .lock = .init,
-                .entry_pool = try .initCapacity(gpa, if (comptime max_entries) |max| max else opts.preheat),
+                .entry_pool = entry_pool,
                 .allocator = gpa,
                 .opts = opts,
             };
@@ -156,7 +168,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
                 error.ReachedMaxEntries => return .{
                     .entry = .{ .raw_value = v },
                     .release_strategy = .{
-                        .not_cached = .{
+                        .exceeded_max_readers = .{
                             .ctx = expiration_cpy.cleanup_context.ctx,
                             .runCleanup = expiration_cpy.cleanup_context.runCleanup,
                         },
@@ -309,7 +321,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
                 error.ReachedMaxEntries => return .{
                     .entry = .{ .raw_value = v },
                     .release_strategy = .{
-                        .not_cached = .{
+                        .exceeded_max_readers = .{
                             .ctx = expiration_cpy.cleanup_context.ctx,
                             .runCleanup = expiration_cpy.cleanup_context.runCleanup,
                         },
@@ -1445,7 +1457,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
                 EntryManager.createEntry,
             );
             defer reader_b.release(&mem_cache);
-            try testing.expect(reader_b.release_strategy == .not_cached);
+            try testing.expect(reader_b.release_strategy == .exceeded_max_readers);
 
             const entry_b: *const DatabaseRow = reader_b.entry.read(DatabaseRow);
             try testing.expectEqual(2, entry_b.id);
@@ -1591,7 +1603,7 @@ pub const Expiration = struct {
 
         /// No callback configured => this is a no-op
         pub const no_callback: CleanupContext = .{
-            .ctx = @constCast(&@as(u8, 0xAA)),
+            .ctx = @ptrFromInt(0xDEADBEEF),
             .runCleanup = Expiration.noopCleanup,
         };
 
@@ -1599,7 +1611,7 @@ pub const Expiration = struct {
         /// (see `getOrPutEntry` and `getOrPutSliceEntry`).
         pub fn callback(runCleanup: *const fn (_: *anyopaque, entry: Entry) void) CleanupContext {
             return .{
-                .ctx = @constCast(&@as(u8, 0xAA)),
+                .ctx = @ptrFromInt(0xDEADBEEF),
                 .runCleanup = runCleanup,
             };
         }
