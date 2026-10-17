@@ -206,9 +206,16 @@ test InternedByteArrayAligned {
     try testing.expectEqual(12, @backingInt(idx));
 
     var iter: Aligned.Iterator = byte_array.iterator();
-    try testing.expectEqualStrings("hello", iter.next().?);
-    try testing.expectEqualStrings("hi", iter.next().?);
-    try testing.expectEqualStrings("", iter.next().?);
+    var next_str: []align(4) const u8 = iter.next() orelse return error.ValueNotFound;
+    try testing.expectEqualStrings("hello", next_str);
+
+    next_str = iter.next() orelse return error.ValueNotFound;
+    try testing.expectEqualStrings("hi", next_str);
+
+    next_str = iter.next() orelse return error.ValueNotFound;
+    try testing.expectEqualStrings("", next_str);
+
+    // end
     try testing.expectEqual(null, iter.next());
 }
 
