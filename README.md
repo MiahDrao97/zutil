@@ -13,7 +13,7 @@ v0.1.1, which targets Zig 0.16.0:
 zig fetch https://github.com/MiahDrao97/zutil/archive/refs/tags/v0.1.1.tar.gz --save
 ```
 
-Main branch (unstable, usually keeping up with latest Zig version):
+Main branch (which has latest changes):
 ```
 zig fetch https://github.com/MiahDrao97/zutil/archive/main.tar.gz --save
 ```
