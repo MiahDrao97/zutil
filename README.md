@@ -8,12 +8,12 @@ It's been a great learning excercise for lots of different things, and I'll cont
 
 You can use the `zig fetch` command like so:
 
-v0.1.0, which targets Zig 0.16.0:
+v0.1.1, which targets Zig 0.16.0:
 ```
-zig fetch https://github.com/MiahDrao97/zutil/archive/refs/tags/v0.1.0.tar.gz --save
+zig fetch https://github.com/MiahDrao97/zutil/archive/refs/tags/v0.1.1.tar.gz --save
 ```
 
-Main branch:
+Main branch (unstable, usually keeping up with latest Zig version):
 ```
 zig fetch https://github.com/MiahDrao97/zutil/archive/main.tar.gz --save
 ```
