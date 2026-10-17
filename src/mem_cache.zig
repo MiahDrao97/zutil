@@ -465,7 +465,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
                     }
                     return null;
                 }
-                return try d.openReader(io, @enumFromInt(self.opts.max_readers));
+                return try d.openReader(io, @fromBackingInt(@intCast(self.opts.max_readers)));
             }
             return null;
         }
@@ -575,7 +575,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
         pub const Options = struct {
             /// Maximum readers allowed before returning `error.TooManyOpenReaders`.
             /// This cache leverages atomic reference counting to ensure that cache entries are not destroyed before all references have dropped it.
-            max_readers: u16 = @intFromEnum(RefCount.max),
+            max_readers: u16 = @backingInt(RefCount.max),
             /// Preheats this many entries.
             /// However, if `max_entries` is set, this value is void and `max_entries` will be preheated instead.
             preheat: Preheat = if (max_entries) |_| {} else 0,
@@ -595,11 +595,11 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
                 switch (self.release_strategy) {
                     .arc => |ref_count| {
                         const count_as_int: *Atomic(u16) = @ptrCast(ref_count);
-                        const prev_count: RefCount = @enumFromInt(count_as_int.fetchSub(1, .release));
+                        const prev_count: RefCount = @fromBackingInt(@intCast(count_as_int.fetchSub(1, .release)));
                         // The previous ref count must be some value between 1 and the max.
                         // Otherwise, something's broken...
                         debug.assert(prev_count.compare(.gt, .zero));
-                        debug.assert(prev_count.compare(.lte, @enumFromInt(cache.opts.max_readers)));
+                        debug.assert(prev_count.compare(.lte, @fromBackingInt(@intCast(cache.opts.max_readers))));
                         if (prev_count == .one) {
                             const data: *EntryData = @alignCast(@fieldParentPtr("ref_count", ref_count));
                             // Tombstoned entries have been removed the cache; so this is just a floating reference.
@@ -709,7 +709,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
             }
         };
 
-        const EntryPool = std.heap.MemoryPoolExtra(EntryData, .{ .growable = max_entries == null });
+        const EntryPool = std.heap.memory_pool.Extra(EntryData, .{ .growable = max_entries == null });
 
         const EntryMap = std.ArrayHashMapUnmanaged(StringHash, *EntryData, StringHash.context, false);
 
@@ -1277,7 +1277,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
 
             try testing.expect(reader.release_strategy == .arc);
             try testing.expectEqual(
-                @as(u16, @intFromEnum(reader.release_strategy.arc.load(.acquire))),
+                @as(u16, @backingInt(reader.release_strategy.arc.load(.acquire))),
                 mem_cache.opts.max_readers,
             );
 
@@ -1668,15 +1668,15 @@ const StringHash = enum(u32) {
     _,
 
     fn hashStr(k: []const u8) StringHash {
-        return @enumFromInt(
+        return @fromBackingInt(@intCast(
             @as(u32, @truncate(std.hash.Wyhash.hash(0, k))),
-        );
+        ));
     }
 
     const context = struct {
         pub fn hash(_: context, k: StringHash) u32 {
             // this already repesents a hash, so just return the u32 value
-            return @intFromEnum(k);
+            return @backingInt(k);
         }
 
         pub fn eql(_: context, a: StringHash, b: StringHash, _: usize) bool {
@@ -1693,8 +1693,8 @@ const RefCount = enum(u16) {
     _,
 
     fn compare(lh: RefCount, op: std.math.CompareOperator, rh: RefCount) bool {
-        const lh_int: u16 = @intFromEnum(lh);
-        const rh_int: u16 = @intFromEnum(rh);
+        const lh_int: u16 = @backingInt(lh);
+        const rh_int: u16 = @backingInt(rh);
 
         return switch (op) {
             .lt => lh_int < rh_int,
@@ -1707,11 +1707,11 @@ const RefCount = enum(u16) {
     }
 
     fn plusOne(count: RefCount) RefCount {
-        return @enumFromInt(@intFromEnum(count) + 1);
+        return @fromBackingInt(@intCast(@backingInt(count) + 1));
     }
 
     fn minusOne(count: RefCount) RefCount {
-        return @enumFromInt(@intFromEnum(count) - 1);
+        return @fromBackingInt(@intCast(@backingInt(count) - 1));
     }
 };
 
