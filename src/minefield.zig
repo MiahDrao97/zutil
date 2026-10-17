@@ -20,9 +20,9 @@ pub fn set(comptime F: type, comptime E: anytype) type {
         comptime {
             debug.assert(@typeInfo(Fuse) == .@"enum");
             // empty error sets are not allowed (null error_names is anyerror, which is ok)
-            if (@typeInfo(Error).error_set.error_names != null or @typeInfo(Error).error_set.error_names.?.len == 0) {
+            if (@typeInfo(Error).error_set.error_names) |error_names| if (error_names.len == 0) {
                 @compileError("Error set from type `" ++ @typeName(if (@TypeOf(E) == type) E else @TypeOf(E)) ++ "` must not be empty.");
-            }
+            };
         }
 
         pub const live: bool = builtin.is_test;

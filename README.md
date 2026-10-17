@@ -72,6 +72,31 @@ fn parse(gpa: Allocator, to_parse: []const u8) !Managed(Value) {
 }
 ```
 
+# InternedByteArrayAligned
+Useful for interning an arbitrary number of byte strings, separating them with a null byte.
+Returns an index where in the containing array the string starts.
+An iterator is provided for convenience as well.
+Note that `InternedByteArray = InternedByteArrayAligned(.@"1")`.
+
+```zig
+const Aligned = InternedByteArrayAligned(.@"4");
+var byte_array: Aligned = .empty;
+defer byte_array.deinit(testing.allocator);
+
+var idx: Aligned.Index = try byte_array.append(testing.allocator, "hello");
+try testing.expectEqual(0, @backingInt(idx));
+idx = try byte_array.append(testing.allocator, "hi");
+try testing.expectEqual(8, @backingInt(idx));
+idx = try byte_array.append(testing.allocator, "");
+try testing.expectEqual(12, @backingInt(idx));
+
+var iter: Aligned.Iterator = byte_array.iterator();
+try testing.expectEqualStrings("hello", iter.next().?);
+try testing.expectEqualStrings("hi", iter.next().?);
+try testing.expectEqualStrings("", iter.next().?);
+try testing.expectEqual(null, iter.next());
+```
+
 # UUID
 Currently supporting v3, v4, v5, and v7 for UUID generation.
 Assumes any 16 bytes can be a valid UUID, but provides parsing and some printing/formatting options.
