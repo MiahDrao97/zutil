@@ -156,7 +156,7 @@ pub const UtcOffset = packed struct(u8) {
             @"30" = 2,
             @"45" = 3,
         };
-        return if (std.meta.stringToEnum(MinuteSlice, slice)) |m| @intFromEnum(m) else null;
+        return if (std.meta.stringToEnum(MinuteSlice, slice)) |m| @backingInt(m) else null;
     }
 
     test "UtcOffset.parse" {
@@ -235,8 +235,8 @@ pub const WeekDay = enum(u4) {
 
     pub fn fromTimestamp(timestamp: Io.Timestamp) WeekDay {
         // Fun fact: Jan. 1, 1970 was a Thursday, so we need add Thursday as an offset
-        const days: u64 = @divTrunc(@abs(timestamp.toSeconds()), time.s_per_day) + @intFromEnum(WeekDay.Thursday);
-        return @enumFromInt(@mod(days, 7));
+        const days: u64 = @divTrunc(@abs(timestamp.toSeconds()), time.s_per_day) + @backingInt(WeekDay.Thursday);
+        return @fromBackingInt(@intCast(@mod(days, 7)));
     }
 
     /// Abbreviate to the first 3 letters
@@ -406,9 +406,9 @@ pub const Formatting = struct {
     /// Which elements are present and separator character(s) come after them
     map: EnumMap(Element, Index),
     /// Since `EnumMap` does not give you the order elements appear, we need this additional array
-    ordering: [@typeInfo(Element).@"enum".fields.len]?FullFormat,
+    ordering: [@typeInfo(Element).@"enum".field_names.len]?FullFormat,
 
-    const Index = std.math.IntFittingRange(0, @typeInfo(Element).@"enum".fields.len - 1);
+    const Index = std.math.IntFittingRange(0, @typeInfo(Element).@"enum".field_names.len - 1);
 
     pub const init: Formatting = .{
         .map = .init(.{}),
@@ -1018,8 +1018,8 @@ fn parseInner(map: *EnumMap(Element, []const u8), subsecond_len: ?usize) ParseEr
             const year_slice: []const u8 = map.get(.year) orelse return error.MissingYear;
             const year: u16 = parseUnsigned(u16, year_slice, 10) catch return error.InvalidYear;
             // this loop intentionally stops before the present month since the "days" value informs us how far into the present month we are
-            for (@intFromEnum(Month.jan)..@intFromEnum(month)) |m| {
-                nanoseconds += (@as(i96, @intCast(time.epoch.getDaysInMonth(year, @enumFromInt(m)))) * time.ns_per_day);
+            for (@backingInt(Month.jan)..@backingInt(month)) |m| {
+                nanoseconds += (@as(i96, @intCast(time.epoch.getDaysInMonth(year, @fromBackingInt(@intCast(m))))) * time.ns_per_day);
             }
         },
         .day => {
@@ -1149,10 +1149,10 @@ fn parseMonth(slice: []const u8) error{InvalidMonth}!Month {
             Dec,
         };
         if (std.meta.stringToEnum(FullMonth, slice)) |month| {
-            return @enumFromInt(@intFromEnum(month));
+            return @fromBackingInt(@intCast(@backingInt(month)));
         }
         if (std.meta.stringToEnum(AbbreviatedMonth, slice)) |month| {
-            return @enumFromInt(@intFromEnum(month));
+            return @fromBackingInt(@intCast(@backingInt(month)));
         }
         if (std.meta.stringToEnum(Month, slice)) |month| {
             return month;
