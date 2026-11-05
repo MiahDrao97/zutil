@@ -1149,10 +1149,10 @@ fn parseMonth(slice: []const u8) error{InvalidMonth}!Month {
             Dec,
         };
         if (std.meta.stringToEnum(FullMonth, slice)) |month| {
-            return @fromBackingInt(@intCast(@backingInt(month)));
+            return @bitCast(month);
         }
         if (std.meta.stringToEnum(AbbreviatedMonth, slice)) |month| {
-            return @fromBackingInt(@intCast(@backingInt(month)));
+            return @bitCast(month);
         }
         if (std.meta.stringToEnum(Month, slice)) |month| {
             return month;

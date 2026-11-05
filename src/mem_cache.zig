@@ -465,7 +465,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
                     }
                     return null;
                 }
-                return try d.openReader(io, @fromBackingInt(@intCast(self.opts.max_readers)));
+                return try d.openReader(io, @fromBackingInt(self.opts.max_readers));
             }
             return null;
         }
@@ -595,11 +595,11 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
                 switch (self.release_strategy) {
                     .arc => |ref_count| {
                         const count_as_int: *Atomic(u16) = @ptrCast(ref_count);
-                        const prev_count: RefCount = @fromBackingInt(@intCast(count_as_int.fetchSub(1, .release)));
+                        const prev_count: RefCount = @fromBackingInt(count_as_int.fetchSub(1, .release));
                         // The previous ref count must be some value between 1 and the max.
                         // Otherwise, something's broken...
                         debug.assert(prev_count.compare(.gt, .zero));
-                        debug.assert(prev_count.compare(.lte, @fromBackingInt(@intCast(cache.opts.max_readers))));
+                        debug.assert(prev_count.compare(.lte, @fromBackingInt(cache.opts.max_readers)));
                         if (prev_count == .one) {
                             const data: *EntryData = @alignCast(@fieldParentPtr("ref_count", ref_count));
                             // Tombstoned entries have been removed the cache; so this is just a floating reference.
@@ -1668,9 +1668,9 @@ const StringHash = enum(u32) {
     _,
 
     fn hashStr(k: []const u8) StringHash {
-        return @fromBackingInt(@intCast(
-            @as(u32, @truncate(std.hash.Wyhash.hash(0, k))),
-        ));
+        return @fromBackingInt(
+            @truncate(std.hash.Wyhash.hash(0, k)),
+        );
     }
 
     const context = struct {
@@ -1707,11 +1707,11 @@ const RefCount = enum(u16) {
     }
 
     fn plusOne(count: RefCount) RefCount {
-        return @fromBackingInt(@intCast(@backingInt(count) + 1));
+        return @fromBackingInt(@backingInt(count) + 1);
     }
 
     fn minusOne(count: RefCount) RefCount {
-        return @fromBackingInt(@intCast(@backingInt(count) - 1));
+        return @fromBackingInt(@backingInt(count) - 1);
     }
 };
 
