@@ -115,7 +115,7 @@ const gpa: std.Allocator = std.testing.allocator;
 
 const uuid: Uuid = .v4(std.testing.io);
 std.debug.print("UUID: {f}\n", .{uuid}); // formatted like xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (lower-case) by default
-const uuid_str: []const u8 = try std.fmt.allocPrint(gpa, "{f}", .{uuid.fmt(.{ .casing = .upper, .separator = .none })}); // can pass in format options
+const uuid_str: []const u8 = try gpa.print("{f}", .{uuid.fmt(.{ .casing = .upper, .separator = .none })}); // can pass in format options
 defer gpa.free(uuid_str);
 
 const parsed: Uuid = try .from(uuid_str); // still parses to the same UUID value

@@ -1398,7 +1398,7 @@ pub fn Aligned(comptime max_alignment: Alignment, comptime max_entries: ?usize) 
                     const timestamp: Io.Timestamp = .now(this.io, .real);
                     const row: DatabaseRow = .{
                         .id = this.id,
-                        .name = try fmt.allocPrint(this.gpa, "NameColumn_{d}", .{this.id}),
+                        .name = try this.gpa.print("NameColumn_{d}", .{this.id}),
                         .timestamp = timestamp.toMilliseconds(),
                     };
                     errdefer this.gpa.free(row.name);

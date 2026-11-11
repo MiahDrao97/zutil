@@ -99,7 +99,7 @@ pub const InternedByteArray = InternedByteArrayAligned(.@"1");
 
 /// Align the bytes, if desired.
 /// Each segment will be aligned, according to whichever alignment you specify.
-pub fn InternedByteArrayAligned(comptime alignment: std.mem.Alignment) type {
+pub fn InternedByteArrayAligned(comptime alignment: Alignment) type {
     return struct {
         inner: ArrayListAligned(u8, alignment),
         segment_count: u32,
@@ -219,6 +219,251 @@ test InternedByteArrayAligned {
     try testing.expectEqual(null, iter.next());
 }
 
+pub fn RegionAllocator(comptime alignment: Alignment) type {
+    return struct {
+        bytes: [*]align(alignment.toByteUnits()) u8,
+        regions: [*]Region,
+        free_list: SinglyLinkedList,
+        lock: std.atomic.Mutex,
+        opts: Opts,
+
+        const RegionAllocatorSelf = @This();
+
+        const log = std.log.scoped(.RegionAllocator);
+
+        pub fn init(self: *RegionAllocatorSelf, gpa: Allocator, opts: Opts) Allocator.Error!void {
+            const bytes: []align(alignment.toByteUnits()) u8 = try gpa.alignedAlloc(u8, alignment, opts.totalSize());
+            errdefer gpa.free(bytes);
+
+            const regions: []Region = try gpa.alloc(Region, opts.region_count);
+            errdefer comptime unreachable;
+
+            for (regions, 0..) |*r, i| r.* = .{
+                .start = i * opts.region_size,
+                .node = .{ .next = if (i + 1 < regions.len) &regions[i + 1].node else null },
+                .owner = self,
+            };
+
+            self.* = .{
+                .bytes = bytes,
+                .regions = regions,
+                .free_list = .{ .first = &regions[0].node },
+                .lock = .unlocked,
+                .opts = opts,
+            };
+        }
+
+        pub fn deinit(self: *RegionAllocatorSelf, gpa: Allocator) void {
+            const slice: []align(alignment.toByteUnits()) u8 = self.bytes[0..self.opts.totalSize()];
+            gpa.free(slice);
+            gpa.free(self.regions[0..self.opts.region_count]);
+        }
+
+        pub fn claimRegion(self: *RegionAllocatorSelf) ?*Region {
+            while (!self.lock.tryLock()) {}
+            defer self.lock.unlock();
+
+            const node: ?*SinglyLinkedList.Node = self.free_list.popFirst();
+            return if (node) |n| found: {
+                const region: *Region = @fieldParentPtr("node", n);
+                // dissociate this from the chain since it's on its own to start
+                region.node.next = null;
+                break :found region;
+            } else null;
+        }
+
+        fn extendRegion(self: *RegionAllocatorSelf, region: *Region) bool {
+            std.debug.assert(region.node.next == null);
+            return if (self.claimRegion()) |new| extended: {
+                region.node.next = &new.node;
+                break :extended true;
+            } else false;
+        }
+
+        pub const Opts = struct {
+            region_count: u16,
+            region_size: u16,
+
+            fn totalSize(self: Opts) usize {
+                return self.region_size * self.region_count;
+            }
+        };
+
+        pub const Region = struct {
+            start: u32,
+            node: SinglyLinkedList.Node,
+            owner: *RegionAllocatorSelf,
+            idx: Atomic(u16),
+
+            const vtable: Allocator.VTable = .{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            };
+
+            pub fn allocator(self: *Region) Allocator {
+                return .{
+                    .ptr = self,
+                    .vtable = &vtable,
+                };
+            }
+
+            fn nextRegion(self: *Region) ?*Region {
+                return if (self.node.next) |n| @fieldParentPtr("node", n) else null;
+            }
+
+            /// Regions have a linked list structure where overflow goes to the next region.
+            /// Whichever one is at the end is our current region.
+            /// Ideally, region size should be large enough so that overflow never happens.
+            fn resolve(
+                self: *Region,
+                pending_addition: usize,
+                _alignment: Alignment,
+            ) Allocator.Error!@Tuple(&.{ *Region, u16 }) {
+                // sanity check
+                if (_alignment.toByteUnits() > alignment.toByteUnits()) {
+                    std.debug.panic("Object with alignment {d} is too large for the RegionAllocator's alignment of {d}", .{
+                        _alignment.toByteUnits(),
+                        alignment.toByteUnits(),
+                    });
+                }
+                if (pending_addition > self.owner.opts.region_size) {
+                    log.err("Object with size {d} cannot fit in any region. Region size is configured to be {d}.", .{
+                        pending_addition,
+                        self.owner.opts.region_size,
+                    });
+                    return error.OutOfMemory;
+                }
+
+                var current: *Region = self;
+                var idx: u16 = current.idx.load(.acquire);
+                var offset: u16 = @intCast(_alignment.forward(idx));
+                const len: u16 = current.owner.opts.region_size;
+                return while (true) {
+                    const new_idx: u16 = @intCast(offset + pending_addition);
+                    while (new_idx > len) {
+                        if (current.nextRegion()) |n| {
+                            // move down the chain
+                            current = n;
+                            idx = current.idx.load(.acquire);
+                            offset = @intCast(_alignment.forward(idx));
+                        } else {
+                            // ope, we gotta extend our region, which links another region onto this one
+                            if (!self.owner.extendRegion(current)) {
+                                return error.OutOfMemory;
+                            }
+                            current = current.nextRegion().?;
+                            idx = current.idx.load(.acquire);
+                            offset = @intCast(_alignment.forward(idx));
+                        }
+                    }
+                    if (current.idx.cmpxchgWeak(idx, new_idx, .release, .monotonic)) |actual| {
+                        // another thread beat us here
+                        idx = actual;
+                    } else break .{ current, offset };
+                };
+            }
+
+            fn reset(self: *Region) void {
+                var current: ?*Region = self;
+                while (current) |region| {
+                    region.idx.store(0, .release);
+                    current = region.nextRegion();
+                }
+            }
+
+            fn alloc(ptr: *anyopaque, len: usize, _alignment: Alignment, ret_addr: usize) ?[*]u8 {
+                _ = ret_addr;
+                const self: *Region = @ptrCast(@alignCast(ptr));
+                const resolved: *Region, const offset: u16 = self.resolve(len, _alignment) catch return null;
+                const slice: []u8 = self.owner.bytes[resolved.start + offset ..];
+                return slice.ptr;
+            }
+
+            /// Attempt to expand or shrink memory in place.
+            ///
+            /// `memory.len` must equal the length requested from the most recent
+            /// successful call to `alloc`, `resize`, or `remap`. `alignment` must
+            /// equal the same value that was passed as the `alignment` parameter to
+            /// the original `alloc` call.
+            ///
+            /// A result of `true` indicates the resize was successful and the
+            /// allocation now has the same address but a size of `new_len`. `false`
+            /// indicates the resize could not be completed without moving the
+            /// allocation to a different address.
+            ///
+            /// `new_len` must be greater than zero.
+            ///
+            /// `ret_addr` is optionally provided as the first return address of the
+            /// allocation call stack. If the value is `0` it means no return address
+            /// has been provided.
+            fn resize(ptr: *anyopaque, memory: []u8, _alignment: Alignment, new_len: usize, ret_addr: usize) bool {
+                std.debug.assert(new_len > 0);
+                _ = ret_addr;
+                _ = _alignment;
+                const self: *Region = @ptrCast(@alignCast(ptr));
+                // FIXME : Actually, don't resolve here... just get the last region in the chain
+                const resolved: *Region, const offset: u16 = self.resolve(0, .@"1") catch return false;
+                const addr: usize = @intFromPtr(memory.ptr);
+                const next_addr_space: usize = @intFromPtr(resolved.owner.bytes + resolved.start + offset);
+                if (next_addr_space - memory.len == addr) {
+                    // TODO : cmpxchg loop to adjust the idx of the resolved region or return false
+                }
+                return false;
+            }
+
+            /// Attempt to expand or shrink memory, allowing relocation.
+            ///
+            /// `memory.len` must equal the length requested from the most recent
+            /// successful call to `alloc`, `resize`, or `remap`. `alignment` must
+            /// equal the same value that was passed as the `alignment` parameter to
+            /// the original `alloc` call.
+            ///
+            /// A non-`null` return value indicates the resize was successful. The
+            /// allocation may have same address, or may have been relocated. In either
+            /// case, the allocation now has size of `new_len`. A `null` return value
+            /// indicates that the resize would be equivalent to allocating new memory,
+            /// copying the bytes from the old memory, and then freeing the old memory.
+            /// In such case, it is more efficient for the caller to perform the copy.
+            ///
+            /// `new_len` must be greater than zero.
+            ///
+            /// `ret_addr` is optionally provided as the first return address of the
+            /// allocation call stack. If the value is `0` it means no return address
+            /// has been provided.
+            fn remap(ptr: *anyopaque, memory: []u8, _alignment: Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+                std.debug.assert(new_len > 0);
+                const self: *Region = @ptrCast(@alignCast(ptr));
+                _ = self;
+                _ = memory;
+                _ = _alignment;
+                _ = ret_addr;
+
+                return null;
+            }
+
+            /// Free and invalidate a region of memory.
+            ///
+            /// `memory.len` must equal the length requested from the most recent
+            /// successful call to `alloc`, `resize`, or `remap`. `alignment` must
+            /// equal the same value that was passed as the `alignment` parameter to
+            /// the original `alloc` call.
+            ///
+            /// `ret_addr` is optionally provided as the first return address of the
+            /// allocation call stack. If the value is `0` it means no return address
+            /// has been provided.
+            fn free(ptr: *anyopaque, memory: []u8, _alignment: Alignment, ret_addr: usize) void {
+                const self: *Region = @ptrCast(@alignCast(ptr));
+                _ = self;
+                _ = memory;
+                _ = _alignment;
+                _ = ret_addr;
+            }
+        };
+    };
+}
+
 comptime {
     _ = string.Casing;
     _ = string.DateTimeFormat;
@@ -237,3 +482,6 @@ const Allocator = mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const ArrayList = std.ArrayList;
 const ArrayListAligned = std.array_list.Aligned;
+const Alignment = mem.Alignment;
+const SinglyLinkedList = std.SinglyLinkedList;
+const Atomic = std.atomic.Value;

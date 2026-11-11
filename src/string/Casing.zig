@@ -400,4 +400,3 @@ const ascii = std.ascii;
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
-const BufPrintError = std.fmt.BufPrintError;

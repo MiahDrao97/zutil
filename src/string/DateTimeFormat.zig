@@ -859,7 +859,7 @@ pub fn format(self: DateTimeFormat, writer: *Io.Writer) Io.Writer.Error!void {
             .subsecond => |places| if (places > 0) {
                 // write all nanoseconds to a buffer and strategically truncate
                 var buf: [32]u8 = undefined;
-                const full_ns: []const u8 = std.fmt.bufPrint(&buf, "{d}", .{self.timestamp.nanoseconds}) catch unreachable;
+                const full_ns: []const u8 = mem.print(&buf, "{d}", .{self.timestamp.nanoseconds}) catch unreachable;
                 // get the last 9 characters
                 const subseconds: []const u8 = full_ns[full_ns.len - 9 ..];
 
