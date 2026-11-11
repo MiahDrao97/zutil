@@ -22,14 +22,14 @@ pub fn structSubset(comptime TSubset: type, @"struct": anytype) TSubset {
         .@"struct" => switch (@typeInfo(TSubset)) {
             .@"struct" => |to| {
                 var result: TSubset = undefined;
-                inline for (to.fields) |field| {
-                    if (@hasField(SourceType, field.name)) {
-                        if (@FieldType(SourceType, field.name) == field.type) {
-                            @field(result, field.name) = @field(@"struct", field.name);
+                inline for (to.field_names, to.field_types) |field, FieldType| {
+                    if (@hasField(SourceType, field)) {
+                        if (@FieldType(SourceType, field) == FieldType) {
+                            @field(result, field) = @field(@"struct", field);
                         } else {
-                            @compileError("Expected type `" ++ @typeName(field.type) ++ "` on field `" ++ field.name ++ "`, but found `" ++ @typeName(@FieldType(SourceType, field.name)) ++ "`.");
+                            @compileError("Expected type `" ++ @typeName(FieldType) ++ "` on field `" ++ field ++ "`, but found `" ++ @typeName(@FieldType(SourceType, field)) ++ "`.");
                         }
-                    } else @compileError("Field `" ++ field.Name ++ "` not found on type `" ++ @typeName(SourceType) ++ "`.");
+                    } else @compileError("Field `" ++ field ++ "` not found on type `" ++ @typeName(SourceType) ++ "`.");
                 }
                 return result;
             },
@@ -68,6 +68,25 @@ pub fn OkComponent(comptime TReturn: type) type {
         .error_set => @compileError("Return type must be an error union or a non-error-set value."),
         else => TReturn,
     };
+}
+
+test structSubset {
+    const A = struct {
+        a: u8,
+        b: []const u8,
+    };
+
+    const B = struct {
+        a: u8,
+        b: []const u8,
+        c: f64,
+    };
+
+    const b: B = .{ .a = 'a', .b = "blarf", .c = 3.14 };
+    const a: A = structSubset(A, b);
+
+    try std.testing.expectEqual('a', a.a);
+    try std.testing.expectEqualStrings("blarf", a.b);
 }
 
 const std = @import("std");
